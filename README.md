@@ -1,0 +1,168 @@
+# lite3-zig
+
+Idiomatic [Zig](https://ziglang.org/) wrapper for [Lite³](https://github.com/fastserial/lite3), a JSON-compatible zero-copy serialization format that encodes data as a B-tree inside a single contiguous buffer, allowing O(log n) access and mutation on any arbitrary field.
+
+## Features
+
+- **Buffer API** — fixed-size, caller-managed memory; ideal for embedded, real-time, or arena-based workflows.
+- **Context API** — heap-allocated, auto-growing buffer; convenient for general-purpose use.
+- **Full type support** — null, bool, i64, f64, string, bytes, nested objects, and arrays.
+- **JSON round-trip** — encode to / decode from JSON via the bundled yyjson backend.
+- **Iteration** — iterate over object keys or array elements.
+- **Proper error handling** — all C error codes are translated to Zig error unions.
+- **Zero `@cImport` issues** — a thin C shim wraps the inline functions that Zig's translate-c cannot handle (alignment casts, flexible array members, GNU statement expressions).
+
+## Requirements
+
+- **Zig ≥ 0.14.0**
+- A C11-capable toolchain (provided by Zig)
+
+## Quick start
+
+```zig
+const lite3 = @import("lite3");
+
+// Using the Context API (auto-growing buffer)
+var ctx = try lite3.Context.create();
+defer ctx.destroy();
+
+try ctx.initObj();
+try ctx.setStr(lite3.root, "name", "Alice");
+try ctx.setI64(lite3.root, "age", 30);
+
+const name = try ctx.getStr(lite3.root, "name");
+// name == "Alice"
+
+// Encode to JSON
+const json = try ctx.jsonEncode(lite3.root);
+defer std.c.free(@ptrCast(@constCast(json.ptr)));
+```
+
+```zig
+// Using the Buffer API (fixed-size, caller-managed memory)
+var mem: [4096]u8 align(4) = undefined;
+var buf = try lite3.Buffer.initObj(&mem);
+
+try buf.setI64(lite3.root, "answer", 42);
+const val = try buf.getI64(lite3.root, "answer");
+// val == 42
+```
+
+## Building
+
+```bash
+# Build the static library
+zig build
+
+# Run all tests
+zig build test
+
+# Build with specific optimization
+zig build -Doptimize=ReleaseFast
+```
+
+### Build options
+
+| Option             | Default | Description                                  |
+|--------------------|---------|----------------------------------------------|
+| `-Djson=false`     | `true`  | Disable JSON encode/decode support           |
+| `-Derror-messages` | `false` | Enable lite3 debug error messages to stdout  |
+
+## Using as a dependency
+
+Add this package to your `build.zig.zon`:
+
+```zig
+.dependencies = .{
+    .lite3 = .{
+        .url = "https://github.com/<your-fork>/lite3-zig/archive/<commit>.tar.gz",
+        .hash = "...",
+    },
+},
+```
+
+Then in your `build.zig`:
+
+```zig
+const lite3_dep = b.dependency("lite3", .{
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("lite3", lite3_dep.module("lite3"));
+```
+
+## API overview
+
+### Types
+
+| Zig type          | Description                                          |
+|-------------------|------------------------------------------------------|
+| `Buffer`          | Fixed-size buffer with caller-managed memory         |
+| `Context`         | Heap-allocated, auto-growing buffer                  |
+| `Type`            | Enum of value types (null, bool_, i64_, f64_, etc.)  |
+| `Offset`          | Byte offset handle into the buffer                   |
+| `Error`           | Error set (NotFound, InvalidArgument, etc.)          |
+| `Buffer.Iterator` | Iterator over object/array entries                   |
+
+### Buffer API
+
+| Method                | Description                                |
+|-----------------------|--------------------------------------------|
+| `initObj` / `initArr` | Initialize as object or array              |
+| `setNull/Bool/I64/F64/Str/Bytes/Obj/Arr` | Set a value by key      |
+| `getBool/I64/F64/Str/Bytes/Obj/Arr`       | Get a value by key      |
+| `getType` / `exists`  | Query type or existence of a key           |
+| `arrAppend*`          | Append values to an array                  |
+| `arrGet*`             | Get values from an array by index          |
+| `count`               | Count entries in an object or array        |
+| `iterate`             | Create an iterator                         |
+| `jsonDecode`          | Decode JSON into a buffer                  |
+| `jsonEncode`          | Encode buffer contents to JSON             |
+| `jsonEncodePretty`    | Encode to pretty-printed JSON              |
+| `jsonEncodeBuf`       | Encode JSON into a caller-supplied buffer  |
+
+### Context API
+
+The Context API mirrors the Buffer API but manages memory automatically. All methods from the Buffer API are available with the same names.
+
+## Project structure
+
+```
+lite3-zig/
+├── build.zig           # Zig build system
+├── build.zig.zon       # Package metadata
+├── Justfile            # Task automation
+├── .mise.toml          # Dev environment (zig 0.14.0)
+├── src/
+│   ├── lite3.zig       # Zig wrapper module
+│   ├── lite3_shim.c    # C shim for inline functions
+│   ├── lite3_shim.h    # C shim header
+│   └── tests.zig       # Comprehensive test suite (56 tests)
+└── vendor/
+    └── lite3/          # Git submodule → github.com/fastserial/lite3
+```
+
+## Development
+
+```bash
+# With mise and just installed:
+mise install          # Install Zig 0.14.0
+just test             # Run tests
+just test-release     # Run tests with ReleaseSafe
+just clean            # Remove build artifacts
+just update-vendor    # Update lite3 submodule
+```
+
+## Architecture notes
+
+### C shim layer
+
+Lite³ makes heavy use of GNU C extensions (statement expressions, `__builtin_prefetch`) and C patterns (flexible array members, `volatile` casts) that Zig's `translate-c` cannot handle. Rather than patching the upstream library, a thin C shim (`src/lite3_shim.c`) wraps every inline function as a proper `extern` function, giving Zig clean function pointers to call.
+
+### Build optimization
+
+The C library is always compiled with `-OReleaseFast` regardless of the Zig optimization level. This is because lite3 uses intentional out-of-bounds `__builtin_prefetch` hints for performance that would trigger false positives under Zig's Debug-mode bounds checking. The Zig wrapper code itself respects the user's chosen optimization level.
+
+## License
+
+This wrapper is provided under the same license as the upstream [Lite³](https://github.com/fastserial/lite3) library.

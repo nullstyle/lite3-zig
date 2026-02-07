@@ -1,0 +1,5 @@
+[tools]
+zig = "0.14.0"
+
+[env]
+LITE3_ZIG_ROOT = "{{config_root}}"
