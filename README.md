@@ -14,7 +14,7 @@ Idiomatic [Zig](https://ziglang.org/) wrapper for [Lite³](https://github.com/fa
 
 ## Requirements
 
-- **Zig ≥ 0.14.0**
+- **Zig ≥ 0.15.2**
 - A C11-capable toolchain (provided by Zig)
 
 ## Quick start
