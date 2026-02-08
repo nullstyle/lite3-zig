@@ -44,6 +44,11 @@ pub const Error = error{
 /// Translate a C return code (< 0 on error) into a Zig error.
 fn translateError(ret: c_int) Error {
     std.debug.assert(ret < 0);
+    return translateErrno();
+}
+
+/// Translate the current errno value into a Zig error.
+fn translateErrno() Error {
     const raw_errno = std.c._errno().*;
     if (raw_errno == 0) return Error.Unexpected;
     const e_val: std.posix.E = @enumFromInt(@as(u16, @intCast(raw_errno)));
@@ -73,6 +78,8 @@ pub const Type = enum(u8) {
     object = 6,
     array = 7,
     invalid = 8,
+
+    const max_valid: u8 = 8;
 };
 
 /// A tagged union representing any Lite3 value, useful for dynamic access.
@@ -148,81 +155,125 @@ pub const Iterator = struct {
 fn SharedMethods(comptime Self: type) type {
     const is_ctx = (Self == Context);
     return struct {
+        /// Save the current len for Buffer (no-op for Context).
+        /// The C library documents that a failed write may still increment
+        /// *inout_buflen, so we snapshot and restore to preserve invariants.
+        inline fn saveLen(self: *Self) usize {
+            return if (!is_ctx) self.len else 0;
+        }
+
+        /// Restore len on error for Buffer (no-op for Context).
+        inline fn restoreLen(self: *Self, saved: usize) void {
+            if (!is_ctx) self.len = saved;
+        }
+
         // --- Set operations ---
 
         /// Set a null value for the given key.
         pub fn setNull(self: *Self, ofs: Offset, key: [:0]const u8) Error!void {
+            const saved = saveLen(self);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_set_null(self.ctx, ofs, key.ptr)
             else
                 c.shim_lite3_set_null(self.buf, &self.len, ofs, self.capacity, key.ptr);
-            if (ret < 0) return translateError(ret);
+            if (ret < 0) {
+                restoreLen(self, saved);
+                return translateError(ret);
+            }
         }
 
         /// Set a boolean value for the given key.
         pub fn setBool(self: *Self, ofs: Offset, key: [:0]const u8, value: bool) Error!void {
+            const saved = saveLen(self);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_set_bool(self.ctx, ofs, key.ptr, value)
             else
                 c.shim_lite3_set_bool(self.buf, &self.len, ofs, self.capacity, key.ptr, value);
-            if (ret < 0) return translateError(ret);
+            if (ret < 0) {
+                restoreLen(self, saved);
+                return translateError(ret);
+            }
         }
 
         /// Set an i64 value for the given key.
         pub fn setI64(self: *Self, ofs: Offset, key: [:0]const u8, value: i64) Error!void {
+            const saved = saveLen(self);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_set_i64(self.ctx, ofs, key.ptr, value)
             else
                 c.shim_lite3_set_i64(self.buf, &self.len, ofs, self.capacity, key.ptr, value);
-            if (ret < 0) return translateError(ret);
+            if (ret < 0) {
+                restoreLen(self, saved);
+                return translateError(ret);
+            }
         }
 
         /// Set an f64 value for the given key.
         pub fn setF64(self: *Self, ofs: Offset, key: [:0]const u8, value: f64) Error!void {
+            const saved = saveLen(self);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_set_f64(self.ctx, ofs, key.ptr, value)
             else
                 c.shim_lite3_set_f64(self.buf, &self.len, ofs, self.capacity, key.ptr, value);
-            if (ret < 0) return translateError(ret);
+            if (ret < 0) {
+                restoreLen(self, saved);
+                return translateError(ret);
+            }
         }
 
         /// Set a string value for the given key.
         pub fn setStr(self: *Self, ofs: Offset, key: [:0]const u8, value: []const u8) Error!void {
+            const saved = saveLen(self);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_set_str(self.ctx, ofs, key.ptr, value.ptr, value.len)
             else
                 c.shim_lite3_set_str(self.buf, &self.len, ofs, self.capacity, key.ptr, value.ptr, value.len);
-            if (ret < 0) return translateError(ret);
+            if (ret < 0) {
+                restoreLen(self, saved);
+                return translateError(ret);
+            }
         }
 
         /// Set a bytes value for the given key.
         pub fn setBytes(self: *Self, ofs: Offset, key: [:0]const u8, value: []const u8) Error!void {
+            const saved = saveLen(self);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_set_bytes(self.ctx, ofs, key.ptr, value.ptr, value.len)
             else
                 c.shim_lite3_set_bytes(self.buf, &self.len, ofs, self.capacity, key.ptr, value.ptr, value.len);
-            if (ret < 0) return translateError(ret);
+            if (ret < 0) {
+                restoreLen(self, saved);
+                return translateError(ret);
+            }
         }
 
         /// Set a nested object for the given key. Returns the offset of the new object.
         pub fn setObj(self: *Self, ofs: Offset, key: [:0]const u8) Error!Offset {
+            const saved = saveLen(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_set_obj(self.ctx, ofs, key.ptr, &out_ofs)
             else
                 c.shim_lite3_set_obj(self.buf, &self.len, ofs, self.capacity, key.ptr, &out_ofs);
-            if (ret < 0) return translateError(ret);
+            if (ret < 0) {
+                restoreLen(self, saved);
+                return translateError(ret);
+            }
             return out_ofs;
         }
 
         /// Set a nested array for the given key. Returns the offset of the new array.
         pub fn setArr(self: *Self, ofs: Offset, key: [:0]const u8) Error!Offset {
+            const saved = saveLen(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_set_arr(self.ctx, ofs, key.ptr, &out_ofs)
             else
                 c.shim_lite3_set_arr(self.buf, &self.len, ofs, self.capacity, key.ptr, &out_ofs);
-            if (ret < 0) return translateError(ret);
+            if (ret < 0) {
+                restoreLen(self, saved);
+                return translateError(ret);
+            }
             return out_ofs;
         }
 
@@ -235,6 +286,7 @@ fn SharedMethods(comptime Self: type) type {
             else
                 c.shim_lite3_get_type(self.buf, self.len, ofs, key.ptr);
             if (ret < 0) return translateError(ret);
+            if (ret > Type.max_valid) return Error.CorruptData;
             const t: Type = @enumFromInt(@as(u8, @intCast(ret)));
             if (t == .invalid) return Error.NotFound;
             return t;
@@ -357,77 +409,109 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Append a null value to an array.
         pub fn arrAppendNull(self: *Self, ofs: Offset) Error!void {
+            const saved = saveLen(self);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_append_null(self.ctx, ofs)
             else
                 c.shim_lite3_arr_append_null(self.buf, &self.len, ofs, self.capacity);
-            if (ret < 0) return translateError(ret);
+            if (ret < 0) {
+                restoreLen(self, saved);
+                return translateError(ret);
+            }
         }
 
         /// Append a boolean value to an array.
         pub fn arrAppendBool(self: *Self, ofs: Offset, value: bool) Error!void {
+            const saved = saveLen(self);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_append_bool(self.ctx, ofs, value)
             else
                 c.shim_lite3_arr_append_bool(self.buf, &self.len, ofs, self.capacity, value);
-            if (ret < 0) return translateError(ret);
+            if (ret < 0) {
+                restoreLen(self, saved);
+                return translateError(ret);
+            }
         }
 
         /// Append an i64 value to an array.
         pub fn arrAppendI64(self: *Self, ofs: Offset, value: i64) Error!void {
+            const saved = saveLen(self);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_append_i64(self.ctx, ofs, value)
             else
                 c.shim_lite3_arr_append_i64(self.buf, &self.len, ofs, self.capacity, value);
-            if (ret < 0) return translateError(ret);
+            if (ret < 0) {
+                restoreLen(self, saved);
+                return translateError(ret);
+            }
         }
 
         /// Append an f64 value to an array.
         pub fn arrAppendF64(self: *Self, ofs: Offset, value: f64) Error!void {
+            const saved = saveLen(self);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_append_f64(self.ctx, ofs, value)
             else
                 c.shim_lite3_arr_append_f64(self.buf, &self.len, ofs, self.capacity, value);
-            if (ret < 0) return translateError(ret);
+            if (ret < 0) {
+                restoreLen(self, saved);
+                return translateError(ret);
+            }
         }
 
         /// Append a string value to an array.
         pub fn arrAppendStr(self: *Self, ofs: Offset, value: []const u8) Error!void {
+            const saved = saveLen(self);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_append_str(self.ctx, ofs, value.ptr, value.len)
             else
                 c.shim_lite3_arr_append_str(self.buf, &self.len, ofs, self.capacity, value.ptr, value.len);
-            if (ret < 0) return translateError(ret);
+            if (ret < 0) {
+                restoreLen(self, saved);
+                return translateError(ret);
+            }
         }
 
         /// Append a bytes value to an array.
         pub fn arrAppendBytes(self: *Self, ofs: Offset, value: []const u8) Error!void {
+            const saved = saveLen(self);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_append_bytes(self.ctx, ofs, value.ptr, value.len)
             else
                 c.shim_lite3_arr_append_bytes(self.buf, &self.len, ofs, self.capacity, value.ptr, value.len);
-            if (ret < 0) return translateError(ret);
+            if (ret < 0) {
+                restoreLen(self, saved);
+                return translateError(ret);
+            }
         }
 
         /// Append a nested object to an array. Returns the offset of the new object.
         pub fn arrAppendObj(self: *Self, ofs: Offset) Error!Offset {
+            const saved = saveLen(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_append_obj(self.ctx, ofs, &out_ofs)
             else
                 c.shim_lite3_arr_append_obj(self.buf, &self.len, ofs, self.capacity, &out_ofs);
-            if (ret < 0) return translateError(ret);
+            if (ret < 0) {
+                restoreLen(self, saved);
+                return translateError(ret);
+            }
             return out_ofs;
         }
 
         /// Append a nested array to an array. Returns the offset of the new array.
         pub fn arrAppendArr(self: *Self, ofs: Offset) Error!Offset {
+            const saved = saveLen(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_append_arr(self.ctx, ofs, &out_ofs)
             else
                 c.shim_lite3_arr_append_arr(self.buf, &self.len, ofs, self.capacity, &out_ofs);
-            if (ret < 0) return translateError(ret);
+            if (ret < 0) {
+                restoreLen(self, saved);
+                return translateError(ret);
+            }
             return out_ofs;
         }
 
@@ -521,13 +605,16 @@ fn SharedMethods(comptime Self: type) type {
         }
 
         /// Get the type of an array element by index.
-        pub fn arrGetType(self: *const Self, ofs: Offset, index: u32) Type {
+        pub fn arrGetType(self: *const Self, ofs: Offset, index: u32) Error!Type {
             const t = if (is_ctx)
                 c.shim_lite3_ctx_arr_get_type(self.ctx, ofs, index)
             else
                 c.shim_lite3_arr_get_type(self.buf, self.len, ofs, index);
-            if (t < 0) return .invalid;
-            return @enumFromInt(@as(u8, @intCast(t)));
+            if (t < 0) return translateError(t);
+            if (t > Type.max_valid) return Error.CorruptData;
+            const ret: Type = @enumFromInt(@as(u8, @intCast(t)));
+            if (ret == .invalid) return Error.NotFound;
+            return ret;
         }
 
         // --- Utility ---
@@ -567,7 +654,7 @@ fn SharedMethods(comptime Self: type) type {
             var out_len: usize = 0;
             const ptr: ?[*]u8 = @ptrCast(c.shim_lite3_json_enc(buf_ptr, buf_len, ofs, &out_len));
             if (ptr) |p| return p[0..out_len];
-            return Error.Unexpected;
+            return translateErrno();
         }
 
         /// Encode the buffer contents as a pretty-printed JSON string.
@@ -578,7 +665,7 @@ fn SharedMethods(comptime Self: type) type {
             var out_len: usize = 0;
             const ptr: ?[*]u8 = @ptrCast(c.shim_lite3_json_enc_pretty(buf_ptr, buf_len, ofs, &out_len));
             if (ptr) |p| return p[0..out_len];
-            return Error.Unexpected;
+            return translateErrno();
         }
 
         /// Get the value at the given key as a tagged union.
@@ -768,21 +855,21 @@ pub const Context = struct {
     /// Create a new context with default size.
     pub fn create() Error!Context {
         const ctx = c.shim_lite3_ctx_create();
-        if (ctx == null) return Error.Unexpected;
+        if (ctx == null) return Error.OutOfMemory;
         return Context{ .ctx = ctx.? };
     }
 
     /// Create a new context with a specific buffer size.
     pub fn createWithSize(bufsz: usize) Error!Context {
         const ctx = c.shim_lite3_ctx_create_with_size(bufsz);
-        if (ctx == null) return Error.Unexpected;
+        if (ctx == null) return Error.OutOfMemory;
         return Context{ .ctx = ctx.? };
     }
 
     /// Create a context by copying from an existing buffer.
     pub fn createFromBuf(buf: []const u8) Error!Context {
         const ctx = c.shim_lite3_ctx_create_from_buf(buf.ptr, buf.len);
-        if (ctx == null) return Error.Unexpected;
+        if (ctx == null) return Error.OutOfMemory;
         return Context{ .ctx = ctx.? };
     }
 

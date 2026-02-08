@@ -207,11 +207,11 @@ test "Buffer: array with mixed types" {
     try buf.arrAppendF64(lite3.root, 3.14);
     try buf.arrAppendStr(lite3.root, "hello");
 
-    try testing.expectEqual(lite3.Type.null, buf.arrGetType(lite3.root, 0));
-    try testing.expectEqual(lite3.Type.bool_, buf.arrGetType(lite3.root, 1));
-    try testing.expectEqual(lite3.Type.i64_, buf.arrGetType(lite3.root, 2));
-    try testing.expectEqual(lite3.Type.f64_, buf.arrGetType(lite3.root, 3));
-    try testing.expectEqual(lite3.Type.string, buf.arrGetType(lite3.root, 4));
+    try testing.expectEqual(lite3.Type.null, try buf.arrGetType(lite3.root, 0));
+    try testing.expectEqual(lite3.Type.bool_, try buf.arrGetType(lite3.root, 1));
+    try testing.expectEqual(lite3.Type.i64_, try buf.arrGetType(lite3.root, 2));
+    try testing.expectEqual(lite3.Type.f64_, try buf.arrGetType(lite3.root, 3));
+    try testing.expectEqual(lite3.Type.string, try buf.arrGetType(lite3.root, 4));
 
     try testing.expectEqual(true, try buf.arrGetBool(lite3.root, 1));
     try testing.expectEqual(@as(i64, 42), try buf.arrGetI64(lite3.root, 2));
@@ -1034,9 +1034,9 @@ test "Context: arrGetType" {
     try ctx.arrAppendI64(lite3.root, 42);
     try ctx.arrAppendStr(lite3.root, "hello");
     try ctx.arrAppendBool(lite3.root, true);
-    try testing.expectEqual(lite3.Type.i64_, ctx.arrGetType(lite3.root, 0));
-    try testing.expectEqual(lite3.Type.string, ctx.arrGetType(lite3.root, 1));
-    try testing.expectEqual(lite3.Type.bool_, ctx.arrGetType(lite3.root, 2));
+    try testing.expectEqual(lite3.Type.i64_, try ctx.arrGetType(lite3.root, 0));
+    try testing.expectEqual(lite3.Type.string, try ctx.arrGetType(lite3.root, 1));
+    try testing.expectEqual(lite3.Type.bool_, try ctx.arrGetType(lite3.root, 2));
 }
 
 // =========================================================================
