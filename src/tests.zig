@@ -1181,3 +1181,83 @@ test "Property: JSON encode-decode is idempotent for objects" {
 
     try testing.expectEqualStrings(json1, json2);
 }
+
+// =========================================================================
+// Error path tests: CorruptData, NoBufferSpace rollback, destroy safety
+// =========================================================================
+
+test "Buffer: corrupted buffer returns error, not valid data" {
+    // Build a valid object, then corrupt the buffer contents.
+    // The wrapper should return an error, never a valid result from garbage data.
+    var mem: [4096]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    try buf.setI64(lite3.root, "x", 42);
+
+    // Verify the key exists before corruption
+    try testing.expectEqual(@as(i64, 42), try buf.getI64(lite3.root, "x"));
+
+    // Corrupt the buffer data area (after the root node header)
+    const raw = buf.buf[0..buf.len];
+    @memset(raw[16..], 0xFF);
+
+    // After corruption, any lookup should return an error (not valid data)
+    const type_result = buf.getType(lite3.root, "x");
+    try testing.expect(std.meta.isError(type_result));
+
+    const val_result = buf.getI64(lite3.root, "x");
+    try testing.expect(std.meta.isError(val_result));
+}
+
+test "Buffer: mutation rollback preserves buffer length on NoBufferSpace" {
+    // Verify saveLen/restoreLen: after a failed mutation, buf.len is unchanged.
+    var mem: [96]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+
+    const len_before = buf.len;
+
+    // Try to write a string that won't fit in the tiny buffer
+    const result = buf.setStr(lite3.root, "big", "a]" ** 100);
+    try testing.expectError(error.NoBufferSpace, result);
+
+    // Buffer length must be restored to pre-mutation value
+    try testing.expectEqual(len_before, buf.len);
+}
+
+test "Context: destroy poisons the struct" {
+    // After destroy, the Context is set to undefined (poisoned).
+    // We verify destroy completes without error.
+    var ctx = try lite3.Context.create();
+    try ctx.initObj();
+    try ctx.setI64(lite3.root, "val", 1);
+    ctx.destroy();
+    // After destroy, ctx is undefined. We do not attempt to use it again.
+    // The test passes if destroy() did not crash or leak.
+}
+
+test "Context: createWithSize(0) returns OutOfMemory or creates empty context" {
+    // Edge case: requesting a zero-size context.
+    const result = lite3.Context.createWithSize(0);
+    if (result) |*ctx| {
+        var c = ctx.*;
+        c.destroy();
+    } else |_| {
+        // OutOfMemory is acceptable for zero-size
+    }
+}
+
+test "Buffer: corrupted array buffer returns error" {
+    var mem: [4096]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initArr(&mem);
+    try buf.arrAppendI64(lite3.root, 99);
+
+    // Verify the value is readable before corruption
+    try testing.expectEqual(@as(i64, 99), try buf.arrGetI64(lite3.root, 0));
+
+    // Corrupt the buffer data area
+    const raw = buf.buf[0..buf.len];
+    @memset(raw[16..], 0xFF);
+
+    // After corruption, lookups should return errors
+    const result = buf.arrGetI64(lite3.root, 0);
+    try testing.expect(std.meta.isError(result));
+}

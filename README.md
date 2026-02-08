@@ -17,12 +17,7 @@ Idiomatic [Zig](https://ziglang.org/) wrapper for [Lite³](https://github.com/fa
 - **Zig ≥ 0.15.2**
 - A C11-capable toolchain (provided by Zig)
 
-**Note:** If cloning from git, initialize submodules:
-```bash
-git clone --recurse-submodules <repo-url>
-# or if already cloned:
-git submodule update --init --recursive
-```
+The C source for lite3 is vendored directly in `vendor/lite3/` — no submodules needed.
 
 ## Quick start
 
@@ -163,7 +158,7 @@ lite3-zig/
 │   ├── basic.zig          # Basic usage example
 │   └── json_roundtrip.zig # JSON encode/decode example
 └── vendor/
-    └── lite3/          # Git submodule → github.com/fastserial/lite3
+    └── lite3/          # Vendored upstream sources (github.com/fastserial/lite3)
 ```
 
 ## Development
@@ -174,7 +169,7 @@ mise install          # Install Zig 0.15.2
 just test             # Run tests
 just test-release     # Run tests with ReleaseSafe
 just clean            # Remove build artifacts
-just update-vendor    # Update lite3 submodule
+just update-vendor    # Update vendored lite3 sources
 ```
 
 ## Architecture notes

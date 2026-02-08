@@ -3,6 +3,14 @@
 // Lite3 is a JSON-compatible zero-copy serialization format that encodes data
 // as a B-tree inside a single contiguous buffer, allowing O(log n) access and
 // mutation on any arbitrary field.
+//
+// Thread safety:
+//   Buffer and Context are NOT thread-safe. Concurrent reads and writes to the
+//   same instance require external synchronization (e.g. a Mutex). In particular:
+//   - Slices returned by getStr/getBytes point into the buffer and are
+//     invalidated by ANY subsequent mutation (including from another thread).
+//   - For Context, mutations may trigger realloc, invalidating ALL prior slices.
+//   - Iterators are invalidated by any mutation to the underlying buffer.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -42,15 +50,25 @@ pub const Error = error{
 };
 
 /// Translate a C return code (< 0 on error) into a Zig error.
+/// The lite3 C library returns -1 and sets errno on failure.
 fn translateError(ret: c_int) Error {
     std.debug.assert(ret < 0);
-    return translateErrno();
+    const raw_errno = std.c._errno().*;
+    // In debug builds, catch cases where C returned an error but forgot to set errno.
+    std.debug.assert(raw_errno != 0);
+    return mapErrno(raw_errno);
 }
 
 /// Translate the current errno value into a Zig error.
+/// Used for C functions that signal failure via NULL return rather than a negative code.
 fn translateErrno() Error {
     const raw_errno = std.c._errno().*;
     if (raw_errno == 0) return Error.Unexpected;
+    return mapErrno(raw_errno);
+}
+
+/// Map a raw errno integer to a Zig error.
+fn mapErrno(raw_errno: c_int) Error {
     const e_val: std.posix.E = @enumFromInt(@as(u16, @intCast(raw_errno)));
     return switch (e_val) {
         .NOENT => Error.NotFound,
@@ -874,8 +892,11 @@ pub const Context = struct {
     }
 
     /// Destroy the context, freeing all associated memory.
+    /// After calling destroy, the Context is poisoned and must not be used again.
+    /// In debug/safe builds, any subsequent use will trigger safety checks.
     pub fn destroy(self: *Context) void {
         c.shim_lite3_ctx_destroy(self.ctx);
+        self.* = undefined;
     }
 
     /// Return the underlying buffer pointer.

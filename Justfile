@@ -20,9 +20,9 @@ test-fast:
 clean:
     rm -rf .zig-cache zig-out
 
-# Update the lite3 submodule to latest
+# Update vendored lite3 sources from upstream
 update-vendor:
-    git submodule update --remote vendor/lite3
+    @echo "Vendored sources are in vendor/lite3/. Update manually from upstream."
 
 # Run benchmarks
 bench:
