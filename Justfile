@@ -23,3 +23,15 @@ clean:
 # Update the lite3 submodule to latest
 update-vendor:
     git submodule update --remote vendor/lite3
+
+# Run benchmarks
+bench:
+    zig build bench
+
+# Check source formatting
+fmt-check:
+    zig fmt --check src/lite3.zig src/tests.zig src/bench.zig
+
+# Format source files
+fmt:
+    zig fmt src/lite3.zig src/tests.zig src/bench.zig

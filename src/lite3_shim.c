@@ -18,10 +18,7 @@
 int shim_lite3_get_bool(const unsigned char *buf, size_t buflen, size_t ofs,
                         const char *key, bool *out)
 {
-    lite3_str s;
-    int ret = lite3_get_bool(buf, buflen, ofs, key, out);
-    (void)s;
-    return ret;
+    return lite3_get_bool(buf, buflen, ofs, key, out);
 }
 
 int shim_lite3_get_i64(const unsigned char *buf, size_t buflen, size_t ofs,
@@ -258,9 +255,9 @@ int shim_lite3_arr_get_type(const unsigned char *buf, size_t buflen, size_t ofs,
 
 /* ---- Buffer API: Utility ---- */
 
-int shim_lite3_count(unsigned char *buf, size_t buflen, size_t ofs, uint32_t *out)
+int shim_lite3_count(const unsigned char *buf, size_t buflen, size_t ofs, uint32_t *out)
 {
-    return lite3_count(buf, buflen, ofs, out);
+    return lite3_count((unsigned char *)buf, buflen, ofs, out);
 }
 
 /* ---- Buffer API: Iterator ---- */
@@ -428,6 +425,9 @@ int shim_lite3_ctx_arr_get_bytes(lite3_ctx *ctx, size_t ofs, uint32_t index, con
 
 int shim_lite3_ctx_arr_get_obj(lite3_ctx *ctx, size_t ofs, uint32_t index, size_t *out_ofs) { return lite3_ctx_arr_get_obj(ctx, ofs, index, out_ofs); }
 int shim_lite3_ctx_arr_get_arr(lite3_ctx *ctx, size_t ofs, uint32_t index, size_t *out_ofs) { return lite3_ctx_arr_get_arr(ctx, ofs, index, out_ofs); }
+int shim_lite3_ctx_arr_get_type(lite3_ctx *ctx, size_t ofs, uint32_t index) { return (int)lite3_ctx_arr_get_type(ctx, ofs, index); }
 
 int shim_lite3_ctx_count(lite3_ctx *ctx, size_t ofs, uint32_t *out) { return lite3_ctx_count(ctx, ofs, out); }
 int shim_lite3_ctx_import_from_buf(lite3_ctx *ctx, const unsigned char *buf, size_t buflen) { return lite3_ctx_import_from_buf(ctx, buf, buflen); }
+
+int shim_lite3_ctx_json_dec(lite3_ctx *ctx, const char *json_str, size_t json_len) { return lite3_ctx_json_dec(ctx, json_str, json_len); }

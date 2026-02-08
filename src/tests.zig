@@ -807,3 +807,377 @@ test "Integration: i64 boundary values" {
     try testing.expectEqual(std.math.minInt(i64), try buf.getI64(lite3.root, "min"));
     try testing.expectEqual(@as(i64, 0), try buf.getI64(lite3.root, "zero"));
 }
+
+// =========================================================================
+// Context API error tests
+// =========================================================================
+
+test "Context: error on key not found" {
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+
+    try ctx.initObj();
+    const result = ctx.getI64(lite3.root, "nonexistent");
+    try testing.expectError(lite3.Error.NotFound, result);
+}
+
+test "Context: error on type mismatch" {
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+
+    try ctx.initObj();
+    try ctx.setStr(lite3.root, "text", "hello");
+    const result = ctx.getI64(lite3.root, "text");
+    try testing.expectError(lite3.Error.InvalidArgument, result);
+}
+
+// =========================================================================
+// Previously untested methods
+// =========================================================================
+
+test "Context: bufPtr returns non-null" {
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+
+    try ctx.initObj();
+    const ptr = ctx.bufPtr();
+    try testing.expect(@intFromPtr(ptr) != 0);
+}
+
+test "Context: data returns valid slice" {
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+
+    try ctx.initObj();
+    try ctx.setI64(lite3.root, "x", 42);
+    const d = ctx.data();
+    try testing.expect(d.len > 0);
+}
+
+test "Context: arrGetStr" {
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+
+    try ctx.initArr();
+    try ctx.arrAppendStr(lite3.root, "alpha");
+    try ctx.arrAppendStr(lite3.root, "beta");
+
+    try testing.expectEqualStrings("alpha", try ctx.arrGetStr(lite3.root, 0));
+    try testing.expectEqualStrings("beta", try ctx.arrGetStr(lite3.root, 1));
+}
+
+test "Context: arrGetBytes" {
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+
+    try ctx.initArr();
+    try ctx.arrAppendBytes(lite3.root, &[_]u8{ 0xAA, 0xBB });
+    try ctx.arrAppendBytes(lite3.root, &[_]u8{ 0xCC, 0xDD });
+
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB }, try ctx.arrGetBytes(lite3.root, 0));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xCC, 0xDD }, try ctx.arrGetBytes(lite3.root, 1));
+}
+
+test "Context: jsonDecode" {
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+
+    const json =
+        \\{"name":"alice","age":30}
+    ;
+    try ctx.jsonDecode(json);
+
+    try testing.expectEqualStrings("alice", try ctx.getStr(lite3.root, "name"));
+    try testing.expectEqual(@as(i64, 30), try ctx.getI64(lite3.root, "age"));
+}
+
+test "Context: jsonDecode and then modify" {
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+
+    try ctx.jsonDecode(
+        \\{"x":1}
+    );
+    try ctx.setI64(lite3.root, "y", 2);
+
+    try testing.expectEqual(@as(i64, 1), try ctx.getI64(lite3.root, "x"));
+    try testing.expectEqual(@as(i64, 2), try ctx.getI64(lite3.root, "y"));
+}
+
+// =========================================================================
+// Edge case tests
+// =========================================================================
+
+test "Buffer: unicode string round-trip" {
+    var mem: [8192]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+
+    try buf.setStr(lite3.root, "emoji", "\xF0\x9F\x8E\x89");
+    try buf.setStr(lite3.root, "cjk", "\xE4\xB8\xAD\xE6\x96\x87");
+    try buf.setStr(lite3.root, "accent", "caf\xC3\xA9");
+
+    try testing.expectEqualStrings("\xF0\x9F\x8E\x89", try buf.getStr(lite3.root, "emoji"));
+    try testing.expectEqualStrings("\xE4\xB8\xAD\xE6\x96\x87", try buf.getStr(lite3.root, "cjk"));
+    try testing.expectEqualStrings("caf\xC3\xA9", try buf.getStr(lite3.root, "accent"));
+}
+
+test "Buffer: empty object count" {
+    var mem: [4096]u8 align(4) = undefined;
+    const buf = try lite3.Buffer.initObj(&mem);
+
+    try testing.expectEqual(@as(u32, 0), try buf.count(lite3.root));
+}
+
+test "Buffer: empty array count" {
+    var mem: [4096]u8 align(4) = undefined;
+    const buf = try lite3.Buffer.initArr(&mem);
+
+    try testing.expectEqual(@as(u32, 0), try buf.count(lite3.root));
+}
+
+test "Context: empty object count" {
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+
+    try ctx.initObj();
+    try testing.expectEqual(@as(u32, 0), try ctx.count(lite3.root));
+}
+
+test "Context: empty array count" {
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+
+    try ctx.initArr();
+    try testing.expectEqual(@as(u32, 0), try ctx.count(lite3.root));
+}
+
+test "Buffer: freeJson helper" {
+    var mem: [4096]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    try buf.setI64(lite3.root, "x", 1);
+
+    const json = try buf.jsonEncode(lite3.root);
+    defer lite3.freeJson(json);
+
+    try testing.expect(json.len > 0);
+}
+
+test "Context: freeJson helper" {
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+
+    try ctx.initObj();
+    try ctx.setI64(lite3.root, "x", 1);
+
+    const json = try ctx.jsonEncode(lite3.root);
+    defer lite3.freeJson(json);
+
+    try testing.expect(json.len > 0);
+}
+
+// =========================================================================
+// Negative tests (malformed JSON, OOB, wrong container type)
+// =========================================================================
+
+test "Buffer: jsonDecode with invalid JSON returns error" {
+    var mem: [8192]u8 align(4) = undefined;
+    const result = lite3.Buffer.jsonDecode(&mem, "{invalid json!!");
+    try testing.expectError(lite3.Error.InvalidArgument, result);
+}
+
+test "Buffer: jsonDecode with empty string returns error" {
+    var mem: [8192]u8 align(4) = undefined;
+    const result = lite3.Buffer.jsonDecode(&mem, "");
+    try testing.expectError(lite3.Error.InvalidArgument, result);
+}
+
+test "Buffer: array OOB index returns error" {
+    var mem: [4096]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initArr(&mem);
+    try buf.arrAppendI64(lite3.root, 42);
+    // Index 99 is out of bounds (only index 0 exists)
+    const result = buf.arrGetI64(lite3.root, 99);
+    try testing.expect(std.meta.isError(result));
+}
+
+test "Buffer: get from wrong container type" {
+    var mem: [4096]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initArr(&mem);
+    // Trying to get by key from an array (should fail)
+    const result = buf.getI64(lite3.root, "key");
+    try testing.expect(std.meta.isError(result));
+}
+
+test "Context: jsonDecode with invalid JSON returns error" {
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+    const result = ctx.jsonDecode("{not valid json}}}");
+    try testing.expect(std.meta.isError(result));
+}
+
+test "Buffer: set on wrong container type" {
+    var mem: [4096]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initArr(&mem);
+    // Trying to set by key on an array (should fail)
+    const result = buf.setI64(lite3.root, "key", 42);
+    try testing.expect(std.meta.isError(result));
+}
+
+// =========================================================================
+// Context.arrGetType test
+// =========================================================================
+
+test "Context: arrGetType" {
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+    try ctx.initArr();
+    try ctx.arrAppendI64(lite3.root, 42);
+    try ctx.arrAppendStr(lite3.root, "hello");
+    try ctx.arrAppendBool(lite3.root, true);
+    try testing.expectEqual(lite3.Type.i64_, ctx.arrGetType(lite3.root, 0));
+    try testing.expectEqual(lite3.Type.string, ctx.arrGetType(lite3.root, 1));
+    try testing.expectEqual(lite3.Type.bool_, ctx.arrGetType(lite3.root, 2));
+}
+
+// =========================================================================
+// Value tagged union test
+// =========================================================================
+
+test "Buffer: getValue returns correct tagged values" {
+    var mem: [8192]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    try buf.setI64(lite3.root, "num", 42);
+    try buf.setStr(lite3.root, "text", "hello");
+    try buf.setBool(lite3.root, "flag", true);
+    try buf.setNull(lite3.root, "nil");
+
+    const num_val = try buf.getValue(lite3.root, "num");
+    try testing.expectEqual(@as(i64, 42), num_val.i64_);
+
+    const str_val = try buf.getValue(lite3.root, "text");
+    try testing.expectEqualStrings("hello", str_val.string);
+
+    const bool_val = try buf.getValue(lite3.root, "flag");
+    try testing.expectEqual(true, bool_val.bool_);
+
+    const null_val = try buf.getValue(lite3.root, "nil");
+    try testing.expectEqual(lite3.Value.null, null_val);
+}
+
+// =========================================================================
+// getStrCopy / getBytesCopy tests
+// =========================================================================
+
+test "Buffer: getStrCopy copies into destination" {
+    var mem: [4096]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    try buf.setStr(lite3.root, "name", "alice");
+
+    var dest: [64]u8 = undefined;
+    const copied = try buf.getStrCopy(lite3.root, "name", &dest);
+    try testing.expectEqualStrings("alice", copied);
+}
+
+test "Buffer: getStrCopy with too-small buffer returns error" {
+    var mem: [4096]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    try buf.setStr(lite3.root, "name", "a long string value");
+
+    var dest: [5]u8 = undefined;
+    const result = buf.getStrCopy(lite3.root, "name", &dest);
+    try testing.expectError(lite3.Error.NoBufferSpace, result);
+}
+
+test "Context: getBytesCopy copies into destination" {
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+    try ctx.initObj();
+    try ctx.setBytes(lite3.root, "data", &[_]u8{ 0xDE, 0xAD });
+
+    var dest: [64]u8 = undefined;
+    const copied = try ctx.getBytesCopy(lite3.root, "data", &dest);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xDE, 0xAD }, copied);
+}
+
+// =========================================================================
+// Context getType unification test (Error!Type)
+// =========================================================================
+
+test "Context: getType returns Error!Type (unified)" {
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+    try ctx.initObj();
+    try ctx.setI64(lite3.root, "num", 42);
+
+    // getType now returns Error!Type, not plain Type
+    const t = try ctx.getType(lite3.root, "num");
+    try testing.expectEqual(lite3.Type.i64_, t);
+
+    // Non-existent key returns NotFound error
+    const result = ctx.getType(lite3.root, "missing");
+    try testing.expectError(lite3.Error.NotFound, result);
+}
+
+// =========================================================================
+// Integration: JSON round-trip preserves all types
+// =========================================================================
+
+test "Integration: JSON round-trip preserves all types" {
+    var mem: [16384]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    try buf.setNull(lite3.root, "n");
+    try buf.setBool(lite3.root, "b", true);
+    try buf.setI64(lite3.root, "i", -12345);
+    try buf.setF64(lite3.root, "f", 3.14);
+    try buf.setStr(lite3.root, "s", "hello");
+
+    const json = try buf.jsonEncode(lite3.root);
+    defer lite3.freeJson(json);
+
+    var mem2: [16384]u8 align(4) = undefined;
+    var buf2 = try lite3.Buffer.jsonDecode(&mem2, json);
+
+    try testing.expectEqual(lite3.Type.null, try buf2.getType(lite3.root, "n"));
+    try testing.expectEqual(true, try buf2.getBool(lite3.root, "b"));
+    try testing.expectEqual(@as(i64, -12345), try buf2.getI64(lite3.root, "i"));
+    try testing.expectEqualStrings("hello", try buf2.getStr(lite3.root, "s"));
+}
+
+// =========================================================================
+// Buffer data() consistency test
+// =========================================================================
+
+test "Buffer: data returns consistent slice after mutations" {
+    var mem: [4096]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    const d1 = buf.data();
+    try buf.setI64(lite3.root, "x", 1);
+    const d2 = buf.data();
+    // After mutation, data length should have grown
+    try testing.expect(d2.len > d1.len);
+}
+
+// =========================================================================
+// Property test: JSON encode-decode idempotency
+// =========================================================================
+
+test "Property: JSON encode-decode is idempotent for objects" {
+    // Create an object, encode to JSON, decode back, re-encode
+    // The two JSON strings should be identical
+    var mem1: [16384]u8 align(4) = undefined;
+    var buf1 = try lite3.Buffer.initObj(&mem1);
+    try buf1.setStr(lite3.root, "key", "value");
+    try buf1.setI64(lite3.root, "num", 42);
+    try buf1.setBool(lite3.root, "flag", false);
+
+    const json1 = try buf1.jsonEncode(lite3.root);
+    defer lite3.freeJson(json1);
+
+    var mem2: [16384]u8 align(4) = undefined;
+    var buf2 = try lite3.Buffer.jsonDecode(&mem2, json1);
+
+    const json2 = try buf2.jsonEncode(lite3.root);
+    defer lite3.freeJson(json2);
+
+    try testing.expectEqualStrings(json1, json2);
+}

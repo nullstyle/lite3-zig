@@ -7,6 +7,7 @@ pub fn build(b: *std.Build) void {
     // --- Options ---
     const enable_json = b.option(bool, "json", "Enable JSON conversion support (requires yyjson)") orelse true;
     const enable_error_messages = b.option(bool, "error-messages", "Enable lite3 error messages for debugging") orelse false;
+    const enable_lto = b.option(bool, "lto", "Enable link-time optimization for the C library") orelse false;
 
     // --- Paths ---
     const lite3_include_path = b.path("vendor/lite3/include");
@@ -24,7 +25,15 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    const c_flags: []const []const u8 = &.{
+    const c_flags: []const []const u8 = if (enable_lto) &.{
+        "-std=gnu11",
+        "-Wall",
+        "-Wextra",
+        "-Wpedantic",
+        "-Wno-gnu-statement-expression",
+        "-Wno-gnu-zero-variadic-macro-arguments",
+        "-flto",
+    } else &.{
         "-std=gnu11",
         "-Wall",
         "-Wextra",
@@ -65,7 +74,15 @@ pub fn build(b: *std.Build) void {
     }
 
     // Add the C shim file (with relaxed warnings for lite3 header quirks)
-    const shim_flags: []const []const u8 = &.{
+    const shim_flags: []const []const u8 = if (enable_lto) &.{
+        "-std=gnu11",
+        "-Wall",
+        "-Wextra",
+        "-Wno-pedantic",
+        "-Wno-gnu-statement-expression",
+        "-Wno-gnu-zero-variadic-macro-arguments",
+        "-flto",
+    } else &.{
         "-std=gnu11",
         "-Wall",
         "-Wextra",
@@ -121,4 +138,25 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run lite3-zig tests");
     test_step.dependOn(&run_tests.step);
+
+    // --- Benchmarks ---
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "lite3", .module = zig_mod },
+        },
+    });
+    bench_mod.addIncludePath(shim_include_path);
+    bench_mod.linkLibrary(lite3_lib);
+
+    const bench_exe = b.addExecutable(.{
+        .name = "lite3-bench",
+        .root_module = bench_mod,
+    });
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run lite3-zig benchmarks");
+    bench_step.dependOn(&run_bench.step);
 }

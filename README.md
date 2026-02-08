@@ -17,6 +17,13 @@ Idiomatic [Zig](https://ziglang.org/) wrapper for [Lite³](https://github.com/fa
 - **Zig ≥ 0.15.2**
 - A C11-capable toolchain (provided by Zig)
 
+**Note:** If cloning from git, initialize submodules:
+```bash
+git clone --recurse-submodules <repo-url>
+# or if already cloned:
+git submodule update --init --recursive
+```
+
 ## Quick start
 
 ```zig
@@ -35,7 +42,7 @@ const name = try ctx.getStr(lite3.root, "name");
 
 // Encode to JSON
 const json = try ctx.jsonEncode(lite3.root);
-defer std.c.free(@ptrCast(@constCast(json.ptr)));
+defer lite3.freeJson(json);
 ```
 
 ```zig
@@ -68,6 +75,12 @@ zig build -Doptimize=ReleaseFast
 | `-Djson=false`     | `true`  | Disable JSON encode/decode support           |
 | `-Derror-messages` | `false` | Enable lite3 debug error messages to stdout  |
 
+### Running benchmarks
+
+```bash
+zig build bench
+```
+
 ## Using as a dependency
 
 Add this package to your `build.zig.zon`:
@@ -90,6 +103,13 @@ const lite3_dep = b.dependency("lite3", .{
 });
 exe.root_module.addImport("lite3", lite3_dep.module("lite3"));
 ```
+
+## Examples
+
+See the `examples/` directory for standalone example programs:
+
+- **`basic.zig`** --- Creating documents, setting/getting values, nested objects and arrays, iteration
+- **`json_roundtrip.zig`** --- JSON encode/decode round-trips with both Buffer and Context APIs
 
 ## API overview
 
@@ -132,12 +152,16 @@ lite3-zig/
 ├── build.zig           # Zig build system
 ├── build.zig.zon       # Package metadata
 ├── Justfile            # Task automation
-├── .mise.toml          # Dev environment (zig 0.14.0)
+├── .mise.toml          # Dev environment (Zig 0.15.2)
 ├── src/
 │   ├── lite3.zig       # Zig wrapper module
 │   ├── lite3_shim.c    # C shim for inline functions
 │   ├── lite3_shim.h    # C shim header
-│   └── tests.zig       # Comprehensive test suite (56 tests)
+│   ├── bench.zig       # Benchmarks
+│   └── tests.zig       # Comprehensive test suite (73+ tests)
+├── examples/
+│   ├── basic.zig          # Basic usage example
+│   └── json_roundtrip.zig # JSON encode/decode example
 └── vendor/
     └── lite3/          # Git submodule → github.com/fastserial/lite3
 ```
@@ -146,7 +170,7 @@ lite3-zig/
 
 ```bash
 # With mise and just installed:
-mise install          # Install Zig 0.14.0
+mise install          # Install Zig 0.15.2
 just test             # Run tests
 just test-release     # Run tests with ReleaseSafe
 just clean            # Remove build artifacts
@@ -165,4 +189,4 @@ The C library is always compiled with `-OReleaseFast` regardless of the Zig opti
 
 ## License
 
-This wrapper is provided under the same license as the upstream [Lite³](https://github.com/fastserial/lite3) library.
+MIT License. See [LICENSE](LICENSE) for details.

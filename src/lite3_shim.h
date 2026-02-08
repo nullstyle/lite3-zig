@@ -75,11 +75,11 @@ int shim_lite3_arr_get_arr(const unsigned char *buf, size_t buflen, size_t ofs, 
 int shim_lite3_arr_get_type(const unsigned char *buf, size_t buflen, size_t ofs, uint32_t index);
 
 /* ---- Buffer API: Utility ---- */
-int shim_lite3_count(unsigned char *buf, size_t buflen, size_t ofs, uint32_t *out);
+int shim_lite3_count(const unsigned char *buf, size_t buflen, size_t ofs, uint32_t *out);
 
 /* ---- Buffer API: Iterator ---- */
 typedef struct {
-    size_t _opaque[8];
+    uint32_t _opaque[16];
 } shim_lite3_iter;
 
 int shim_lite3_iter_create(const unsigned char *buf, size_t buflen, size_t ofs, shim_lite3_iter *iter);
@@ -145,9 +145,11 @@ int shim_lite3_ctx_arr_get_str(lite3_ctx *ctx, size_t ofs, uint32_t index, const
 int shim_lite3_ctx_arr_get_bytes(lite3_ctx *ctx, size_t ofs, uint32_t index, const unsigned char **out_ptr, uint32_t *out_len);
 int shim_lite3_ctx_arr_get_obj(lite3_ctx *ctx, size_t ofs, uint32_t index, size_t *out_ofs);
 int shim_lite3_ctx_arr_get_arr(lite3_ctx *ctx, size_t ofs, uint32_t index, size_t *out_ofs);
+int shim_lite3_ctx_arr_get_type(lite3_ctx *ctx, size_t ofs, uint32_t index);
 
 int shim_lite3_ctx_count(lite3_ctx *ctx, size_t ofs, uint32_t *out);
 int shim_lite3_ctx_import_from_buf(lite3_ctx *ctx, const unsigned char *buf, size_t buflen);
+int shim_lite3_ctx_json_dec(lite3_ctx *ctx, const char *json_str, size_t json_len);
 
 #ifdef __cplusplus
 }
