@@ -14,10 +14,14 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("lite3_build_options");
 
 const c = @cImport({
     @cInclude("lite3_shim.h");
 });
+
+/// True when JSON conversion support is compiled in.
+pub const json_enabled: bool = build_options.json_enabled;
 
 comptime {
     if (builtin.target.cpu.arch.endian() == .big)
@@ -69,7 +73,8 @@ fn translateErrno() Error {
 
 /// Map a raw errno integer to a Zig error.
 fn mapErrno(raw_errno: c_int) Error {
-    const e_val: std.posix.E = @enumFromInt(@as(u16, @intCast(raw_errno)));
+    const raw_u16 = std.math.cast(u16, raw_errno) orelse return Error.Unexpected;
+    const e_val: std.posix.E = @enumFromInt(raw_u16);
     return switch (e_val) {
         .NOENT => Error.NotFound,
         .INVAL => Error.InvalidArgument,
@@ -123,11 +128,22 @@ pub const Offset = usize;
 /// Root offset constant.
 pub const root: Offset = 0;
 
-/// Free a JSON string returned by `Buffer.jsonEncode`, `Buffer.jsonEncodePretty`,
-/// `Context.jsonEncode`, or `Context.jsonEncodePretty`.
-pub fn freeJson(json: []const u8) void {
-    std.c.free(@ptrCast(@constCast(json.ptr)));
-}
+/// An opaque handle to a C-allocated JSON string.
+/// Must be freed by calling `deinit()` exactly once.
+pub const JsonString = struct {
+    ptr: [*]u8,
+    len: usize,
+
+    /// Return the JSON content as a slice.
+    pub fn slice(self: JsonString) []const u8 {
+        return self.ptr[0..self.len];
+    }
+
+    /// Free the C-allocated JSON string. Must be called exactly once.
+    pub fn deinit(self: JsonString) void {
+        std.c.free(self.ptr);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Iterator (shared by Buffer and Context)
@@ -665,24 +681,28 @@ fn SharedMethods(comptime Self: type) type {
         // --- JSON ---
 
         /// Encode the buffer contents as a JSON string.
-        /// The returned slice is allocated by the C library and must be freed with `freeJson`.
-        pub fn jsonEncode(self: *const Self, ofs: Offset) Error![]const u8 {
+        /// The returned `JsonString` is allocated by the C library and must be freed with `.deinit()`.
+        pub fn jsonEncode(self: *const Self, ofs: Offset) Error!JsonString {
+            if (!json_enabled) return Error.InvalidArgument;
             const buf_ptr: [*]const u8 = if (is_ctx) c.shim_lite3_ctx_buf(self.ctx) else self.buf;
             const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.ctx) else self.len;
             var out_len: usize = 0;
+            std.c._errno().* = 0;
             const ptr: ?[*]u8 = @ptrCast(c.shim_lite3_json_enc(buf_ptr, buf_len, ofs, &out_len));
-            if (ptr) |p| return p[0..out_len];
+            if (ptr) |p| return JsonString{ .ptr = p, .len = out_len };
             return translateErrno();
         }
 
         /// Encode the buffer contents as a pretty-printed JSON string.
-        /// The returned slice is allocated by the C library and must be freed with `freeJson`.
-        pub fn jsonEncodePretty(self: *const Self, ofs: Offset) Error![]const u8 {
+        /// The returned `JsonString` is allocated by the C library and must be freed with `.deinit()`.
+        pub fn jsonEncodePretty(self: *const Self, ofs: Offset) Error!JsonString {
+            if (!json_enabled) return Error.InvalidArgument;
             const buf_ptr: [*]const u8 = if (is_ctx) c.shim_lite3_ctx_buf(self.ctx) else self.buf;
             const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.ctx) else self.len;
             var out_len: usize = 0;
+            std.c._errno().* = 0;
             const ptr: ?[*]u8 = @ptrCast(c.shim_lite3_json_enc_pretty(buf_ptr, buf_len, ofs, &out_len));
-            if (ptr) |p| return p[0..out_len];
+            if (ptr) |p| return JsonString{ .ptr = p, .len = out_len };
             return translateErrno();
         }
 
@@ -793,6 +813,7 @@ pub const Buffer = struct {
 
     /// Decode a JSON string into a buffer, reinitializing it.
     pub fn jsonDecode(mem: []align(4) u8, json: []const u8) Error!Buffer {
+        if (!json_enabled) return Error.InvalidArgument;
         var buflen: usize = 0;
         const ret = c.shim_lite3_json_dec(mem.ptr, &buflen, mem.len, json.ptr, json.len);
         if (ret < 0) return translateError(ret);
@@ -806,6 +827,7 @@ pub const Buffer = struct {
     /// Encode the buffer contents as JSON into a caller-supplied buffer.
     /// Returns the number of bytes written.
     pub fn jsonEncodeBuf(self: *const Buffer, ofs: Offset, out: []u8) Error!usize {
+        if (!json_enabled) return Error.InvalidArgument;
         const ret = c.shim_lite3_json_enc_buf(self.buf, self.len, ofs, out.ptr, out.len);
         if (ret < 0) return translateError(@intCast(ret));
         return @intCast(ret);
@@ -925,6 +947,7 @@ pub const Context = struct {
 
     /// Decode a JSON string into this context.
     pub fn jsonDecode(self: *Context, json: []const u8) Error!void {
+        if (!json_enabled) return Error.InvalidArgument;
         const ret = c.shim_lite3_ctx_json_dec(self.ctx, json.ptr, json.len);
         if (ret < 0) return translateError(ret);
     }

@@ -37,7 +37,7 @@ const name = try ctx.getStr(lite3.root, "name");
 
 // Encode to JSON
 const json = try ctx.jsonEncode(lite3.root);
-defer lite3.freeJson(json);
+defer json.deinit();
 ```
 
 ```zig
@@ -67,8 +67,9 @@ zig build -Doptimize=ReleaseFast
 
 | Option             | Default | Description                                  |
 |--------------------|---------|----------------------------------------------|
-| `-Djson=false`     | `true`  | Disable JSON encode/decode support           |
+| `-Djson=false`     | `true`  | Disable JSON backend; JSON APIs return `error.InvalidArgument` |
 | `-Derror-messages` | `false` | Enable lite3 debug error messages to stdout  |
+| `-Dlto=true`       | `false` | Currently unsupported (build fails fast with a clear message) |
 
 ### Running benchmarks
 
@@ -152,8 +153,9 @@ lite3-zig/
 │   ├── lite3.zig       # Zig wrapper module
 │   ├── lite3_shim.c    # C shim for inline functions
 │   ├── lite3_shim.h    # C shim header
+│   ├── lite3_json_disabled.c # JSON stubs for -Djson=false
 │   ├── bench.zig       # Benchmarks
-│   └── tests.zig       # Comprehensive test suite (73+ tests)
+│   └── tests.zig       # Comprehensive test suite
 ├── examples/
 │   ├── basic.zig          # Basic usage example
 │   └── json_roundtrip.zig # JSON encode/decode example
@@ -168,6 +170,7 @@ lite3-zig/
 mise install          # Install Zig 0.15.2
 just test             # Run tests
 just test-release     # Run tests with ReleaseSafe
+just test-no-json     # Run tests with JSON backend disabled
 just clean            # Remove build artifacts
 just update-vendor    # Update vendored lite3 sources
 ```

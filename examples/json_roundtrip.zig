@@ -29,19 +29,19 @@ pub fn main() !void {
 
     // Encode to JSON
     const json = try buf.jsonEncode(lite3.root);
-    defer lite3.freeJson(json);
+    defer json.deinit();
 
-    try stdout.print("Compact JSON:\n{s}\n\n", .{json});
+    try stdout.print("Compact JSON:\n{s}\n\n", .{json.slice()});
 
     // Pretty-print
     const pretty = try buf.jsonEncodePretty(lite3.root);
-    defer lite3.freeJson(pretty);
+    defer pretty.deinit();
 
-    try stdout.print("Pretty JSON:\n{s}\n\n", .{pretty});
+    try stdout.print("Pretty JSON:\n{s}\n\n", .{pretty.slice()});
 
     // Decode back into a new buffer
     var mem2: [16384]u8 align(4) = undefined;
-    var buf2 = try lite3.Buffer.jsonDecode(&mem2, json);
+    var buf2 = try lite3.Buffer.jsonDecode(&mem2, json.slice());
 
     // Verify round-trip
     try stdout.print("Round-trip verification:\n", .{});
@@ -55,12 +55,12 @@ pub fn main() !void {
 
     // Encode the decoded buffer to verify identical JSON
     const json2 = try buf2.jsonEncode(lite3.root);
-    defer lite3.freeJson(json2);
+    defer json2.deinit();
 
-    if (std.mem.eql(u8, json, json2)) {
+    if (std.mem.eql(u8, json.slice(), json2.slice())) {
         try stdout.print("\nJSON round-trip: PASSED (identical output)\n", .{});
     } else {
-        try stdout.print("\nJSON round-trip: DIFFERENT\n  original: {s}\n  decoded:  {s}\n", .{ json, json2 });
+        try stdout.print("\nJSON round-trip: DIFFERENT\n  original: {s}\n  decoded:  {s}\n", .{ json.slice(), json2.slice() });
     }
 
     // Context API JSON decode

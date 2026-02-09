@@ -321,6 +321,8 @@ test "Buffer: array iterator" {
 }
 
 test "Buffer: JSON encode and decode round-trip" {
+    if (!lite3.json_enabled) return;
+
     var mem: [8192]u8 align(4) = undefined;
     var buf = try lite3.Buffer.initObj(&mem);
 
@@ -329,11 +331,11 @@ test "Buffer: JSON encode and decode round-trip" {
     try buf.setBool(lite3.root, "active", true);
 
     const json = try buf.jsonEncode(lite3.root);
-    defer std.c.free(@ptrCast(@constCast(json.ptr)));
+    defer json.deinit();
 
     // Decode the JSON back into a new buffer
     var mem2: [8192]u8 align(4) = undefined;
-    var buf2 = try lite3.Buffer.jsonDecode(&mem2, json);
+    var buf2 = try lite3.Buffer.jsonDecode(&mem2, json.slice());
 
     try testing.expectEqual(@as(i64, 42), try buf2.getI64(lite3.root, "value"));
     try testing.expectEqual(true, try buf2.getBool(lite3.root, "active"));
@@ -341,19 +343,23 @@ test "Buffer: JSON encode and decode round-trip" {
 }
 
 test "Buffer: JSON pretty encode" {
+    if (!lite3.json_enabled) return;
+
     var mem: [8192]u8 align(4) = undefined;
     var buf = try lite3.Buffer.initObj(&mem);
 
     try buf.setI64(lite3.root, "x", 1);
 
     const json = try buf.jsonEncodePretty(lite3.root);
-    defer std.c.free(@ptrCast(@constCast(json.ptr)));
+    defer json.deinit();
 
     // Pretty JSON should contain newlines and indentation
-    try testing.expect(std.mem.indexOf(u8, json, "\n") != null);
+    try testing.expect(std.mem.indexOf(u8, json.slice(), "\n") != null);
 }
 
 test "Buffer: JSON encode to buffer" {
+    if (!lite3.json_enabled) return;
+
     var mem: [8192]u8 align(4) = undefined;
     var buf = try lite3.Buffer.initObj(&mem);
 
@@ -368,6 +374,8 @@ test "Buffer: JSON encode to buffer" {
 }
 
 test "Buffer: JSON decode from string" {
+    if (!lite3.json_enabled) return;
+
     const json =
         \\{"name":"alice","age":30,"scores":[100,95,88]}
     ;
@@ -594,6 +602,8 @@ test "Context: iterator" {
 }
 
 test "Context: JSON encode" {
+    if (!lite3.json_enabled) return;
+
     var ctx = try lite3.Context.create();
     defer ctx.destroy();
 
@@ -602,14 +612,16 @@ test "Context: JSON encode" {
     try ctx.setI64(lite3.root, "code", 200);
 
     const json = try ctx.jsonEncode(lite3.root);
-    defer std.c.free(@ptrCast(@constCast(json.ptr)));
+    defer json.deinit();
 
-    try testing.expect(json.len > 0);
-    try testing.expect(std.mem.indexOf(u8, json, "hello") != null);
-    try testing.expect(std.mem.indexOf(u8, json, "200") != null);
+    try testing.expect(json.slice().len > 0);
+    try testing.expect(std.mem.indexOf(u8, json.slice(), "hello") != null);
+    try testing.expect(std.mem.indexOf(u8, json.slice(), "200") != null);
 }
 
 test "Context: JSON pretty encode" {
+    if (!lite3.json_enabled) return;
+
     var ctx = try lite3.Context.create();
     defer ctx.destroy();
 
@@ -617,9 +629,9 @@ test "Context: JSON pretty encode" {
     try ctx.setI64(lite3.root, "x", 1);
 
     const json = try ctx.jsonEncodePretty(lite3.root);
-    defer std.c.free(@ptrCast(@constCast(json.ptr)));
+    defer json.deinit();
 
-    try testing.expect(std.mem.indexOf(u8, json, "\n") != null);
+    try testing.expect(std.mem.indexOf(u8, json.slice(), "\n") != null);
 }
 
 test "Context: create with size" {
@@ -663,6 +675,8 @@ test "Context: import from buffer" {
 // =========================================================================
 
 test "Integration: build complex document and JSON round-trip" {
+    if (!lite3.json_enabled) return;
+
     var ctx = try lite3.Context.create();
     defer ctx.destroy();
 
@@ -682,11 +696,11 @@ test "Integration: build complex document and JSON round-trip" {
 
     // Encode to JSON
     const json = try ctx.jsonEncode(lite3.root);
-    defer std.c.free(@ptrCast(@constCast(json.ptr)));
+    defer json.deinit();
 
     // Decode back
     var mem: [16384]u8 align(4) = undefined;
-    var buf = try lite3.Buffer.jsonDecode(&mem, json);
+    var buf = try lite3.Buffer.jsonDecode(&mem, json.slice());
 
     try testing.expectEqual(@as(i64, 47), try buf.getI64(lite3.root, "duration_ms"));
     try testing.expectEqualStrings("POST", try buf.getStr(lite3.root, "method"));
@@ -751,6 +765,8 @@ test "Integration: array of objects pattern" {
 }
 
 test "Integration: JSON decode complex document" {
+    if (!lite3.json_enabled) return;
+
     const json =
         \\{
         \\  "users": [
@@ -879,6 +895,8 @@ test "Context: arrGetBytes" {
 }
 
 test "Context: jsonDecode" {
+    if (!lite3.json_enabled) return;
+
     var ctx = try lite3.Context.create();
     defer ctx.destroy();
 
@@ -892,6 +910,8 @@ test "Context: jsonDecode" {
 }
 
 test "Context: jsonDecode and then modify" {
+    if (!lite3.json_enabled) return;
+
     var ctx = try lite3.Context.create();
     defer ctx.destroy();
 
@@ -951,18 +971,22 @@ test "Context: empty array count" {
     try testing.expectEqual(@as(u32, 0), try ctx.count(lite3.root));
 }
 
-test "Buffer: freeJson helper" {
+test "Buffer: JsonString lifecycle" {
+    if (!lite3.json_enabled) return;
+
     var mem: [4096]u8 align(4) = undefined;
     var buf = try lite3.Buffer.initObj(&mem);
     try buf.setI64(lite3.root, "x", 1);
 
     const json = try buf.jsonEncode(lite3.root);
-    defer lite3.freeJson(json);
+    defer json.deinit();
 
-    try testing.expect(json.len > 0);
+    try testing.expect(json.slice().len > 0);
 }
 
-test "Context: freeJson helper" {
+test "Context: JsonString lifecycle" {
+    if (!lite3.json_enabled) return;
+
     var ctx = try lite3.Context.create();
     defer ctx.destroy();
 
@@ -970,9 +994,9 @@ test "Context: freeJson helper" {
     try ctx.setI64(lite3.root, "x", 1);
 
     const json = try ctx.jsonEncode(lite3.root);
-    defer lite3.freeJson(json);
+    defer json.deinit();
 
-    try testing.expect(json.len > 0);
+    try testing.expect(json.slice().len > 0);
 }
 
 // =========================================================================
@@ -997,7 +1021,7 @@ test "Buffer: array OOB index returns error" {
     try buf.arrAppendI64(lite3.root, 42);
     // Index 99 is out of bounds (only index 0 exists)
     const result = buf.arrGetI64(lite3.root, 99);
-    try testing.expect(std.meta.isError(result));
+    try testing.expectError(lite3.Error.InvalidArgument, result);
 }
 
 test "Buffer: get from wrong container type" {
@@ -1005,14 +1029,36 @@ test "Buffer: get from wrong container type" {
     var buf = try lite3.Buffer.initArr(&mem);
     // Trying to get by key from an array (should fail)
     const result = buf.getI64(lite3.root, "key");
-    try testing.expect(std.meta.isError(result));
+    try testing.expectError(lite3.Error.InvalidArgument, result);
 }
 
 test "Context: jsonDecode with invalid JSON returns error" {
     var ctx = try lite3.Context.create();
     defer ctx.destroy();
     const result = ctx.jsonDecode("{not valid json}}}");
-    try testing.expect(std.meta.isError(result));
+    try testing.expectError(lite3.Error.InvalidArgument, result);
+}
+
+test "JSON APIs return InvalidArgument when JSON support is disabled" {
+    if (lite3.json_enabled) return;
+
+    var mem: [4096]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    try buf.setI64(lite3.root, "x", 1);
+
+    try testing.expectError(lite3.Error.InvalidArgument, buf.jsonEncode(lite3.root));
+
+    var json_buf: [128]u8 = undefined;
+    try testing.expectError(lite3.Error.InvalidArgument, buf.jsonEncodeBuf(lite3.root, &json_buf));
+
+    var mem2: [4096]u8 align(4) = undefined;
+    try testing.expectError(lite3.Error.InvalidArgument, lite3.Buffer.jsonDecode(&mem2, "{}"));
+
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+    try ctx.initObj();
+    try testing.expectError(lite3.Error.InvalidArgument, ctx.jsonEncode(lite3.root));
+    try testing.expectError(lite3.Error.InvalidArgument, ctx.jsonDecode("{}"));
 }
 
 test "Buffer: set on wrong container type" {
@@ -1020,7 +1066,7 @@ test "Buffer: set on wrong container type" {
     var buf = try lite3.Buffer.initArr(&mem);
     // Trying to set by key on an array (should fail)
     const result = buf.setI64(lite3.root, "key", 42);
-    try testing.expect(std.meta.isError(result));
+    try testing.expectError(lite3.Error.InvalidArgument, result);
 }
 
 // =========================================================================
@@ -1123,6 +1169,8 @@ test "Context: getType returns Error!Type (unified)" {
 // =========================================================================
 
 test "Integration: JSON round-trip preserves all types" {
+    if (!lite3.json_enabled) return;
+
     var mem: [16384]u8 align(4) = undefined;
     var buf = try lite3.Buffer.initObj(&mem);
     try buf.setNull(lite3.root, "n");
@@ -1132,10 +1180,10 @@ test "Integration: JSON round-trip preserves all types" {
     try buf.setStr(lite3.root, "s", "hello");
 
     const json = try buf.jsonEncode(lite3.root);
-    defer lite3.freeJson(json);
+    defer json.deinit();
 
     var mem2: [16384]u8 align(4) = undefined;
-    var buf2 = try lite3.Buffer.jsonDecode(&mem2, json);
+    var buf2 = try lite3.Buffer.jsonDecode(&mem2, json.slice());
 
     try testing.expectEqual(lite3.Type.null, try buf2.getType(lite3.root, "n"));
     try testing.expectEqual(true, try buf2.getBool(lite3.root, "b"));
@@ -1162,6 +1210,8 @@ test "Buffer: data returns consistent slice after mutations" {
 // =========================================================================
 
 test "Property: JSON encode-decode is idempotent for objects" {
+    if (!lite3.json_enabled) return;
+
     // Create an object, encode to JSON, decode back, re-encode
     // The two JSON strings should be identical
     var mem1: [16384]u8 align(4) = undefined;
@@ -1171,15 +1221,15 @@ test "Property: JSON encode-decode is idempotent for objects" {
     try buf1.setBool(lite3.root, "flag", false);
 
     const json1 = try buf1.jsonEncode(lite3.root);
-    defer lite3.freeJson(json1);
+    defer json1.deinit();
 
     var mem2: [16384]u8 align(4) = undefined;
-    var buf2 = try lite3.Buffer.jsonDecode(&mem2, json1);
+    var buf2 = try lite3.Buffer.jsonDecode(&mem2, json1.slice());
 
     const json2 = try buf2.jsonEncode(lite3.root);
-    defer lite3.freeJson(json2);
+    defer json2.deinit();
 
-    try testing.expectEqualStrings(json1, json2);
+    try testing.expectEqualStrings(json1.slice(), json2.slice());
 }
 
 // =========================================================================
@@ -1200,7 +1250,9 @@ test "Buffer: corrupted buffer returns error, not valid data" {
     const raw = buf.buf[0..buf.len];
     @memset(raw[16..], 0xFF);
 
-    // After corruption, any lookup should return an error (not valid data)
+    // After corruption, any lookup should return an error (not valid data).
+    // The specific error depends on how the C library interprets the corrupted bytes;
+    // it may return CorruptData (EBADMSG), NotFound (ENOENT), or InvalidArgument (EINVAL).
     const type_result = buf.getType(lite3.root, "x");
     try testing.expect(std.meta.isError(type_result));
 
@@ -1257,7 +1309,8 @@ test "Buffer: corrupted array buffer returns error" {
     const raw = buf.buf[0..buf.len];
     @memset(raw[16..], 0xFF);
 
-    // After corruption, lookups should return errors
+    // After corruption, lookups should return errors.
+    // The specific error depends on how the C library interprets the corrupted bytes.
     const result = buf.arrGetI64(lite3.root, 0);
     try testing.expect(std.meta.isError(result));
 }
