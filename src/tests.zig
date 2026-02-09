@@ -112,8 +112,8 @@ test "Buffer: exists and not found" {
     var buf = try lite3.Buffer.initObj(&mem);
 
     try buf.setI64(lite3.root, "present", 1);
-    try testing.expect(buf.exists(lite3.root, "present"));
-    try testing.expect(!buf.exists(lite3.root, "absent"));
+    try testing.expect(try buf.exists(lite3.root, "present"));
+    try testing.expect(!try buf.exists(lite3.root, "absent"));
 }
 
 test "Buffer: get type" {
@@ -485,7 +485,7 @@ test "Context: set and get all types" {
     try ctx.setStr(lite3.root, "text", "hello");
     try ctx.setBytes(lite3.root, "data", &[_]u8{ 0xCA, 0xFE });
 
-    try testing.expectEqual(lite3.Type.null, ctx.getType(lite3.root, "nil"));
+    try testing.expectEqual(lite3.Type.null, try ctx.getType(lite3.root, "nil"));
     try testing.expectEqual(true, try ctx.getBool(lite3.root, "flag"));
     try testing.expectEqual(@as(i64, 123), try ctx.getI64(lite3.root, "num"));
     try testing.expectApproxEqAbs(@as(f64, 2.718), try ctx.getF64(lite3.root, "decimal"), 1e-10);
@@ -499,8 +499,8 @@ test "Context: exists" {
 
     try ctx.initObj();
     try ctx.setI64(lite3.root, "present", 1);
-    try testing.expect(ctx.exists(lite3.root, "present"));
-    try testing.expect(!ctx.exists(lite3.root, "absent"));
+    try testing.expect(try ctx.exists(lite3.root, "present"));
+    try testing.expect(!try ctx.exists(lite3.root, "absent"));
 }
 
 test "Context: count" {
@@ -1313,4 +1313,103 @@ test "Buffer: corrupted array buffer returns error" {
     // The specific error depends on how the C library interprets the corrupted bytes.
     const result = buf.arrGetI64(lite3.root, 0);
     try testing.expect(std.meta.isError(result));
+}
+
+// =========================================================================
+// arrGetStrCopy / arrGetBytesCopy tests
+// =========================================================================
+
+test "Buffer: arrGetStrCopy copies array string safely" {
+    var mem: [8192]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initArr(&mem);
+
+    try buf.arrAppendStr(lite3.root, "hello");
+    try buf.arrAppendStr(lite3.root, "world");
+
+    var dest: [64]u8 = undefined;
+    const copied = try buf.arrGetStrCopy(lite3.root, 0, &dest);
+    try testing.expectEqualStrings("hello", copied);
+
+    const copied2 = try buf.arrGetStrCopy(lite3.root, 1, &dest);
+    try testing.expectEqualStrings("world", copied2);
+}
+
+test "Buffer: arrGetStrCopy with too-small buffer returns error" {
+    var mem: [8192]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initArr(&mem);
+
+    try buf.arrAppendStr(lite3.root, "a long string value");
+
+    var dest: [5]u8 = undefined;
+    const result = buf.arrGetStrCopy(lite3.root, 0, &dest);
+    try testing.expectError(lite3.Error.NoBufferSpace, result);
+}
+
+test "Buffer: arrGetBytesCopy copies array bytes safely" {
+    var mem: [8192]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initArr(&mem);
+
+    try buf.arrAppendBytes(lite3.root, &[_]u8{ 0xAA, 0xBB, 0xCC });
+
+    var dest: [64]u8 = undefined;
+    const copied = try buf.arrGetBytesCopy(lite3.root, 0, &dest);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB, 0xCC }, copied);
+}
+
+test "Context: arrGetStrCopy copies array string safely" {
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+
+    try ctx.initArr();
+    try ctx.arrAppendStr(lite3.root, "alpha");
+    try ctx.arrAppendStr(lite3.root, "beta");
+
+    var dest: [64]u8 = undefined;
+    const copied = try ctx.arrGetStrCopy(lite3.root, 0, &dest);
+    try testing.expectEqualStrings("alpha", copied);
+}
+
+// =========================================================================
+// Dangling pointer mitigation test
+// =========================================================================
+
+test "Context: getStrCopy survives mutation (dangling pointer mitigation)" {
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+
+    try ctx.initObj();
+    try ctx.setStr(lite3.root, "name", "alice");
+
+    // Safe: copy the string out before mutating
+    var copy_buf: [64]u8 = undefined;
+    const safe_copy = try ctx.getStrCopy(lite3.root, "name", &copy_buf);
+
+    // Mutate the context heavily (may trigger realloc)
+    for (0..100) |i| {
+        var key_buf: [32]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "pad_{d}", .{i}) catch unreachable;
+        try ctx.setStr(lite3.root, key, "x" ** 200);
+    }
+
+    // The copy is still valid
+    try testing.expectEqualStrings("alice", safe_copy);
+}
+
+// =========================================================================
+// Key accepts []const u8 (non-sentinel) test
+// =========================================================================
+
+test "Buffer: keys accept runtime []const u8 slices" {
+    var mem: [8192]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+
+    // Build a key at runtime (not a string literal, so not sentinel-terminated)
+    const prefix = "my_key";
+    var key_buf: [32]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}_1", .{prefix}) catch unreachable;
+
+    try buf.setI64(lite3.root, key, 42);
+    const val = try buf.getI64(lite3.root, key);
+    try testing.expectEqual(@as(i64, 42), val);
+    try testing.expect(try buf.exists(lite3.root, key));
 }

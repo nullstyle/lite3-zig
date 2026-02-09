@@ -1,8 +1,6 @@
 //! Basic usage of lite3-zig
 //!
-//! Build and run:
-//!   zig build-exe examples/basic.zig -Mroot=.zig-cache/...
-//!   (or use the lite3 module from build.zig)
+//! Build with: zig build examples
 //!
 //! This example demonstrates creating a document, adding fields,
 //! and reading values back.
@@ -11,10 +9,12 @@ const std = @import("std");
 const lite3 = @import("lite3");
 
 pub fn main() !void {
-    const stdout = std.io.getStdOut().writer();
+    var write_buf: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writerStreaming(&write_buf);
+    defer stdout.interface.flush() catch {};
 
     // --- Buffer API: fixed-size, caller-managed memory ---
-    try stdout.print("=== Buffer API ===\n", .{});
+    try stdout.interface.print("=== Buffer API ===\n", .{});
 
     var mem: [4096]u8 align(4) = undefined;
     var buf = try lite3.Buffer.initObj(&mem);
@@ -35,14 +35,14 @@ pub fn main() !void {
     try buf.arrAppendStr(tags, "user");
 
     // Read values back
-    try stdout.print("name:    {s}\n", .{try buf.getStr(lite3.root, "name")});
-    try stdout.print("age:     {d}\n", .{try buf.getI64(lite3.root, "age")});
-    try stdout.print("active:  {}\n", .{try buf.getBool(lite3.root, "active")});
-    try stdout.print("entries: {d}\n", .{try buf.count(lite3.root)});
-    try stdout.print("buffer:  {d} / {d} bytes used\n", .{ buf.len, buf.capacity });
+    try stdout.interface.print("name:    {s}\n", .{try buf.getStr(lite3.root, "name")});
+    try stdout.interface.print("age:     {d}\n", .{try buf.getI64(lite3.root, "age")});
+    try stdout.interface.print("active:  {}\n", .{try buf.getBool(lite3.root, "active")});
+    try stdout.interface.print("entries: {d}\n", .{try buf.count(lite3.root)});
+    try stdout.interface.print("buffer:  {d} / {d} bytes used\n", .{ buf.len, buf.capacity });
 
     // --- Context API: auto-growing memory ---
-    try stdout.print("\n=== Context API ===\n", .{});
+    try stdout.interface.print("\n=== Context API ===\n", .{});
 
     var ctx = try lite3.Context.create();
     defer ctx.destroy();
@@ -54,14 +54,15 @@ pub fn main() !void {
     const headers = try ctx.setObj(lite3.root, "headers");
     try ctx.setStr(headers, "content-type", "application/json");
 
-    // Iterate over top-level keys
-    try stdout.print("\nTop-level keys:\n", .{});
-    var iter = try ctx.iterate(lite3.root);
-    while (try iter.next()) |entry| {
-        if (entry.key) |k| {
-            try stdout.print("  - {s}\n", .{k});
-        }
-    }
+    // Read context values back
+    try stdout.interface.print("event:     {s}\n", .{try ctx.getStr(lite3.root, "event")});
+    try stdout.interface.print("timestamp: {d}\n", .{try ctx.getI64(lite3.root, "timestamp")});
+    try stdout.interface.print("entries:   {d}\n", .{try ctx.count(lite3.root)});
 
-    try stdout.print("\nDone.\n", .{});
+    // Safe copy: survives even after context mutations
+    var name_buf: [64]u8 = undefined;
+    const name_copy = try ctx.getStrCopy(lite3.root, "event", &name_buf);
+    try stdout.interface.print("safe copy: {s}\n", .{name_copy});
+
+    try stdout.interface.print("\nDone.\n", .{});
 }

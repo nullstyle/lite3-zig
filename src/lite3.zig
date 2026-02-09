@@ -121,12 +121,17 @@ pub const Value = union(enum) {
 // Offset handle
 // ---------------------------------------------------------------------------
 
-/// An offset into a Lite3 buffer pointing to an object or array.
-/// The root is always offset 0.
-pub const Offset = usize;
+/// A typed offset into a Lite3 buffer pointing to an object or array.
+/// Using a distinct type prevents accidentally passing arbitrary `usize` values.
+pub const Offset = enum(usize) {
+    /// The root node is always at offset 0.
+    root = 0,
+    /// Catch-all for runtime offset values returned by C.
+    _,
+};
 
-/// Root offset constant.
-pub const root: Offset = 0;
+/// Convenience alias for `Offset.root`.
+pub const root = Offset.root;
 
 /// An opaque handle to a C-allocated JSON string.
 /// Must be freed by calling `deinit()` exactly once.
@@ -150,6 +155,10 @@ pub const JsonString = struct {
 // ---------------------------------------------------------------------------
 
 /// An iterator over the entries of a Lite3 object or array.
+///
+/// WARNING: The iterator captures the buffer pointer at creation time.
+/// Any mutation to the underlying buffer (or Context reallocation) invalidates
+/// the iterator. Do not mutate the buffer while iterating.
 pub const Iterator = struct {
     raw: c.shim_lite3_iter,
     buf: [*]const u8,
@@ -174,7 +183,7 @@ pub const Iterator = struct {
         const entry_key: ?[]const u8 = if (key_ptr) |p| p[0..key_len] else null;
         return Entry{
             .key = entry_key,
-            .val_offset = val_ofs,
+            .val_offset = @enumFromInt(val_ofs),
         };
     }
 };
@@ -189,6 +198,19 @@ pub const Iterator = struct {
 fn SharedMethods(comptime Self: type) type {
     const is_ctx = (Self == Context);
     return struct {
+        /// Maximum key length in bytes. Keys longer than this return InvalidArgument.
+        const max_key_len: usize = 255;
+
+        /// Convert a key slice to a null-terminated stack buffer for passing to C.
+        /// Returns a fixed-size array that can be passed to C via `&kz`.
+        inline fn toKeyZ(key: []const u8) Error![max_key_len + 1]u8 {
+            if (key.len > max_key_len) return Error.InvalidArgument;
+            var buf: [max_key_len + 1]u8 = undefined;
+            @memcpy(buf[0..key.len], key);
+            buf[key.len] = 0;
+            return buf;
+        }
+
         /// Save the current len for Buffer (no-op for Context).
         /// The C library documents that a failed write may still increment
         /// *inout_buflen, so we snapshot and restore to preserve invariants.
@@ -204,12 +226,13 @@ fn SharedMethods(comptime Self: type) type {
         // --- Set operations ---
 
         /// Set a null value for the given key.
-        pub fn setNull(self: *Self, ofs: Offset, key: [:0]const u8) Error!void {
+        pub fn setNull(self: *Self, ofs: Offset, key: []const u8) Error!void {
+            var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_null(self.ctx, ofs, key.ptr)
+                c.shim_lite3_ctx_set_null(self.ctx, @intFromEnum(ofs), &kz)
             else
-                c.shim_lite3_set_null(self.buf, &self.len, ofs, self.capacity, key.ptr);
+                c.shim_lite3_set_null(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -217,12 +240,13 @@ fn SharedMethods(comptime Self: type) type {
         }
 
         /// Set a boolean value for the given key.
-        pub fn setBool(self: *Self, ofs: Offset, key: [:0]const u8, value: bool) Error!void {
+        pub fn setBool(self: *Self, ofs: Offset, key: []const u8, value: bool) Error!void {
+            var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_bool(self.ctx, ofs, key.ptr, value)
+                c.shim_lite3_ctx_set_bool(self.ctx, @intFromEnum(ofs), &kz, value)
             else
-                c.shim_lite3_set_bool(self.buf, &self.len, ofs, self.capacity, key.ptr, value);
+                c.shim_lite3_set_bool(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, value);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -230,12 +254,13 @@ fn SharedMethods(comptime Self: type) type {
         }
 
         /// Set an i64 value for the given key.
-        pub fn setI64(self: *Self, ofs: Offset, key: [:0]const u8, value: i64) Error!void {
+        pub fn setI64(self: *Self, ofs: Offset, key: []const u8, value: i64) Error!void {
+            var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_i64(self.ctx, ofs, key.ptr, value)
+                c.shim_lite3_ctx_set_i64(self.ctx, @intFromEnum(ofs), &kz, value)
             else
-                c.shim_lite3_set_i64(self.buf, &self.len, ofs, self.capacity, key.ptr, value);
+                c.shim_lite3_set_i64(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, value);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -243,12 +268,13 @@ fn SharedMethods(comptime Self: type) type {
         }
 
         /// Set an f64 value for the given key.
-        pub fn setF64(self: *Self, ofs: Offset, key: [:0]const u8, value: f64) Error!void {
+        pub fn setF64(self: *Self, ofs: Offset, key: []const u8, value: f64) Error!void {
+            var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_f64(self.ctx, ofs, key.ptr, value)
+                c.shim_lite3_ctx_set_f64(self.ctx, @intFromEnum(ofs), &kz, value)
             else
-                c.shim_lite3_set_f64(self.buf, &self.len, ofs, self.capacity, key.ptr, value);
+                c.shim_lite3_set_f64(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, value);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -256,12 +282,13 @@ fn SharedMethods(comptime Self: type) type {
         }
 
         /// Set a string value for the given key.
-        pub fn setStr(self: *Self, ofs: Offset, key: [:0]const u8, value: []const u8) Error!void {
+        pub fn setStr(self: *Self, ofs: Offset, key: []const u8, value: []const u8) Error!void {
+            var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_str(self.ctx, ofs, key.ptr, value.ptr, value.len)
+                c.shim_lite3_ctx_set_str(self.ctx, @intFromEnum(ofs), &kz, value.ptr, value.len)
             else
-                c.shim_lite3_set_str(self.buf, &self.len, ofs, self.capacity, key.ptr, value.ptr, value.len);
+                c.shim_lite3_set_str(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, value.ptr, value.len);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -269,12 +296,13 @@ fn SharedMethods(comptime Self: type) type {
         }
 
         /// Set a bytes value for the given key.
-        pub fn setBytes(self: *Self, ofs: Offset, key: [:0]const u8, value: []const u8) Error!void {
+        pub fn setBytes(self: *Self, ofs: Offset, key: []const u8, value: []const u8) Error!void {
+            var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_bytes(self.ctx, ofs, key.ptr, value.ptr, value.len)
+                c.shim_lite3_ctx_set_bytes(self.ctx, @intFromEnum(ofs), &kz, value.ptr, value.len)
             else
-                c.shim_lite3_set_bytes(self.buf, &self.len, ofs, self.capacity, key.ptr, value.ptr, value.len);
+                c.shim_lite3_set_bytes(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, value.ptr, value.len);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -282,43 +310,46 @@ fn SharedMethods(comptime Self: type) type {
         }
 
         /// Set a nested object for the given key. Returns the offset of the new object.
-        pub fn setObj(self: *Self, ofs: Offset, key: [:0]const u8) Error!Offset {
+        pub fn setObj(self: *Self, ofs: Offset, key: []const u8) Error!Offset {
+            var kz = try toKeyZ(key);
             const saved = saveLen(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_obj(self.ctx, ofs, key.ptr, &out_ofs)
+                c.shim_lite3_ctx_set_obj(self.ctx, @intFromEnum(ofs), &kz, &out_ofs)
             else
-                c.shim_lite3_set_obj(self.buf, &self.len, ofs, self.capacity, key.ptr, &out_ofs);
+                c.shim_lite3_set_obj(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, &out_ofs);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
             }
-            return out_ofs;
+            return @enumFromInt(out_ofs);
         }
 
         /// Set a nested array for the given key. Returns the offset of the new array.
-        pub fn setArr(self: *Self, ofs: Offset, key: [:0]const u8) Error!Offset {
+        pub fn setArr(self: *Self, ofs: Offset, key: []const u8) Error!Offset {
+            var kz = try toKeyZ(key);
             const saved = saveLen(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_arr(self.ctx, ofs, key.ptr, &out_ofs)
+                c.shim_lite3_ctx_set_arr(self.ctx, @intFromEnum(ofs), &kz, &out_ofs)
             else
-                c.shim_lite3_set_arr(self.buf, &self.len, ofs, self.capacity, key.ptr, &out_ofs);
+                c.shim_lite3_set_arr(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, &out_ofs);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
             }
-            return out_ofs;
+            return @enumFromInt(out_ofs);
         }
 
         // --- Get operations ---
 
         /// Get the type of a value by key.
-        pub fn getType(self: *const Self, ofs: Offset, key: [:0]const u8) Error!Type {
+        pub fn getType(self: *const Self, ofs: Offset, key: []const u8) Error!Type {
+            var kz = try toKeyZ(key);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_type(self.ctx, ofs, key.ptr)
+                c.shim_lite3_ctx_get_type(self.ctx, @intFromEnum(ofs), &kz)
             else
-                c.shim_lite3_get_type(self.buf, self.len, ofs, key.ptr);
+                c.shim_lite3_get_type(self.buf, self.len, @intFromEnum(ofs), &kz);
             if (ret < 0) return translateError(ret);
             if (ret > Type.max_valid) return Error.CorruptData;
             const t: Type = @enumFromInt(@as(u8, @intCast(ret)));
@@ -326,43 +357,47 @@ fn SharedMethods(comptime Self: type) type {
             return t;
         }
 
-        /// Check if a key exists.
-        pub fn exists(self: *const Self, ofs: Offset, key: [:0]const u8) bool {
+        /// Check if a key exists. Returns an error if the key conversion fails.
+        pub fn exists(self: *const Self, ofs: Offset, key: []const u8) Error!bool {
+            var kz = try toKeyZ(key);
             return if (is_ctx)
-                c.shim_lite3_ctx_exists(self.ctx, ofs, key.ptr) != 0
+                c.shim_lite3_ctx_exists(self.ctx, @intFromEnum(ofs), &kz) != 0
             else
-                c.shim_lite3_exists(self.buf, self.len, ofs, key.ptr) != 0;
+                c.shim_lite3_exists(self.buf, self.len, @intFromEnum(ofs), &kz) != 0;
         }
 
         /// Get a boolean value by key.
-        pub fn getBool(self: *const Self, ofs: Offset, key: [:0]const u8) Error!bool {
+        pub fn getBool(self: *const Self, ofs: Offset, key: []const u8) Error!bool {
+            var kz = try toKeyZ(key);
             var out: bool = false;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_bool(self.ctx, ofs, key.ptr, &out)
+                c.shim_lite3_ctx_get_bool(self.ctx, @intFromEnum(ofs), &kz, &out)
             else
-                c.shim_lite3_get_bool(self.buf, self.len, ofs, key.ptr, &out);
+                c.shim_lite3_get_bool(self.buf, self.len, @intFromEnum(ofs), &kz, &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
 
         /// Get an i64 value by key.
-        pub fn getI64(self: *const Self, ofs: Offset, key: [:0]const u8) Error!i64 {
+        pub fn getI64(self: *const Self, ofs: Offset, key: []const u8) Error!i64 {
+            var kz = try toKeyZ(key);
             var out: i64 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_i64(self.ctx, ofs, key.ptr, &out)
+                c.shim_lite3_ctx_get_i64(self.ctx, @intFromEnum(ofs), &kz, &out)
             else
-                c.shim_lite3_get_i64(self.buf, self.len, ofs, key.ptr, &out);
+                c.shim_lite3_get_i64(self.buf, self.len, @intFromEnum(ofs), &kz, &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
 
         /// Get an f64 value by key.
-        pub fn getF64(self: *const Self, ofs: Offset, key: [:0]const u8) Error!f64 {
+        pub fn getF64(self: *const Self, ofs: Offset, key: []const u8) Error!f64 {
+            var kz = try toKeyZ(key);
             var out: f64 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_f64(self.ctx, ofs, key.ptr, &out)
+                c.shim_lite3_ctx_get_f64(self.ctx, @intFromEnum(ofs), &kz, &out)
             else
-                c.shim_lite3_get_f64(self.buf, self.len, ofs, key.ptr, &out);
+                c.shim_lite3_get_f64(self.buf, self.len, @intFromEnum(ofs), &kz, &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
@@ -371,13 +406,14 @@ fn SharedMethods(comptime Self: type) type {
         /// WARNING: The returned slice points directly into the buffer and is
         /// invalidated by any subsequent mutation. For Context, auto-reallocation
         /// can cause use-after-free. Use `getStrCopy` for a safe alternative.
-        pub fn getStr(self: *const Self, ofs: Offset, key: [:0]const u8) Error![]const u8 {
+        pub fn getStr(self: *const Self, ofs: Offset, key: []const u8) Error![]const u8 {
+            var kz = try toKeyZ(key);
             var out_ptr: ?[*]const u8 = null;
             var out_len: u32 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_str(self.ctx, ofs, key.ptr, @ptrCast(&out_ptr), &out_len)
+                c.shim_lite3_ctx_get_str(self.ctx, @intFromEnum(ofs), &kz, @ptrCast(&out_ptr), &out_len)
             else
-                c.shim_lite3_get_str(self.buf, self.len, ofs, key.ptr, @ptrCast(&out_ptr), &out_len);
+                c.shim_lite3_get_str(self.buf, self.len, @intFromEnum(ofs), &kz, @ptrCast(&out_ptr), &out_len);
             if (ret < 0) return translateError(ret);
             if (out_ptr) |p| return p[0..out_len];
             return Error.StaleReference;
@@ -387,43 +423,46 @@ fn SharedMethods(comptime Self: type) type {
         /// WARNING: The returned slice points directly into the buffer and is
         /// invalidated by any subsequent mutation. For Context, auto-reallocation
         /// can cause use-after-free. Use `getBytesCopy` for a safe alternative.
-        pub fn getBytes(self: *const Self, ofs: Offset, key: [:0]const u8) Error![]const u8 {
+        pub fn getBytes(self: *const Self, ofs: Offset, key: []const u8) Error![]const u8 {
+            var kz = try toKeyZ(key);
             var out_ptr: ?[*]const u8 = null;
             var out_len: u32 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_bytes(self.ctx, ofs, key.ptr, &out_ptr, &out_len)
+                c.shim_lite3_ctx_get_bytes(self.ctx, @intFromEnum(ofs), &kz, &out_ptr, &out_len)
             else
-                c.shim_lite3_get_bytes(self.buf, self.len, ofs, key.ptr, &out_ptr, &out_len);
+                c.shim_lite3_get_bytes(self.buf, self.len, @intFromEnum(ofs), &kz, &out_ptr, &out_len);
             if (ret < 0) return translateError(ret);
             if (out_ptr) |p| return p[0..out_len];
             return Error.StaleReference;
         }
 
         /// Get a nested object offset by key.
-        pub fn getObj(self: *const Self, ofs: Offset, key: [:0]const u8) Error!Offset {
+        pub fn getObj(self: *const Self, ofs: Offset, key: []const u8) Error!Offset {
+            var kz = try toKeyZ(key);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_obj(self.ctx, ofs, key.ptr, &out_ofs)
+                c.shim_lite3_ctx_get_obj(self.ctx, @intFromEnum(ofs), &kz, &out_ofs)
             else
-                c.shim_lite3_get_obj(self.buf, self.len, ofs, key.ptr, &out_ofs);
+                c.shim_lite3_get_obj(self.buf, self.len, @intFromEnum(ofs), &kz, &out_ofs);
             if (ret < 0) return translateError(ret);
-            return out_ofs;
+            return @enumFromInt(out_ofs);
         }
 
         /// Get a nested array offset by key.
-        pub fn getArr(self: *const Self, ofs: Offset, key: [:0]const u8) Error!Offset {
+        pub fn getArr(self: *const Self, ofs: Offset, key: []const u8) Error!Offset {
+            var kz = try toKeyZ(key);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_arr(self.ctx, ofs, key.ptr, &out_ofs)
+                c.shim_lite3_ctx_get_arr(self.ctx, @intFromEnum(ofs), &kz, &out_ofs)
             else
-                c.shim_lite3_get_arr(self.buf, self.len, ofs, key.ptr, &out_ofs);
+                c.shim_lite3_get_arr(self.buf, self.len, @intFromEnum(ofs), &kz, &out_ofs);
             if (ret < 0) return translateError(ret);
-            return out_ofs;
+            return @enumFromInt(out_ofs);
         }
 
         /// Get a string value by key, copying into a caller-supplied buffer.
         /// Returns the copied slice. Safe to use even after buffer mutations.
-        pub fn getStrCopy(self: *const Self, ofs: Offset, key: [:0]const u8, dest: []u8) Error![]const u8 {
+        pub fn getStrCopy(self: *const Self, ofs: Offset, key: []const u8, dest: []u8) Error![]const u8 {
             const src = try self.getStr(ofs, key);
             if (src.len > dest.len) return Error.NoBufferSpace;
             @memcpy(dest[0..src.len], src);
@@ -432,7 +471,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Get a bytes value by key, copying into a caller-supplied buffer.
         /// Returns the copied slice. Safe to use even after buffer mutations.
-        pub fn getBytesCopy(self: *const Self, ofs: Offset, key: [:0]const u8, dest: []u8) Error![]const u8 {
+        pub fn getBytesCopy(self: *const Self, ofs: Offset, key: []const u8, dest: []u8) Error![]const u8 {
             const src = try self.getBytes(ofs, key);
             if (src.len > dest.len) return Error.NoBufferSpace;
             @memcpy(dest[0..src.len], src);
@@ -445,9 +484,9 @@ fn SharedMethods(comptime Self: type) type {
         pub fn arrAppendNull(self: *Self, ofs: Offset) Error!void {
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_null(self.ctx, ofs)
+                c.shim_lite3_ctx_arr_append_null(self.ctx, @intFromEnum(ofs))
             else
-                c.shim_lite3_arr_append_null(self.buf, &self.len, ofs, self.capacity);
+                c.shim_lite3_arr_append_null(self.buf, &self.len, @intFromEnum(ofs), self.capacity);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -458,9 +497,9 @@ fn SharedMethods(comptime Self: type) type {
         pub fn arrAppendBool(self: *Self, ofs: Offset, value: bool) Error!void {
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_bool(self.ctx, ofs, value)
+                c.shim_lite3_ctx_arr_append_bool(self.ctx, @intFromEnum(ofs), value)
             else
-                c.shim_lite3_arr_append_bool(self.buf, &self.len, ofs, self.capacity, value);
+                c.shim_lite3_arr_append_bool(self.buf, &self.len, @intFromEnum(ofs), self.capacity, value);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -471,9 +510,9 @@ fn SharedMethods(comptime Self: type) type {
         pub fn arrAppendI64(self: *Self, ofs: Offset, value: i64) Error!void {
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_i64(self.ctx, ofs, value)
+                c.shim_lite3_ctx_arr_append_i64(self.ctx, @intFromEnum(ofs), value)
             else
-                c.shim_lite3_arr_append_i64(self.buf, &self.len, ofs, self.capacity, value);
+                c.shim_lite3_arr_append_i64(self.buf, &self.len, @intFromEnum(ofs), self.capacity, value);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -484,9 +523,9 @@ fn SharedMethods(comptime Self: type) type {
         pub fn arrAppendF64(self: *Self, ofs: Offset, value: f64) Error!void {
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_f64(self.ctx, ofs, value)
+                c.shim_lite3_ctx_arr_append_f64(self.ctx, @intFromEnum(ofs), value)
             else
-                c.shim_lite3_arr_append_f64(self.buf, &self.len, ofs, self.capacity, value);
+                c.shim_lite3_arr_append_f64(self.buf, &self.len, @intFromEnum(ofs), self.capacity, value);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -497,9 +536,9 @@ fn SharedMethods(comptime Self: type) type {
         pub fn arrAppendStr(self: *Self, ofs: Offset, value: []const u8) Error!void {
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_str(self.ctx, ofs, value.ptr, value.len)
+                c.shim_lite3_ctx_arr_append_str(self.ctx, @intFromEnum(ofs), value.ptr, value.len)
             else
-                c.shim_lite3_arr_append_str(self.buf, &self.len, ofs, self.capacity, value.ptr, value.len);
+                c.shim_lite3_arr_append_str(self.buf, &self.len, @intFromEnum(ofs), self.capacity, value.ptr, value.len);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -510,9 +549,9 @@ fn SharedMethods(comptime Self: type) type {
         pub fn arrAppendBytes(self: *Self, ofs: Offset, value: []const u8) Error!void {
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_bytes(self.ctx, ofs, value.ptr, value.len)
+                c.shim_lite3_ctx_arr_append_bytes(self.ctx, @intFromEnum(ofs), value.ptr, value.len)
             else
-                c.shim_lite3_arr_append_bytes(self.buf, &self.len, ofs, self.capacity, value.ptr, value.len);
+                c.shim_lite3_arr_append_bytes(self.buf, &self.len, @intFromEnum(ofs), self.capacity, value.ptr, value.len);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -524,14 +563,14 @@ fn SharedMethods(comptime Self: type) type {
             const saved = saveLen(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_obj(self.ctx, ofs, &out_ofs)
+                c.shim_lite3_ctx_arr_append_obj(self.ctx, @intFromEnum(ofs), &out_ofs)
             else
-                c.shim_lite3_arr_append_obj(self.buf, &self.len, ofs, self.capacity, &out_ofs);
+                c.shim_lite3_arr_append_obj(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &out_ofs);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
             }
-            return out_ofs;
+            return @enumFromInt(out_ofs);
         }
 
         /// Append a nested array to an array. Returns the offset of the new array.
@@ -539,14 +578,14 @@ fn SharedMethods(comptime Self: type) type {
             const saved = saveLen(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_arr(self.ctx, ofs, &out_ofs)
+                c.shim_lite3_ctx_arr_append_arr(self.ctx, @intFromEnum(ofs), &out_ofs)
             else
-                c.shim_lite3_arr_append_arr(self.buf, &self.len, ofs, self.capacity, &out_ofs);
+                c.shim_lite3_arr_append_arr(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &out_ofs);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
             }
-            return out_ofs;
+            return @enumFromInt(out_ofs);
         }
 
         // --- Array get operations ---
@@ -555,9 +594,9 @@ fn SharedMethods(comptime Self: type) type {
         pub fn arrGetBool(self: *const Self, ofs: Offset, index: u32) Error!bool {
             var out: bool = false;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_bool(self.ctx, ofs, index, &out)
+                c.shim_lite3_ctx_arr_get_bool(self.ctx, @intFromEnum(ofs), index, &out)
             else
-                c.shim_lite3_arr_get_bool(self.buf, self.len, ofs, index, &out);
+                c.shim_lite3_arr_get_bool(self.buf, self.len, @intFromEnum(ofs), index, &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
@@ -566,9 +605,9 @@ fn SharedMethods(comptime Self: type) type {
         pub fn arrGetI64(self: *const Self, ofs: Offset, index: u32) Error!i64 {
             var out: i64 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_i64(self.ctx, ofs, index, &out)
+                c.shim_lite3_ctx_arr_get_i64(self.ctx, @intFromEnum(ofs), index, &out)
             else
-                c.shim_lite3_arr_get_i64(self.buf, self.len, ofs, index, &out);
+                c.shim_lite3_arr_get_i64(self.buf, self.len, @intFromEnum(ofs), index, &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
@@ -577,9 +616,9 @@ fn SharedMethods(comptime Self: type) type {
         pub fn arrGetF64(self: *const Self, ofs: Offset, index: u32) Error!f64 {
             var out: f64 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_f64(self.ctx, ofs, index, &out)
+                c.shim_lite3_ctx_arr_get_f64(self.ctx, @intFromEnum(ofs), index, &out)
             else
-                c.shim_lite3_arr_get_f64(self.buf, self.len, ofs, index, &out);
+                c.shim_lite3_arr_get_f64(self.buf, self.len, @intFromEnum(ofs), index, &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
@@ -587,14 +626,14 @@ fn SharedMethods(comptime Self: type) type {
         /// Get a string value from an array by index.
         /// WARNING: The returned slice points directly into the buffer and is
         /// invalidated by any subsequent mutation. For Context, auto-reallocation
-        /// can cause use-after-free.
+        /// can cause use-after-free. Use `arrGetStrCopy` for a safe alternative.
         pub fn arrGetStr(self: *const Self, ofs: Offset, index: u32) Error![]const u8 {
             var out_ptr: ?[*]const u8 = null;
             var out_len: u32 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_str(self.ctx, ofs, index, @ptrCast(&out_ptr), &out_len)
+                c.shim_lite3_ctx_arr_get_str(self.ctx, @intFromEnum(ofs), index, @ptrCast(&out_ptr), &out_len)
             else
-                c.shim_lite3_arr_get_str(self.buf, self.len, ofs, index, @ptrCast(&out_ptr), &out_len);
+                c.shim_lite3_arr_get_str(self.buf, self.len, @intFromEnum(ofs), index, @ptrCast(&out_ptr), &out_len);
             if (ret < 0) return translateError(ret);
             if (out_ptr) |p| return p[0..out_len];
             return Error.StaleReference;
@@ -603,14 +642,14 @@ fn SharedMethods(comptime Self: type) type {
         /// Get a bytes value from an array by index.
         /// WARNING: The returned slice points directly into the buffer and is
         /// invalidated by any subsequent mutation. For Context, auto-reallocation
-        /// can cause use-after-free.
+        /// can cause use-after-free. Use `arrGetBytesCopy` for a safe alternative.
         pub fn arrGetBytes(self: *const Self, ofs: Offset, index: u32) Error![]const u8 {
             var out_ptr: ?[*]const u8 = null;
             var out_len: u32 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_bytes(self.ctx, ofs, index, &out_ptr, &out_len)
+                c.shim_lite3_ctx_arr_get_bytes(self.ctx, @intFromEnum(ofs), index, &out_ptr, &out_len)
             else
-                c.shim_lite3_arr_get_bytes(self.buf, self.len, ofs, index, &out_ptr, &out_len);
+                c.shim_lite3_arr_get_bytes(self.buf, self.len, @intFromEnum(ofs), index, &out_ptr, &out_len);
             if (ret < 0) return translateError(ret);
             if (out_ptr) |p| return p[0..out_len];
             return Error.StaleReference;
@@ -620,35 +659,53 @@ fn SharedMethods(comptime Self: type) type {
         pub fn arrGetObj(self: *const Self, ofs: Offset, index: u32) Error!Offset {
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_obj(self.ctx, ofs, index, &out_ofs)
+                c.shim_lite3_ctx_arr_get_obj(self.ctx, @intFromEnum(ofs), index, &out_ofs)
             else
-                c.shim_lite3_arr_get_obj(self.buf, self.len, ofs, index, &out_ofs);
+                c.shim_lite3_arr_get_obj(self.buf, self.len, @intFromEnum(ofs), index, &out_ofs);
             if (ret < 0) return translateError(ret);
-            return out_ofs;
+            return @enumFromInt(out_ofs);
         }
 
         /// Get a nested array offset from an array by index.
         pub fn arrGetArr(self: *const Self, ofs: Offset, index: u32) Error!Offset {
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_arr(self.ctx, ofs, index, &out_ofs)
+                c.shim_lite3_ctx_arr_get_arr(self.ctx, @intFromEnum(ofs), index, &out_ofs)
             else
-                c.shim_lite3_arr_get_arr(self.buf, self.len, ofs, index, &out_ofs);
+                c.shim_lite3_arr_get_arr(self.buf, self.len, @intFromEnum(ofs), index, &out_ofs);
             if (ret < 0) return translateError(ret);
-            return out_ofs;
+            return @enumFromInt(out_ofs);
         }
 
         /// Get the type of an array element by index.
         pub fn arrGetType(self: *const Self, ofs: Offset, index: u32) Error!Type {
             const t = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_type(self.ctx, ofs, index)
+                c.shim_lite3_ctx_arr_get_type(self.ctx, @intFromEnum(ofs), index)
             else
-                c.shim_lite3_arr_get_type(self.buf, self.len, ofs, index);
+                c.shim_lite3_arr_get_type(self.buf, self.len, @intFromEnum(ofs), index);
             if (t < 0) return translateError(t);
             if (t > Type.max_valid) return Error.CorruptData;
             const ret: Type = @enumFromInt(@as(u8, @intCast(t)));
             if (ret == .invalid) return Error.NotFound;
             return ret;
+        }
+
+        /// Get a string value from an array by index, copying into a caller-supplied buffer.
+        /// Returns the copied slice. Safe to use even after buffer mutations.
+        pub fn arrGetStrCopy(self: *const Self, ofs: Offset, index: u32, dest: []u8) Error![]const u8 {
+            const src = try self.arrGetStr(ofs, index);
+            if (src.len > dest.len) return Error.NoBufferSpace;
+            @memcpy(dest[0..src.len], src);
+            return dest[0..src.len];
+        }
+
+        /// Get a bytes value from an array by index, copying into a caller-supplied buffer.
+        /// Returns the copied slice. Safe to use even after buffer mutations.
+        pub fn arrGetBytesCopy(self: *const Self, ofs: Offset, index: u32, dest: []u8) Error![]const u8 {
+            const src = try self.arrGetBytes(ofs, index);
+            if (src.len > dest.len) return Error.NoBufferSpace;
+            @memcpy(dest[0..src.len], src);
+            return dest[0..src.len];
         }
 
         // --- Utility ---
@@ -657,19 +714,22 @@ fn SharedMethods(comptime Self: type) type {
         pub fn count(self: *const Self, ofs: Offset) Error!u32 {
             var out: u32 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_count(self.ctx, ofs, &out)
+                c.shim_lite3_ctx_count(self.ctx, @intFromEnum(ofs), &out)
             else
-                c.shim_lite3_count(self.buf, self.len, ofs, &out);
+                c.shim_lite3_count(self.buf, self.len, @intFromEnum(ofs), &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
 
         /// Create an iterator over the entries at the given offset.
+        ///
+        /// WARNING: The iterator captures the buffer pointer at creation time.
+        /// Any mutation (or Context reallocation) invalidates the iterator.
         pub fn iterate(self: *const Self, ofs: Offset) Error!Iterator {
             const buf_ptr: [*]const u8 = if (is_ctx) c.shim_lite3_ctx_buf(self.ctx) else self.buf;
             const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.ctx) else self.len;
             var iter: c.shim_lite3_iter = undefined;
-            const ret = c.shim_lite3_iter_create(buf_ptr, buf_len, ofs, &iter);
+            const ret = c.shim_lite3_iter_create(buf_ptr, buf_len, @intFromEnum(ofs), &iter);
             if (ret < 0) return translateError(ret);
             return Iterator{
                 .raw = iter,
@@ -688,7 +748,7 @@ fn SharedMethods(comptime Self: type) type {
             const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.ctx) else self.len;
             var out_len: usize = 0;
             std.c._errno().* = 0;
-            const ptr: ?[*]u8 = @ptrCast(c.shim_lite3_json_enc(buf_ptr, buf_len, ofs, &out_len));
+            const ptr: ?[*]u8 = @ptrCast(c.shim_lite3_json_enc(buf_ptr, buf_len, @intFromEnum(ofs), &out_len));
             if (ptr) |p| return JsonString{ .ptr = p, .len = out_len };
             return translateErrno();
         }
@@ -701,14 +761,14 @@ fn SharedMethods(comptime Self: type) type {
             const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.ctx) else self.len;
             var out_len: usize = 0;
             std.c._errno().* = 0;
-            const ptr: ?[*]u8 = @ptrCast(c.shim_lite3_json_enc_pretty(buf_ptr, buf_len, ofs, &out_len));
+            const ptr: ?[*]u8 = @ptrCast(c.shim_lite3_json_enc_pretty(buf_ptr, buf_len, @intFromEnum(ofs), &out_len));
             if (ptr) |p| return JsonString{ .ptr = p, .len = out_len };
             return translateErrno();
         }
 
         /// Get the value at the given key as a tagged union.
         /// WARNING: String and bytes slices point into the buffer; see getStr safety notes.
-        pub fn getValue(self: *const Self, ofs: Offset, key: [:0]const u8) Error!Value {
+        pub fn getValue(self: *const Self, ofs: Offset, key: []const u8) Error!Value {
             const t = try self.getType(ofs, key);
             return switch (t) {
                 .null => .null,
@@ -774,6 +834,8 @@ pub const Buffer = struct {
     pub const arrGetObj = SharedMethods(Buffer).arrGetObj;
     pub const arrGetArr = SharedMethods(Buffer).arrGetArr;
     pub const arrGetType = SharedMethods(Buffer).arrGetType;
+    pub const arrGetStrCopy = SharedMethods(Buffer).arrGetStrCopy;
+    pub const arrGetBytesCopy = SharedMethods(Buffer).arrGetBytesCopy;
     pub const count = SharedMethods(Buffer).count;
     pub const iterate = SharedMethods(Buffer).iterate;
     pub const jsonEncode = SharedMethods(Buffer).jsonEncode;
@@ -828,7 +890,7 @@ pub const Buffer = struct {
     /// Returns the number of bytes written.
     pub fn jsonEncodeBuf(self: *const Buffer, ofs: Offset, out: []u8) Error!usize {
         if (!json_enabled) return Error.InvalidArgument;
-        const ret = c.shim_lite3_json_enc_buf(self.buf, self.len, ofs, out.ptr, out.len);
+        const ret = c.shim_lite3_json_enc_buf(self.buf, self.len, @intFromEnum(ofs), out.ptr, out.len);
         if (ret < 0) return translateError(@intCast(ret));
         return @intCast(ret);
     }
@@ -884,6 +946,8 @@ pub const Context = struct {
     pub const arrGetObj = SharedMethods(Context).arrGetObj;
     pub const arrGetArr = SharedMethods(Context).arrGetArr;
     pub const arrGetType = SharedMethods(Context).arrGetType;
+    pub const arrGetStrCopy = SharedMethods(Context).arrGetStrCopy;
+    pub const arrGetBytesCopy = SharedMethods(Context).arrGetBytesCopy;
     pub const count = SharedMethods(Context).count;
     pub const iterate = SharedMethods(Context).iterate;
     pub const jsonEncode = SharedMethods(Context).jsonEncode;

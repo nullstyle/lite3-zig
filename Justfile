@@ -16,6 +16,17 @@ test-release:
 test-fast:
     zig build test -Doptimize=ReleaseFast
 
+# Run tests with JSON support disabled
+test-no-json:
+    zig build test -Djson=false
+
+# Run all test variants
+test-all: test test-release test-fast test-no-json
+
+# Build example programs
+examples:
+    zig build examples
+
 # Clean build artifacts
 clean:
     rm -rf .zig-cache zig-out

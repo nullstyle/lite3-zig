@@ -152,7 +152,7 @@ fn benchIterate() !void {
         var iter = try buf.iterate(lite3.root);
         var sink: usize = 0;
         while (try iter.next()) |entry| {
-            sink +%= entry.val_offset;
+            sink +%= @intFromEnum(entry.val_offset);
         }
         std.mem.doNotOptimizeAway(&sink);
     }
@@ -162,7 +162,7 @@ fn benchIterate() !void {
             var iter = try buf.iterate(lite3.root);
             var sink: usize = 0;
             while (try iter.next()) |entry| {
-                sink +%= entry.val_offset;
+                sink +%= @intFromEnum(entry.val_offset);
             }
             std.mem.doNotOptimizeAway(&sink);
         }

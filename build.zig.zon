@@ -6,7 +6,10 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "README.md",
+        "LICENSE",
         "src",
+        "examples",
         "vendor/lite3/include",
         "vendor/lite3/src",
         "vendor/lite3/lib",

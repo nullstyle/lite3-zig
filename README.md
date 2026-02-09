@@ -10,6 +10,7 @@ Idiomatic [Zig](https://ziglang.org/) wrapper for [Lite³](https://github.com/fa
 - **JSON round-trip** — encode to / decode from JSON via the bundled yyjson backend.
 - **Iteration** — iterate over object keys or array elements.
 - **Proper error handling** — all C error codes are translated to Zig error unions.
+- **Flexible keys** — accepts `[]const u8` keys (no sentinel terminator required).
 - **Zero `@cImport` issues** — a thin C shim wraps the inline functions that Zig's translate-c cannot handle (alignment casts, flexible array members, GNU statement expressions).
 
 ## Requirements
@@ -71,6 +72,12 @@ zig build -Doptimize=ReleaseFast
 | `-Derror-messages` | `false` | Enable lite3 debug error messages to stdout  |
 | `-Dlto=true`       | `false` | Currently unsupported (build fails fast with a clear message) |
 
+### Building examples
+
+```bash
+zig build examples
+```
+
 ### Running benchmarks
 
 ```bash
@@ -116,8 +123,10 @@ See the `examples/` directory for standalone example programs:
 | `Buffer`          | Fixed-size buffer with caller-managed memory         |
 | `Context`         | Heap-allocated, auto-growing buffer                  |
 | `Type`            | Enum of value types (null, bool_, i64_, f64_, etc.)  |
-| `Offset`          | Byte offset handle into the buffer                   |
+| `Offset`          | Typed offset handle into the buffer (`enum(usize)`)  |
 | `Error`           | Error set (NotFound, InvalidArgument, etc.)          |
+| `Value`           | Tagged union for dynamic access (null, bool_, i64_, etc.) |
+| `JsonString`      | Opaque handle to C-allocated JSON; freed via `.deinit()` |
 | `Buffer.Iterator` | Iterator over object/array entries                   |
 
 ### Buffer API
@@ -127,14 +136,17 @@ See the `examples/` directory for standalone example programs:
 | `initObj` / `initArr` | Initialize as object or array              |
 | `setNull/Bool/I64/F64/Str/Bytes/Obj/Arr` | Set a value by key      |
 | `getBool/I64/F64/Str/Bytes/Obj/Arr`       | Get a value by key      |
-| `getType` / `exists`  | Query type or existence of a key           |
+| `getType` / `exists`  | Query type or existence of a key (`Error!`) |
+| `getValue`            | Get value as a `Value` tagged union        |
+| `getStrCopy` / `getBytesCopy` | Copy string/bytes into caller buffer (safe) |
 | `arrAppend*`          | Append values to an array                  |
 | `arrGet*`             | Get values from an array by index          |
+| `arrGetStrCopy` / `arrGetBytesCopy` | Copy array string/bytes into caller buffer |
 | `count`               | Count entries in an object or array        |
 | `iterate`             | Create an iterator                         |
 | `jsonDecode`          | Decode JSON into a buffer                  |
-| `jsonEncode`          | Encode buffer contents to JSON             |
-| `jsonEncodePretty`    | Encode to pretty-printed JSON              |
+| `jsonEncode`          | Encode buffer contents to JSON (`JsonString`) |
+| `jsonEncodePretty`    | Encode to pretty-printed JSON (`JsonString`) |
 | `jsonEncodeBuf`       | Encode JSON into a caller-supplied buffer  |
 
 ### Context API
@@ -174,6 +186,29 @@ just test-no-json     # Run tests with JSON backend disabled
 just clean            # Remove build artifacts
 just update-vendor    # Update vendored lite3 sources
 ```
+
+## Safety notes
+
+### Dangling pointers
+
+Methods that return string or byte slices (`getStr`, `getBytes`, `arrGetStr`, `arrGetBytes`) return pointers **directly into the underlying buffer**. These slices are invalidated by:
+
+- **Any mutation** to the same buffer (Buffer API)
+- **Any mutation** to the context (Context API), since the context may reallocate its internal buffer
+
+To safely retain a value across mutations, use the copy variants:
+
+```zig
+var dest: [256]u8 = undefined;
+const safe = try buf.getStrCopy(lite3.root, "key", &dest);
+// safe remains valid after mutations
+```
+
+The copy variants are: `getStrCopy`, `getBytesCopy`, `arrGetStrCopy`, `arrGetBytesCopy`.
+
+### Thread safety
+
+Buffer and Context are **not thread-safe**. Concurrent reads and writes require external synchronization (e.g. a `Mutex`). Iterators are also invalidated by any mutation.
 
 ## Architecture notes
 

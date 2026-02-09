@@ -7,7 +7,11 @@ pub fn build(b: *std.Build) void {
     // --- Options ---
     const enable_json = b.option(bool, "json", "Enable JSON conversion support (requires yyjson)") orelse true;
     const enable_error_messages = b.option(bool, "error-messages", "Enable lite3 error messages for debugging") orelse false;
-    const enable_lto = b.option(bool, "lto", "Enable link-time optimization for the C library") orelse false;
+    const enable_lto = b.option(bool, "lto", "Enable link-time optimization for the C library (currently unsupported)") orelse false;
+
+    if (enable_lto) {
+        @panic("`-Dlto=true` is currently unsupported in lite3-zig; remove the flag.");
+    }
 
     // --- Paths ---
     const lite3_include_path = b.path("vendor/lite3/include");
@@ -25,15 +29,10 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
-    const c_flags: []const []const u8 = if (enable_lto) &.{
-        "-std=gnu11",
-        "-Wall",
-        "-Wextra",
-        "-Wpedantic",
-        "-Wno-gnu-statement-expression",
-        "-Wno-gnu-zero-variadic-macro-arguments",
-        "-flto",
-    } else &.{
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "json_enabled", enable_json);
+
+    const c_flags: []const []const u8 = &.{
         "-std=gnu11",
         "-Wall",
         "-Wextra",
@@ -71,18 +70,17 @@ pub fn build(b: *std.Build) void {
             });
         }
         lite3_mod.addIncludePath(lite3_lib_path);
+    } else {
+        // lite3 headers always declare JSON entry points. Provide explicit stubs
+        // so `-Djson=false` links cleanly and JSON APIs return EINVAL.
+        lite3_mod.addCSourceFile(.{
+            .file = b.path("src/lite3_json_disabled.c"),
+            .flags = c_flags,
+        });
     }
 
     // Add the C shim file (with relaxed warnings for lite3 header quirks)
-    const shim_flags: []const []const u8 = if (enable_lto) &.{
-        "-std=gnu11",
-        "-Wall",
-        "-Wextra",
-        "-Wno-pedantic",
-        "-Wno-gnu-statement-expression",
-        "-Wno-gnu-zero-variadic-macro-arguments",
-        "-flto",
-    } else &.{
+    const shim_flags: []const []const u8 = &.{
         "-std=gnu11",
         "-Wall",
         "-Wextra",
@@ -116,6 +114,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    zig_mod.addOptions("lite3_build_options", build_options);
     zig_mod.addIncludePath(shim_include_path);
     zig_mod.linkLibrary(lite3_lib);
 
@@ -159,4 +158,32 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run lite3-zig benchmarks");
     bench_step.dependOn(&run_bench.step);
+
+    // --- Examples ---
+    const example_files = [_]struct { name: []const u8, path: []const u8 }{
+        .{ .name = "basic", .path = "examples/basic.zig" },
+        .{ .name = "json_roundtrip", .path = "examples/json_roundtrip.zig" },
+    };
+
+    const examples_step = b.step("examples", "Build example programs");
+
+    for (example_files) |ex| {
+        const ex_mod = b.createModule(.{
+            .root_source_file = b.path(ex.path),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lite3", .module = zig_mod },
+            },
+        });
+        ex_mod.addIncludePath(shim_include_path);
+        ex_mod.linkLibrary(lite3_lib);
+
+        const ex_exe = b.addExecutable(.{
+            .name = ex.name,
+            .root_module = ex_mod,
+        });
+
+        examples_step.dependOn(&b.addInstallArtifact(ex_exe, .{}).step);
+    }
 }

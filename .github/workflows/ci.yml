@@ -17,13 +17,14 @@ jobs:
           version: 0.15.2
 
       - name: Check formatting
-        run: zig fmt --check src/lite3.zig src/tests.zig
+        run: zig fmt --check src/lite3.zig src/tests.zig src/bench.zig
 
   test:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
         optimize: [Debug, ReleaseSafe, ReleaseFast]
+        json: [true, false]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -35,8 +36,29 @@ jobs:
       - name: Build
         run: zig build
 
-      - name: Test (${{ matrix.optimize }})
-        run: zig build test -Doptimize=${{ matrix.optimize }}
+      - name: Test (${{ matrix.optimize }}, json=${{ matrix.json }})
+        run: zig build test -Doptimize=${{ matrix.optimize }} -Djson=${{ matrix.json }}
+
+  unsupported-options:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Verify -Dlto=true fails with clear message
+        run: |
+          set +e
+          output=$(zig build test -Dlto=true 2>&1)
+          status=$?
+          echo "$output"
+          if [ "$status" -eq 0 ]; then
+            echo "Expected -Dlto=true to fail."
+            exit 1
+          fi
+          echo "$output" | grep -q "currently unsupported in lite3-zig"
 
   cross-compile:
     runs-on: ubuntu-latest
