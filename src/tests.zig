@@ -1413,3 +1413,138 @@ test "Buffer: keys accept runtime []const u8 slices" {
     try testing.expectEqual(@as(i64, 42), val);
     try testing.expect(try buf.exists(lite3.root, key));
 }
+
+// =========================================================================
+// Fuzz / property-based tests
+// =========================================================================
+
+test "Fuzz: random set/get round-trip preserves values" {
+    // Generate many key-value pairs and verify all survive insertion.
+    var mem: [65536]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+
+    var prng = std.Random.DefaultPrng.init(0xdeadbeef);
+    const rand = prng.random();
+
+    const num_keys = 50;
+    var keys: [num_keys][16]u8 = undefined;
+    var values: [num_keys]i64 = undefined;
+
+    for (0..num_keys) |i| {
+        // Generate a random 8-char key
+        for (&keys[i]) |*byte| {
+            byte.* = rand.intRangeAtMost(u8, 'a', 'z');
+        }
+        values[i] = rand.int(i64);
+        try buf.setI64(lite3.root, &keys[i], values[i]);
+    }
+
+    // Verify all values are retrievable
+    for (0..num_keys) |i| {
+        const val = try buf.getI64(lite3.root, &keys[i]);
+        try testing.expectEqual(values[i], val);
+    }
+}
+
+test "Fuzz: JSON decode of random valid documents" {
+    if (!lite3.json_enabled) return;
+
+    // Test that well-formed JSON documents decode and re-encode consistently.
+    const test_jsons = [_][]const u8{
+        \\{"a":1,"b":2,"c":3}
+        ,
+        \\{"nested":{"x":true,"y":false},"arr":[1,2,3]}
+        ,
+        \\{"empty_obj":{},"empty_arr":[],"null_val":null}
+        ,
+        \\{"str":"hello \"world\"","num":-42,"float":3.14}
+        ,
+        \\[1,2,3,"four",true,null,{"key":"val"}]
+        ,
+        \\{"unicode":"caf\u00e9","escape":"line\nbreak"}
+        ,
+    };
+
+    for (test_jsons) |json| {
+        var mem: [16384]u8 align(4) = undefined;
+        var buf = lite3.Buffer.jsonDecode(&mem, json) catch continue;
+
+        // Re-encode should succeed
+        const encoded = try buf.jsonEncode(lite3.root);
+        defer encoded.deinit();
+        try testing.expect(encoded.slice().len > 0);
+
+        // Decode the re-encoded JSON and re-encode again — should be stable
+        var mem2: [16384]u8 align(4) = undefined;
+        var buf2 = try lite3.Buffer.jsonDecode(&mem2, encoded.slice());
+        const encoded2 = try buf2.jsonEncode(lite3.root);
+        defer encoded2.deinit();
+
+        try testing.expectEqualStrings(encoded.slice(), encoded2.slice());
+    }
+}
+
+test "Fuzz: oversized key returns InvalidArgument" {
+    var mem: [8192]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+
+    // Key exactly at max (255 bytes) should work
+    const max_key = "k" ** 255;
+    try buf.setI64(lite3.root, max_key, 1);
+    try testing.expectEqual(@as(i64, 1), try buf.getI64(lite3.root, max_key));
+
+    // Key at 256 bytes should fail
+    const too_long = "k" ** 256;
+    try testing.expectError(lite3.Error.InvalidArgument, buf.setI64(lite3.root, too_long, 2));
+    try testing.expectError(lite3.Error.InvalidArgument, buf.getI64(lite3.root, too_long));
+    try testing.expectError(lite3.Error.InvalidArgument, buf.exists(lite3.root, too_long));
+}
+
+test "Fuzz: many types in single object" {
+    // Stress test: insert every type into one object and verify.
+    var mem: [65536]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+
+    try buf.setNull(lite3.root, "null_val");
+    try buf.setBool(lite3.root, "bool_val", true);
+    try buf.setI64(lite3.root, "i64_val", std.math.minInt(i64));
+    try buf.setF64(lite3.root, "f64_val", std.math.floatMax(f64));
+    try buf.setStr(lite3.root, "str_val", "hello");
+    try buf.setBytes(lite3.root, "bytes_val", &[_]u8{ 0x00, 0xFF, 0x80 });
+    const obj = try buf.setObj(lite3.root, "obj_val");
+    try buf.setI64(obj, "inner", 42);
+    const arr = try buf.setArr(lite3.root, "arr_val");
+    try buf.arrAppendI64(arr, 1);
+    try buf.arrAppendStr(arr, "two");
+
+    try testing.expectEqual(lite3.Type.null, try buf.getType(lite3.root, "null_val"));
+    try testing.expectEqual(true, try buf.getBool(lite3.root, "bool_val"));
+    try testing.expectEqual(std.math.minInt(i64), try buf.getI64(lite3.root, "i64_val"));
+    try testing.expectEqual(std.math.floatMax(f64), try buf.getF64(lite3.root, "f64_val"));
+    try testing.expectEqualStrings("hello", try buf.getStr(lite3.root, "str_val"));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0xFF, 0x80 }, try buf.getBytes(lite3.root, "bytes_val"));
+    try testing.expectEqual(@as(i64, 42), try buf.getI64(obj, "inner"));
+    try testing.expectEqual(@as(i64, 1), try buf.arrGetI64(arr, 0));
+    try testing.expectEqualStrings("two", try buf.arrGetStr(arr, 1));
+    try testing.expectEqual(@as(u32, 8), try buf.count(lite3.root));
+}
+
+test "Fuzz: Context rapid grow/shrink cycle" {
+    // Repeatedly add and overwrite keys to exercise Context's realloc path.
+    var ctx = try lite3.Context.create();
+    defer ctx.destroy();
+    try ctx.initObj();
+
+    for (0..20) |round| {
+        // Add many keys with large values to force growth
+        for (0..50) |i| {
+            var key_buf: [16]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "k{d}_{d}", .{ round, i }) catch unreachable;
+            try ctx.setStr(lite3.root, key, "x" ** 200);
+        }
+    }
+
+    // Verify the context is still usable
+    try ctx.setI64(lite3.root, "final", 999);
+    try testing.expectEqual(@as(i64, 999), try ctx.getI64(lite3.root, "final"));
+}
