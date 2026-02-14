@@ -205,6 +205,8 @@ fn SharedMethods(comptime Self: type) type {
         /// Returns a fixed-size array that can be passed to C via `&kz`.
         inline fn toKeyZ(key: []const u8) Error![max_key_len + 1]u8 {
             if (key.len > max_key_len) return Error.InvalidArgument;
+            // C APIs treat keys as NUL-terminated strings; embedded NUL would truncate.
+            if (std.mem.indexOfScalar(u8, key, 0) != null) return Error.InvalidArgument;
             var buf: [max_key_len + 1]u8 = undefined;
             @memcpy(buf[0..key.len], key);
             buf[key.len] = 0;
@@ -958,22 +960,25 @@ pub const Context = struct {
 
     /// Create a new context with default size.
     pub fn create() Error!Context {
+        std.c._errno().* = 0;
         const ctx = c.shim_lite3_ctx_create();
-        if (ctx == null) return Error.OutOfMemory;
+        if (ctx == null) return translateErrno();
         return Context{ .ctx = ctx.? };
     }
 
     /// Create a new context with a specific buffer size.
     pub fn createWithSize(bufsz: usize) Error!Context {
+        std.c._errno().* = 0;
         const ctx = c.shim_lite3_ctx_create_with_size(bufsz);
-        if (ctx == null) return Error.OutOfMemory;
+        if (ctx == null) return translateErrno();
         return Context{ .ctx = ctx.? };
     }
 
     /// Create a context by copying from an existing buffer.
     pub fn createFromBuf(buf: []const u8) Error!Context {
+        std.c._errno().* = 0;
         const ctx = c.shim_lite3_ctx_create_from_buf(buf.ptr, buf.len);
-        if (ctx == null) return Error.OutOfMemory;
+        if (ctx == null) return translateErrno();
         return Context{ .ctx = ctx.? };
     }
 

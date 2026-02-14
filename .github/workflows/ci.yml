@@ -39,6 +39,14 @@ jobs:
       - name: Test (${{ matrix.optimize }}, json=${{ matrix.json }})
         run: zig build test -Doptimize=${{ matrix.optimize }} -Djson=${{ matrix.json }}
 
+      - name: Build examples (${{ matrix.optimize }}, json=${{ matrix.json }})
+        run: zig build examples -Doptimize=${{ matrix.optimize }} -Djson=${{ matrix.json }}
+
+      - name: Run examples (${{ matrix.optimize }}, json=${{ matrix.json }})
+        run: |
+          ./zig-out/bin/basic
+          ./zig-out/bin/json_roundtrip
+
   unsupported-options:
     runs-on: ubuntu-latest
     steps:

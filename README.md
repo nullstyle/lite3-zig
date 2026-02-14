@@ -10,7 +10,7 @@ Idiomatic [Zig](https://ziglang.org/) wrapper for [Lite³](https://github.com/fa
 - **JSON round-trip** — encode to / decode from JSON via the bundled yyjson backend.
 - **Iteration** — iterate over object keys or array elements.
 - **Proper error handling** — all C error codes are translated to Zig error unions.
-- **Flexible keys** — accepts `[]const u8` keys (no sentinel terminator required).
+- **Flexible keys** — accepts `[]const u8` keys (no sentinel terminator required; embedded `\0` is rejected).
 - **Zero `@cImport` issues** — a thin C shim wraps the inline functions that Zig's translate-c cannot handle (alignment casts, flexible array members, GNU statement expressions).
 
 ## Requirements

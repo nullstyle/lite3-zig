@@ -13,6 +13,11 @@ pub fn main() !void {
     var stdout = std.fs.File.stdout().writerStreaming(&write_buf);
     defer stdout.interface.flush() catch {};
 
+    if (!lite3.json_enabled) {
+        try stdout.interface.print("JSON round-trip example is unavailable when JSON is disabled (-Djson=false).\n", .{});
+        return;
+    }
+
     // Build a document
     var mem: [16384]u8 align(4) = undefined;
     var buf = try lite3.Buffer.initObj(&mem);

@@ -10,7 +10,8 @@ pub fn build(b: *std.Build) void {
     const enable_lto = b.option(bool, "lto", "Enable link-time optimization for the C library (currently unsupported)") orelse false;
 
     if (enable_lto) {
-        @panic("`-Dlto=true` is currently unsupported in lite3-zig; remove the flag.");
+        std.log.err("`-Dlto=true` is currently unsupported in lite3-zig; remove the flag.", .{});
+        std.process.exit(1);
     }
 
     // --- Paths ---

@@ -1414,6 +1414,23 @@ test "Buffer: keys accept runtime []const u8 slices" {
     try testing.expect(try buf.exists(lite3.root, key));
 }
 
+test "Buffer: embedded NUL in key returns InvalidArgument" {
+    var mem: [4096]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    const bad_key = "abc\x00def";
+
+    try testing.expectError(lite3.Error.InvalidArgument, buf.setI64(lite3.root, bad_key, 1));
+    try testing.expectError(lite3.Error.InvalidArgument, buf.getI64(lite3.root, bad_key));
+    try testing.expectError(lite3.Error.InvalidArgument, buf.exists(lite3.root, bad_key));
+}
+
+test "Context: constructor errno mapping for invalid arguments" {
+    try testing.expectError(lite3.Error.InvalidArgument, lite3.Context.createWithSize(std.math.maxInt(usize)));
+
+    const empty = [_]u8{};
+    try testing.expectError(lite3.Error.InvalidArgument, lite3.Context.createFromBuf(empty[0..]));
+}
+
 // =========================================================================
 // Fuzz / property-based tests
 // =========================================================================
