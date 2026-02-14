@@ -7,7 +7,9 @@
 ## Features
 
 - **Buffer API** — fixed-size, caller-managed memory; ideal for embedded, real-time, or arena-based workflows.
-- **Context API** — heap-allocated, auto-growing buffer; convenient for general-purpose use.
+- **Context API** — heap-allocated, auto-growing buffer via lite3's internal C allocator.
+- **ManagedContext API** — allocator-explicit, auto-growing buffer managed by Zig allocator.
+- **ExternalContext API** — no stored allocator; provide allocator only to growth-capable calls.
 - **Full type support** — null, bool, i64, f64, string, bytes, nested objects, and arrays.
 - **JSON round-trip** — encode to / decode from JSON via the bundled yyjson backend.
 - **Iteration** — iterate over object keys or array elements.
@@ -27,11 +29,11 @@ The C source for lite3 is vendored directly in `vendor/lite3/` — no submodules
 ```zig
 const lite3 = @import("lite3");
 
-// Using the Context API (auto-growing buffer)
-var ctx = try lite3.Context.create();
-defer ctx.destroy();
+// Using the Context API (auto-growing buffer via C malloc/free)
+var ctx = try lite3.Context.init();
+defer ctx.deinit();
 
-try ctx.initObj();
+try ctx.resetObj();
 try ctx.setStr(lite3.root, "name", "Alice");
 try ctx.setI64(lite3.root, "age", 30);
 
@@ -41,6 +43,30 @@ const name = try ctx.getStr(lite3.root, "name");
 // Encode to JSON
 const json = try ctx.jsonEncode(lite3.root);
 defer json.deinit();
+```
+
+```zig
+const std = @import("std");
+const lite3 = @import("lite3");
+
+// Using the ManagedContext API (auto-growing via Zig allocator)
+var mctx = try lite3.ManagedContext.init(std.heap.page_allocator);
+defer mctx.deinit();
+
+try mctx.resetObj();
+try mctx.setStr(lite3.root, "name", "Alice");
+```
+
+```zig
+const std = @import("std");
+const lite3 = @import("lite3");
+
+// Using ExternalContext (no allocator stored in the type)
+var ectx = try lite3.ExternalContext.init(std.heap.page_allocator);
+defer ectx.deinit(std.heap.page_allocator);
+
+try ectx.resetObj();
+try ectx.setStr(std.heap.page_allocator, lite3.root, "name", "Alice");
 ```
 
 ```zig
@@ -123,7 +149,9 @@ See the `examples/` directory for standalone example programs:
 | Zig type          | Description                                          |
 |-------------------|------------------------------------------------------|
 | `Buffer`          | Fixed-size buffer with caller-managed memory         |
-| `Context`         | Heap-allocated, auto-growing buffer                  |
+| `Context`         | Heap-allocated, auto-growing buffer (C allocator)    |
+| `ManagedContext`  | Auto-growing buffer managed by Zig allocator         |
+| `ExternalContext` | Auto-growing buffer; allocator passed per grow-capable call |
 | `Type`            | Enum of value types (null, bool_, i64_, f64_, etc.)  |
 | `Offset`          | Typed offset handle into the buffer (`enum(usize)`)  |
 | `Error`           | Error set (NotFound, InvalidArgument, etc.)          |
@@ -153,7 +181,28 @@ See the `examples/` directory for standalone example programs:
 
 ### Context API
 
-The Context API mirrors the Buffer API but manages memory automatically. All methods from the Buffer API are available with the same names.
+The Context API manages memory automatically via lite3's internal C allocator (`malloc/free`) and exposes the same value/query/array methods as `Buffer`.
+Lifecycle methods are context-specific:
+
+- `init` / `initWithSize` / `initFromBuf` to construct a context
+- `resetObj` / `resetArr` to reset the root container type
+- `deinit` to release resources (idempotent)
+
+### ManagedContext API
+
+`ManagedContext` mirrors the operational API of `Context`, but allocation is explicit through a caller-provided Zig allocator:
+
+- `init(allocator)` / `initWithCapacity(allocator, n)` / `initFromBuf(allocator, buf)`
+- Mutating operations auto-grow on `Error.NoBufferSpace`
+- `deinit` releases allocator-owned memory (idempotent)
+
+### ExternalContext API
+
+`ExternalContext` also uses Zig allocators, but it does not store one internally:
+
+- `init(allocator)` / `initWithCapacity(allocator, n)` / `initFromBuf(allocator, buf)`
+- Pass allocator only to grow-capable operations (`set*`, `arrAppend*`, `importFromBuf`, `jsonDecode`)
+- `deinit(allocator)` requires the same allocator used for init/growth
 
 ## Project structure
 

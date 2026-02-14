@@ -258,22 +258,22 @@ fn benchContextVsBuffer() !void {
     // --- Context ---
     var ctx_times: [NUM_TRIALS]u64 = undefined;
     {
-        var ctx = try lite3.Context.create();
-        try ctx.initObj();
+        var ctx = try lite3.Context.init();
+        try ctx.resetObj();
         try ctx.setI64(lite3.root, "k", 1);
         std.mem.doNotOptimizeAway(&ctx);
-        ctx.destroy();
+        ctx.deinit();
     }
     for (&ctx_times) |*t| {
-        var ctx = try lite3.Context.create();
-        try ctx.initObj();
+        var ctx = try lite3.Context.init();
+        try ctx.resetObj();
         var timer = try Timer.start();
         for (0..iterations) |_| {
             try ctx.setI64(lite3.root, "k", 1);
         }
         t.* = timer.read();
         std.mem.doNotOptimizeAway(&ctx);
-        ctx.destroy();
+        ctx.deinit();
     }
     printStats("ctx_set:", iterations, &ctx_times);
 

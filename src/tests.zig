@@ -458,26 +458,26 @@ test "Buffer: large number of entries" {
 // Context API tests
 // =========================================================================
 
-test "Context: create and destroy" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+test "Context: init and deinit" {
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 }
 
-test "Context: init object and set/get i64" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+test "Context: reset object and set/get i64" {
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     try ctx.setI64(lite3.root, "answer", 42);
     const val = try ctx.getI64(lite3.root, "answer");
     try testing.expectEqual(@as(i64, 42), val);
 }
 
 test "Context: set and get all types" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     try ctx.setNull(lite3.root, "nil");
     try ctx.setBool(lite3.root, "flag", true);
     try ctx.setI64(lite3.root, "num", 123);
@@ -494,30 +494,30 @@ test "Context: set and get all types" {
 }
 
 test "Context: exists" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     try ctx.setI64(lite3.root, "present", 1);
     try testing.expect(try ctx.exists(lite3.root, "present"));
     try testing.expect(!try ctx.exists(lite3.root, "absent"));
 }
 
 test "Context: count" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     try ctx.setI64(lite3.root, "a", 1);
     try ctx.setI64(lite3.root, "b", 2);
     try testing.expectEqual(@as(u32, 2), try ctx.count(lite3.root));
 }
 
 test "Context: nested object" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     const child = try ctx.setObj(lite3.root, "child");
     try ctx.setStr(child, "name", "nested");
     try ctx.setI64(child, "value", 99);
@@ -528,10 +528,10 @@ test "Context: nested object" {
 }
 
 test "Context: nested array" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     const arr = try ctx.setArr(lite3.root, "items");
     try ctx.arrAppendI64(arr, 10);
     try ctx.arrAppendI64(arr, 20);
@@ -542,10 +542,10 @@ test "Context: nested array" {
 }
 
 test "Context: array operations" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initArr();
+    try ctx.resetArr();
     try ctx.arrAppendNull(lite3.root);
     try ctx.arrAppendBool(lite3.root, false);
     try ctx.arrAppendI64(lite3.root, 42);
@@ -560,10 +560,10 @@ test "Context: array operations" {
 }
 
 test "Context: array with nested objects" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initArr();
+    try ctx.resetArr();
     const obj = try ctx.arrAppendObj(lite3.root);
     try ctx.setStr(obj, "key", "value");
 
@@ -572,10 +572,10 @@ test "Context: array with nested objects" {
 }
 
 test "Context: array with nested arrays" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initArr();
+    try ctx.resetArr();
     const inner = try ctx.arrAppendArr(lite3.root);
     try ctx.arrAppendI64(inner, 1);
     try ctx.arrAppendI64(inner, 2);
@@ -586,10 +586,10 @@ test "Context: array with nested arrays" {
 }
 
 test "Context: iterator" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     try ctx.setI64(lite3.root, "a", 10);
     try ctx.setI64(lite3.root, "b", 20);
 
@@ -604,10 +604,10 @@ test "Context: iterator" {
 test "Context: JSON encode" {
     if (!lite3.json_enabled) return;
 
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     try ctx.setStr(lite3.root, "msg", "hello");
     try ctx.setI64(lite3.root, "code", 200);
 
@@ -622,10 +622,10 @@ test "Context: JSON encode" {
 test "Context: JSON pretty encode" {
     if (!lite3.json_enabled) return;
 
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     try ctx.setI64(lite3.root, "x", 1);
 
     const json = try ctx.jsonEncodePretty(lite3.root);
@@ -634,31 +634,31 @@ test "Context: JSON pretty encode" {
     try testing.expect(std.mem.indexOf(u8, json.slice(), "\n") != null);
 }
 
-test "Context: create with size" {
-    var ctx = try lite3.Context.createWithSize(65536);
-    defer ctx.destroy();
+test "Context: init with size" {
+    var ctx = try lite3.Context.initWithSize(65536);
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     try ctx.setStr(lite3.root, "big", "buffer");
     try testing.expectEqualStrings("buffer", try ctx.getStr(lite3.root, "big"));
 }
 
-test "Context: create from buffer" {
-    // First create a buffer
+test "Context: init from buffer" {
+    // First initialize a buffer
     var mem: [4096]u8 align(4) = undefined;
     var buf = try lite3.Buffer.initObj(&mem);
     try buf.setI64(lite3.root, "val", 42);
 
-    // Create context from that buffer
-    var ctx = try lite3.Context.createFromBuf(buf.data());
-    defer ctx.destroy();
+    // Initialize context from that buffer
+    var ctx = try lite3.Context.initFromBuf(buf.data());
+    defer ctx.deinit();
 
     try testing.expectEqual(@as(i64, 42), try ctx.getI64(lite3.root, "val"));
 }
 
 test "Context: import from buffer" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
     // Create a buffer with data
     var mem: [4096]u8 align(4) = undefined;
@@ -671,16 +671,108 @@ test "Context: import from buffer" {
 }
 
 // =========================================================================
+// ManagedContext API tests
+// =========================================================================
+
+test "ManagedContext: explicit allocator lifecycle" {
+    var mctx = try lite3.ManagedContext.init(testing.allocator);
+    defer mctx.deinit();
+
+    try mctx.resetObj();
+    try mctx.setI64(lite3.root, "answer", 42);
+    try testing.expectEqual(@as(i64, 42), try mctx.getI64(lite3.root, "answer"));
+}
+
+test "ManagedContext: grows on NoBufferSpace" {
+    var mctx = try lite3.ManagedContext.initWithCapacity(testing.allocator, 1024);
+    defer mctx.deinit();
+
+    const initial_capacity = mctx.capacity();
+    try mctx.resetObj();
+    try mctx.setStr(lite3.root, "blob", "x" ** 6000);
+
+    try testing.expect(mctx.capacity() > initial_capacity);
+    const s = try mctx.getStr(lite3.root, "blob");
+    try testing.expectEqual(@as(usize, 6000), s.len);
+}
+
+test "ManagedContext: initFromBuf imports an existing buffer" {
+    var mem: [4096]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    try buf.setStr(lite3.root, "name", "alice");
+    try buf.setI64(lite3.root, "age", 30);
+
+    var mctx = try lite3.ManagedContext.initFromBuf(testing.allocator, buf.data());
+    defer mctx.deinit();
+
+    try testing.expectEqualStrings("alice", try mctx.getStr(lite3.root, "name"));
+    try testing.expectEqual(@as(i64, 30), try mctx.getI64(lite3.root, "age"));
+}
+
+test "ManagedContext: deinit is idempotent" {
+    var mctx = try lite3.ManagedContext.init(testing.allocator);
+    mctx.deinit();
+    mctx.deinit();
+}
+
+// =========================================================================
+// ExternalContext API tests
+// =========================================================================
+
+test "ExternalContext: explicit allocator on mutating operations" {
+    var ectx = try lite3.ExternalContext.init(testing.allocator);
+    defer ectx.deinit(testing.allocator);
+
+    try ectx.resetObj();
+    try ectx.setI64(testing.allocator, lite3.root, "answer", 42);
+    try testing.expectEqual(@as(i64, 42), try ectx.getI64(lite3.root, "answer"));
+}
+
+test "ExternalContext: grows on NoBufferSpace with provided allocator" {
+    var ectx = try lite3.ExternalContext.initWithCapacity(testing.allocator, 1024);
+    defer ectx.deinit(testing.allocator);
+
+    const initial_capacity = ectx.capacity();
+    try ectx.resetObj();
+    try ectx.setStr(testing.allocator, lite3.root, "blob", "x" ** 6000);
+
+    try testing.expect(ectx.capacity() > initial_capacity);
+    const s = try ectx.getStr(lite3.root, "blob");
+    try testing.expectEqual(@as(usize, 6000), s.len);
+}
+
+test "ExternalContext: importFromBuf can grow with provided allocator" {
+    var mem: [8192]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    try buf.setStr(lite3.root, "name", "alice");
+    try buf.setI64(lite3.root, "age", 30);
+    try buf.setStr(lite3.root, "payload", "y" ** 3000);
+
+    var ectx = try lite3.ExternalContext.initWithCapacity(testing.allocator, 1024);
+    defer ectx.deinit(testing.allocator);
+    try ectx.importFromBuf(testing.allocator, buf.data());
+
+    try testing.expectEqualStrings("alice", try ectx.getStr(lite3.root, "name"));
+    try testing.expectEqual(@as(i64, 30), try ectx.getI64(lite3.root, "age"));
+}
+
+test "ExternalContext: deinit is idempotent" {
+    var ectx = try lite3.ExternalContext.init(testing.allocator);
+    ectx.deinit(testing.allocator);
+    ectx.deinit(testing.allocator);
+}
+
+// =========================================================================
 // Complex / integration tests
 // =========================================================================
 
 test "Integration: build complex document and JSON round-trip" {
     if (!lite3.json_enabled) return;
 
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     try ctx.setStr(lite3.root, "event", "http_request");
     try ctx.setStr(lite3.root, "method", "POST");
     try ctx.setI64(lite3.root, "duration_ms", 47);
@@ -732,10 +824,10 @@ test "Integration: buffer data can be copied and reused" {
 }
 
 test "Integration: array of objects pattern" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     const users = try ctx.setArr(lite3.root, "users");
 
     const user1 = try ctx.arrAppendObj(users);
@@ -829,19 +921,19 @@ test "Integration: i64 boundary values" {
 // =========================================================================
 
 test "Context: error on key not found" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     const result = ctx.getI64(lite3.root, "nonexistent");
     try testing.expectError(lite3.Error.NotFound, result);
 }
 
 test "Context: error on type mismatch" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     try ctx.setStr(lite3.root, "text", "hello");
     const result = ctx.getI64(lite3.root, "text");
     try testing.expectError(lite3.Error.InvalidArgument, result);
@@ -852,29 +944,29 @@ test "Context: error on type mismatch" {
 // =========================================================================
 
 test "Context: bufPtr returns non-null" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     const ptr = ctx.bufPtr();
     try testing.expect(@intFromPtr(ptr) != 0);
 }
 
 test "Context: data returns valid slice" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     try ctx.setI64(lite3.root, "x", 42);
     const d = ctx.data();
     try testing.expect(d.len > 0);
 }
 
 test "Context: arrGetStr" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initArr();
+    try ctx.resetArr();
     try ctx.arrAppendStr(lite3.root, "alpha");
     try ctx.arrAppendStr(lite3.root, "beta");
 
@@ -883,10 +975,10 @@ test "Context: arrGetStr" {
 }
 
 test "Context: arrGetBytes" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initArr();
+    try ctx.resetArr();
     try ctx.arrAppendBytes(lite3.root, &[_]u8{ 0xAA, 0xBB });
     try ctx.arrAppendBytes(lite3.root, &[_]u8{ 0xCC, 0xDD });
 
@@ -897,8 +989,8 @@ test "Context: arrGetBytes" {
 test "Context: jsonDecode" {
     if (!lite3.json_enabled) return;
 
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
     const json =
         \\{"name":"alice","age":30}
@@ -912,8 +1004,8 @@ test "Context: jsonDecode" {
 test "Context: jsonDecode and then modify" {
     if (!lite3.json_enabled) return;
 
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
     try ctx.jsonDecode(
         \\{"x":1}
@@ -956,18 +1048,18 @@ test "Buffer: empty array count" {
 }
 
 test "Context: empty object count" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     try testing.expectEqual(@as(u32, 0), try ctx.count(lite3.root));
 }
 
 test "Context: empty array count" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initArr();
+    try ctx.resetArr();
     try testing.expectEqual(@as(u32, 0), try ctx.count(lite3.root));
 }
 
@@ -987,10 +1079,10 @@ test "Buffer: JsonString lifecycle" {
 test "Context: JsonString lifecycle" {
     if (!lite3.json_enabled) return;
 
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     try ctx.setI64(lite3.root, "x", 1);
 
     const json = try ctx.jsonEncode(lite3.root);
@@ -1033,8 +1125,8 @@ test "Buffer: get from wrong container type" {
 }
 
 test "Context: jsonDecode with invalid JSON returns error" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
     const result = ctx.jsonDecode("{not valid json}}}");
     try testing.expectError(lite3.Error.InvalidArgument, result);
 }
@@ -1054,9 +1146,9 @@ test "JSON APIs return InvalidArgument when JSON support is disabled" {
     var mem2: [4096]u8 align(4) = undefined;
     try testing.expectError(lite3.Error.InvalidArgument, lite3.Buffer.jsonDecode(&mem2, "{}"));
 
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
-    try ctx.initObj();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
+    try ctx.resetObj();
     try testing.expectError(lite3.Error.InvalidArgument, ctx.jsonEncode(lite3.root));
     try testing.expectError(lite3.Error.InvalidArgument, ctx.jsonDecode("{}"));
 }
@@ -1074,9 +1166,9 @@ test "Buffer: set on wrong container type" {
 // =========================================================================
 
 test "Context: arrGetType" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
-    try ctx.initArr();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
+    try ctx.resetArr();
     try ctx.arrAppendI64(lite3.root, 42);
     try ctx.arrAppendStr(lite3.root, "hello");
     try ctx.arrAppendBool(lite3.root, true);
@@ -1135,9 +1227,9 @@ test "Buffer: getStrCopy with too-small buffer returns error" {
 }
 
 test "Context: getBytesCopy copies into destination" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
-    try ctx.initObj();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
+    try ctx.resetObj();
     try ctx.setBytes(lite3.root, "data", &[_]u8{ 0xDE, 0xAD });
 
     var dest: [64]u8 = undefined;
@@ -1150,9 +1242,9 @@ test "Context: getBytesCopy copies into destination" {
 // =========================================================================
 
 test "Context: getType returns Error!Type (unified)" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
-    try ctx.initObj();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
+    try ctx.resetObj();
     try ctx.setI64(lite3.root, "num", 42);
 
     // getType now returns Error!Type, not plain Type
@@ -1233,7 +1325,7 @@ test "Property: JSON encode-decode is idempotent for objects" {
 }
 
 // =========================================================================
-// Error path tests: CorruptData, NoBufferSpace rollback, destroy safety
+// Error path tests: CorruptData, NoBufferSpace rollback, deinit safety
 // =========================================================================
 
 test "Buffer: corrupted buffer returns error, not valid data" {
@@ -1275,23 +1367,20 @@ test "Buffer: mutation rollback preserves buffer length on NoBufferSpace" {
     try testing.expectEqual(len_before, buf.len);
 }
 
-test "Context: destroy poisons the struct" {
-    // After destroy, the Context is set to undefined (poisoned).
-    // We verify destroy completes without error.
-    var ctx = try lite3.Context.create();
-    try ctx.initObj();
+test "Context: deinit is idempotent" {
+    var ctx = try lite3.Context.init();
+    try ctx.resetObj();
     try ctx.setI64(lite3.root, "val", 1);
-    ctx.destroy();
-    // After destroy, ctx is undefined. We do not attempt to use it again.
-    // The test passes if destroy() did not crash or leak.
+    ctx.deinit();
+    ctx.deinit();
 }
 
-test "Context: createWithSize(0) returns OutOfMemory or creates empty context" {
+test "Context: initWithSize(0) returns OutOfMemory or creates empty context" {
     // Edge case: requesting a zero-size context.
-    const result = lite3.Context.createWithSize(0);
+    const result = lite3.Context.initWithSize(0);
     if (result) |*ctx| {
         var c = ctx.*;
-        c.destroy();
+        c.deinit();
     } else |_| {
         // OutOfMemory is acceptable for zero-size
     }
@@ -1357,10 +1446,10 @@ test "Buffer: arrGetBytesCopy copies array bytes safely" {
 }
 
 test "Context: arrGetStrCopy copies array string safely" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initArr();
+    try ctx.resetArr();
     try ctx.arrAppendStr(lite3.root, "alpha");
     try ctx.arrAppendStr(lite3.root, "beta");
 
@@ -1374,10 +1463,10 @@ test "Context: arrGetStrCopy copies array string safely" {
 // =========================================================================
 
 test "Context: getStrCopy survives mutation (dangling pointer mitigation)" {
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     try ctx.setStr(lite3.root, "name", "alice");
 
     // Safe: copy the string out before mutating
@@ -1425,10 +1514,10 @@ test "Buffer: embedded NUL in key returns InvalidArgument" {
 }
 
 test "Context: constructor errno mapping for invalid arguments" {
-    try testing.expectError(lite3.Error.InvalidArgument, lite3.Context.createWithSize(std.math.maxInt(usize)));
+    try testing.expectError(lite3.Error.InvalidArgument, lite3.Context.initWithSize(std.math.maxInt(usize)));
 
     const empty = [_]u8{};
-    try testing.expectError(lite3.Error.InvalidArgument, lite3.Context.createFromBuf(empty[0..]));
+    try testing.expectError(lite3.Error.InvalidArgument, lite3.Context.initFromBuf(empty[0..]));
 }
 
 // =========================================================================
@@ -1548,9 +1637,9 @@ test "Fuzz: many types in single object" {
 
 test "Fuzz: Context rapid grow/shrink cycle" {
     // Repeatedly add and overwrite keys to exercise Context's realloc path.
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
-    try ctx.initObj();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
+    try ctx.resetObj();
 
     for (0..20) |round| {
         // Add many keys with large values to force growth

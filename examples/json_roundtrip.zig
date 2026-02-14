@@ -74,8 +74,8 @@ pub fn main() !void {
 
     // Context API JSON decode
     try stdout.interface.print("\n=== Context API JSON decode ===\n", .{});
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
     const input_json =
         \\{"users":[{"name":"Alice","age":30},{"name":"Bob","age":25}],"count":2}

@@ -44,10 +44,10 @@ pub fn main() !void {
     // --- Context API: auto-growing memory ---
     try stdout.interface.print("\n=== Context API ===\n", .{});
 
-    var ctx = try lite3.Context.create();
-    defer ctx.destroy();
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
 
-    try ctx.initObj();
+    try ctx.resetObj();
     try ctx.setStr(lite3.root, "event", "login");
     try ctx.setI64(lite3.root, "timestamp", 1700000000);
 
