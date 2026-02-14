@@ -23,6 +23,10 @@ test-no-json:
 # Run all test variants
 test-all: test test-release test-fast test-no-json
 
+# Run the local GitHub Actions CI workflow with act
+act-local:
+    act -W .github/workflows/ci-local.yml
+
 # Build example programs
 examples:
     zig build examples

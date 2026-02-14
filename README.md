@@ -1,6 +1,8 @@
 # lite3-zig
 
-Idiomatic [Zig](https://ziglang.org/) wrapper for [Lite³](https://github.com/fastserial/lite3), a JSON-compatible zero-copy serialization format that encodes data as a B-tree inside a single contiguous buffer, allowing O(log n) access and mutation on any arbitrary field.
+**WARNING: This library is fully vibe-coded;  it's just for me for now.  use at your own risk**
+
+(Human's note: _aim's to be_) Idiomatic [Zig](https://ziglang.org/) wrapper for [Lite³](https://github.com/fastserial/lite3), a JSON-compatible zero-copy serialization format that encodes data as a B-tree inside a single contiguous buffer, allowing O(log n) access and mutation on any arbitrary field.
 
 ## Features
 
@@ -185,7 +187,21 @@ just test-release     # Run tests with ReleaseSafe
 just test-no-json     # Run tests with JSON backend disabled
 just clean            # Remove build artifacts
 just update-vendor    # Update vendored lite3 sources
+just act-local        # Run local CI in act
+
 ```
+
+### Local GitHub Actions (act)
+
+To run CI locally, use the dedicated workflow in `.github/workflows/ci-local.yml`:
+
+```bash
+act workflow_dispatch -W .github/workflows/ci-local.yml
+```
+
+If you install act and want a short alias, use `just act-local` from the root of this repository.
+
+The local workflow intentionally mirrors the existing CI commands on Linux so it can run in `act` consistently without requiring a macOS runner.
 
 ## Safety notes
 
