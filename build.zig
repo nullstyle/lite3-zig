@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const arch = target.result.cpu.arch;
 
     // --- Options ---
     const enable_json = b.option(bool, "json", "Enable JSON conversion support (requires yyjson)") orelse true;
@@ -99,6 +100,11 @@ pub fn build(b: *std.Build) void {
 
     if (enable_error_messages) {
         lite3_mod.addCMacro("LITE3_ERROR_MESSAGES", "");
+    }
+    // Upstream warns that prefetching can crash on non-x86 targets.
+    // Keep it enabled on x86/x86_64 and disable elsewhere.
+    if (arch != .x86 and arch != .x86_64) {
+        lite3_mod.addCMacro("LITE3_DISABLE_PREFETCHING", "1");
     }
 
     const lite3_lib = b.addLibrary(.{

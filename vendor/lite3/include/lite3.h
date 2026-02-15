@@ -181,7 +181,9 @@ This *may* happen when:
 1. reading near unallocated page boundaries
 2. untrusted messages contain invalid offsets
 */
+#ifndef LITE3_DISABLE_PREFETCHING
 #define LITE3_PREFETCHING
+#endif
 
 #if defined(DOXYGEN_ONLY) && !defined(LITE3_PREFETCHING)
 #define LITE3_PREFETCHING

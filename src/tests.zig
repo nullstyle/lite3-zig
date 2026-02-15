@@ -32,6 +32,12 @@ test "Buffer: init array" {
     try testing.expect(buf.len > 0);
 }
 
+test "Buffer: fromSerialized validates used length" {
+    var mem: [64]u8 align(4) = undefined;
+    try testing.expectError(lite3.Error.InvalidArgument, lite3.Buffer.fromSerialized(&mem, 0));
+    try testing.expectError(lite3.Error.InvalidArgument, lite3.Buffer.fromSerialized(&mem, mem.len + 1));
+}
+
 test "Buffer: set and get i64" {
     var mem: [4096]u8 align(4) = undefined;
     var buf = try lite3.Buffer.initObj(&mem);
@@ -715,6 +721,16 @@ test "ManagedContext: deinit is idempotent" {
     mctx.deinit();
 }
 
+test "ManagedContext: methods after deinit return InvalidState" {
+    var mctx = try lite3.ManagedContext.init(testing.allocator);
+    mctx.deinit();
+
+    try testing.expectEqual(@as(usize, 0), mctx.capacity());
+    try testing.expectEqual(@as(usize, 0), mctx.data().len);
+    try testing.expectError(lite3.Error.InvalidState, mctx.setI64(lite3.root, "x", 1));
+    try testing.expectError(lite3.Error.InvalidState, mctx.getI64(lite3.root, "x"));
+}
+
 // =========================================================================
 // ExternalContext API tests
 // =========================================================================
@@ -760,6 +776,16 @@ test "ExternalContext: deinit is idempotent" {
     var ectx = try lite3.ExternalContext.init(testing.allocator);
     ectx.deinit(testing.allocator);
     ectx.deinit(testing.allocator);
+}
+
+test "ExternalContext: methods after deinit return InvalidState" {
+    var ectx = try lite3.ExternalContext.init(testing.allocator);
+    ectx.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 0), ectx.capacity());
+    try testing.expectEqual(@as(usize, 0), ectx.data().len);
+    try testing.expectError(lite3.Error.InvalidState, ectx.setI64(testing.allocator, lite3.root, "x", 1));
+    try testing.expectError(lite3.Error.InvalidState, ectx.getI64(lite3.root, "x"));
 }
 
 // =========================================================================
@@ -814,11 +840,7 @@ test "Integration: buffer data can be copied and reused" {
     const src = buf1.data();
     @memcpy(mem2[0..src.len], src);
 
-    const buf2 = lite3.Buffer{
-        .buf = &mem2,
-        .len = src.len,
-        .capacity = mem2.len,
-    };
+    const buf2 = try lite3.Buffer.fromSerialized(&mem2, src.len);
 
     try testing.expectEqual(@as(i64, 100), try buf2.getI64(lite3.root, "x"));
 }
@@ -1375,14 +1397,23 @@ test "Context: deinit is idempotent" {
     ctx.deinit();
 }
 
+test "Context: methods after deinit return InvalidState" {
+    var ctx = try lite3.Context.init();
+    ctx.deinit();
+
+    try testing.expectEqual(@as(usize, 0), ctx.data().len);
+    try testing.expectError(lite3.Error.InvalidState, ctx.resetObj());
+    try testing.expectError(lite3.Error.InvalidState, ctx.getType(lite3.root, "missing"));
+}
+
 test "Context: initWithSize(0) returns OutOfMemory or creates empty context" {
     // Edge case: requesting a zero-size context.
     const result = lite3.Context.initWithSize(0);
     if (result) |*ctx| {
         var c = ctx.*;
         c.deinit();
-    } else |_| {
-        // OutOfMemory is acceptable for zero-size
+    } else |err| {
+        try testing.expect(err == lite3.Error.OutOfMemory or err == lite3.Error.InvalidArgument);
     }
 }
 
@@ -1573,7 +1604,7 @@ test "Fuzz: JSON decode of random valid documents" {
 
     for (test_jsons) |json| {
         var mem: [16384]u8 align(4) = undefined;
-        var buf = lite3.Buffer.jsonDecode(&mem, json) catch continue;
+        var buf = try lite3.Buffer.jsonDecode(&mem, json);
 
         // Re-encode should succeed
         const encoded = try buf.jsonEncode(lite3.root);

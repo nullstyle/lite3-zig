@@ -51,6 +51,8 @@ pub const Error = error{
     CorruptData,
     /// Memory allocation failed (Context API only).
     OutOfMemory,
+    /// The value was used after deinit or before proper initialization.
+    InvalidState,
 };
 
 /// Translate a C return code (< 0 on error) into a Zig error.
@@ -213,6 +215,17 @@ fn SharedMethods(comptime Self: type) type {
             return buf;
         }
 
+        /// Validate lifecycle/invariants before dispatching to C.
+        inline fn ensureUsable(self: *const Self) Error!void {
+            if (is_ctx) {
+                if (self.ctx == null) return Error.InvalidState;
+                return;
+            }
+            if (self.capacity == 0 and self.len == 0) return Error.InvalidState;
+            if (self.len > self.capacity) return Error.CorruptData;
+            if ((@intFromPtr(self.buf) & 0x3) != 0) return Error.InvalidArgument;
+        }
+
         /// Save the current len for Buffer (no-op for Context).
         /// The C library documents that a failed write may still increment
         /// *inout_buflen, so we snapshot and restore to preserve invariants.
@@ -229,6 +242,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Set a null value for the given key.
         pub fn setNull(self: *Self, ofs: Offset, key: []const u8) Error!void {
+            try ensureUsable(self);
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
@@ -243,6 +257,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Set a boolean value for the given key.
         pub fn setBool(self: *Self, ofs: Offset, key: []const u8, value: bool) Error!void {
+            try ensureUsable(self);
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
@@ -257,6 +272,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Set an i64 value for the given key.
         pub fn setI64(self: *Self, ofs: Offset, key: []const u8, value: i64) Error!void {
+            try ensureUsable(self);
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
@@ -271,6 +287,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Set an f64 value for the given key.
         pub fn setF64(self: *Self, ofs: Offset, key: []const u8, value: f64) Error!void {
+            try ensureUsable(self);
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
@@ -285,6 +302,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Set a string value for the given key.
         pub fn setStr(self: *Self, ofs: Offset, key: []const u8, value: []const u8) Error!void {
+            try ensureUsable(self);
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
@@ -299,6 +317,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Set a bytes value for the given key.
         pub fn setBytes(self: *Self, ofs: Offset, key: []const u8, value: []const u8) Error!void {
+            try ensureUsable(self);
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
@@ -313,6 +332,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Set a nested object for the given key. Returns the offset of the new object.
         pub fn setObj(self: *Self, ofs: Offset, key: []const u8) Error!Offset {
+            try ensureUsable(self);
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             var out_ofs: usize = 0;
@@ -329,6 +349,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Set a nested array for the given key. Returns the offset of the new array.
         pub fn setArr(self: *Self, ofs: Offset, key: []const u8) Error!Offset {
+            try ensureUsable(self);
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             var out_ofs: usize = 0;
@@ -347,6 +368,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Get the type of a value by key.
         pub fn getType(self: *const Self, ofs: Offset, key: []const u8) Error!Type {
+            try ensureUsable(self);
             var kz = try toKeyZ(key);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_get_type(self.raw(), @intFromEnum(ofs), &kz)
@@ -361,6 +383,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Check if a key exists. Returns an error if the key conversion fails.
         pub fn exists(self: *const Self, ofs: Offset, key: []const u8) Error!bool {
+            try ensureUsable(self);
             var kz = try toKeyZ(key);
             return if (is_ctx)
                 c.shim_lite3_ctx_exists(self.raw(), @intFromEnum(ofs), &kz) != 0
@@ -370,6 +393,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Get a boolean value by key.
         pub fn getBool(self: *const Self, ofs: Offset, key: []const u8) Error!bool {
+            try ensureUsable(self);
             var kz = try toKeyZ(key);
             var out: bool = false;
             const ret = if (is_ctx)
@@ -382,6 +406,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Get an i64 value by key.
         pub fn getI64(self: *const Self, ofs: Offset, key: []const u8) Error!i64 {
+            try ensureUsable(self);
             var kz = try toKeyZ(key);
             var out: i64 = 0;
             const ret = if (is_ctx)
@@ -394,6 +419,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Get an f64 value by key.
         pub fn getF64(self: *const Self, ofs: Offset, key: []const u8) Error!f64 {
+            try ensureUsable(self);
             var kz = try toKeyZ(key);
             var out: f64 = 0;
             const ret = if (is_ctx)
@@ -409,6 +435,7 @@ fn SharedMethods(comptime Self: type) type {
         /// invalidated by any subsequent mutation. For Context, auto-reallocation
         /// can cause use-after-free. Use `getStrCopy` for a safe alternative.
         pub fn getStr(self: *const Self, ofs: Offset, key: []const u8) Error![]const u8 {
+            try ensureUsable(self);
             var kz = try toKeyZ(key);
             var out_ptr: ?[*]const u8 = null;
             var out_len: u32 = 0;
@@ -426,6 +453,7 @@ fn SharedMethods(comptime Self: type) type {
         /// invalidated by any subsequent mutation. For Context, auto-reallocation
         /// can cause use-after-free. Use `getBytesCopy` for a safe alternative.
         pub fn getBytes(self: *const Self, ofs: Offset, key: []const u8) Error![]const u8 {
+            try ensureUsable(self);
             var kz = try toKeyZ(key);
             var out_ptr: ?[*]const u8 = null;
             var out_len: u32 = 0;
@@ -440,6 +468,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Get a nested object offset by key.
         pub fn getObj(self: *const Self, ofs: Offset, key: []const u8) Error!Offset {
+            try ensureUsable(self);
             var kz = try toKeyZ(key);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
@@ -452,6 +481,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Get a nested array offset by key.
         pub fn getArr(self: *const Self, ofs: Offset, key: []const u8) Error!Offset {
+            try ensureUsable(self);
             var kz = try toKeyZ(key);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
@@ -465,6 +495,7 @@ fn SharedMethods(comptime Self: type) type {
         /// Get a string value by key, copying into a caller-supplied buffer.
         /// Returns the copied slice. Safe to use even after buffer mutations.
         pub fn getStrCopy(self: *const Self, ofs: Offset, key: []const u8, dest: []u8) Error![]const u8 {
+            try ensureUsable(self);
             const src = try self.getStr(ofs, key);
             if (src.len > dest.len) return Error.NoBufferSpace;
             @memcpy(dest[0..src.len], src);
@@ -474,6 +505,7 @@ fn SharedMethods(comptime Self: type) type {
         /// Get a bytes value by key, copying into a caller-supplied buffer.
         /// Returns the copied slice. Safe to use even after buffer mutations.
         pub fn getBytesCopy(self: *const Self, ofs: Offset, key: []const u8, dest: []u8) Error![]const u8 {
+            try ensureUsable(self);
             const src = try self.getBytes(ofs, key);
             if (src.len > dest.len) return Error.NoBufferSpace;
             @memcpy(dest[0..src.len], src);
@@ -484,6 +516,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Append a null value to an array.
         pub fn arrAppendNull(self: *Self, ofs: Offset) Error!void {
+            try ensureUsable(self);
             const saved = saveLen(self);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_append_null(self.raw(), @intFromEnum(ofs))
@@ -497,6 +530,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Append a boolean value to an array.
         pub fn arrAppendBool(self: *Self, ofs: Offset, value: bool) Error!void {
+            try ensureUsable(self);
             const saved = saveLen(self);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_append_bool(self.raw(), @intFromEnum(ofs), value)
@@ -510,6 +544,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Append an i64 value to an array.
         pub fn arrAppendI64(self: *Self, ofs: Offset, value: i64) Error!void {
+            try ensureUsable(self);
             const saved = saveLen(self);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_append_i64(self.raw(), @intFromEnum(ofs), value)
@@ -523,6 +558,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Append an f64 value to an array.
         pub fn arrAppendF64(self: *Self, ofs: Offset, value: f64) Error!void {
+            try ensureUsable(self);
             const saved = saveLen(self);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_append_f64(self.raw(), @intFromEnum(ofs), value)
@@ -536,6 +572,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Append a string value to an array.
         pub fn arrAppendStr(self: *Self, ofs: Offset, value: []const u8) Error!void {
+            try ensureUsable(self);
             const saved = saveLen(self);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_append_str(self.raw(), @intFromEnum(ofs), value.ptr, value.len)
@@ -549,6 +586,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Append a bytes value to an array.
         pub fn arrAppendBytes(self: *Self, ofs: Offset, value: []const u8) Error!void {
+            try ensureUsable(self);
             const saved = saveLen(self);
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_append_bytes(self.raw(), @intFromEnum(ofs), value.ptr, value.len)
@@ -562,6 +600,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Append a nested object to an array. Returns the offset of the new object.
         pub fn arrAppendObj(self: *Self, ofs: Offset) Error!Offset {
+            try ensureUsable(self);
             const saved = saveLen(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
@@ -577,6 +616,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Append a nested array to an array. Returns the offset of the new array.
         pub fn arrAppendArr(self: *Self, ofs: Offset) Error!Offset {
+            try ensureUsable(self);
             const saved = saveLen(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
@@ -594,6 +634,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Get a boolean value from an array by index.
         pub fn arrGetBool(self: *const Self, ofs: Offset, index: u32) Error!bool {
+            try ensureUsable(self);
             var out: bool = false;
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_get_bool(self.raw(), @intFromEnum(ofs), index, &out)
@@ -605,6 +646,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Get an i64 value from an array by index.
         pub fn arrGetI64(self: *const Self, ofs: Offset, index: u32) Error!i64 {
+            try ensureUsable(self);
             var out: i64 = 0;
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_get_i64(self.raw(), @intFromEnum(ofs), index, &out)
@@ -616,6 +658,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Get an f64 value from an array by index.
         pub fn arrGetF64(self: *const Self, ofs: Offset, index: u32) Error!f64 {
+            try ensureUsable(self);
             var out: f64 = 0;
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_get_f64(self.raw(), @intFromEnum(ofs), index, &out)
@@ -630,6 +673,7 @@ fn SharedMethods(comptime Self: type) type {
         /// invalidated by any subsequent mutation. For Context, auto-reallocation
         /// can cause use-after-free. Use `arrGetStrCopy` for a safe alternative.
         pub fn arrGetStr(self: *const Self, ofs: Offset, index: u32) Error![]const u8 {
+            try ensureUsable(self);
             var out_ptr: ?[*]const u8 = null;
             var out_len: u32 = 0;
             const ret = if (is_ctx)
@@ -646,6 +690,7 @@ fn SharedMethods(comptime Self: type) type {
         /// invalidated by any subsequent mutation. For Context, auto-reallocation
         /// can cause use-after-free. Use `arrGetBytesCopy` for a safe alternative.
         pub fn arrGetBytes(self: *const Self, ofs: Offset, index: u32) Error![]const u8 {
+            try ensureUsable(self);
             var out_ptr: ?[*]const u8 = null;
             var out_len: u32 = 0;
             const ret = if (is_ctx)
@@ -659,6 +704,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Get a nested object offset from an array by index.
         pub fn arrGetObj(self: *const Self, ofs: Offset, index: u32) Error!Offset {
+            try ensureUsable(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_get_obj(self.raw(), @intFromEnum(ofs), index, &out_ofs)
@@ -670,6 +716,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Get a nested array offset from an array by index.
         pub fn arrGetArr(self: *const Self, ofs: Offset, index: u32) Error!Offset {
+            try ensureUsable(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_arr_get_arr(self.raw(), @intFromEnum(ofs), index, &out_ofs)
@@ -681,6 +728,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Get the type of an array element by index.
         pub fn arrGetType(self: *const Self, ofs: Offset, index: u32) Error!Type {
+            try ensureUsable(self);
             const t = if (is_ctx)
                 c.shim_lite3_ctx_arr_get_type(self.raw(), @intFromEnum(ofs), index)
             else
@@ -695,6 +743,7 @@ fn SharedMethods(comptime Self: type) type {
         /// Get a string value from an array by index, copying into a caller-supplied buffer.
         /// Returns the copied slice. Safe to use even after buffer mutations.
         pub fn arrGetStrCopy(self: *const Self, ofs: Offset, index: u32, dest: []u8) Error![]const u8 {
+            try ensureUsable(self);
             const src = try self.arrGetStr(ofs, index);
             if (src.len > dest.len) return Error.NoBufferSpace;
             @memcpy(dest[0..src.len], src);
@@ -704,6 +753,7 @@ fn SharedMethods(comptime Self: type) type {
         /// Get a bytes value from an array by index, copying into a caller-supplied buffer.
         /// Returns the copied slice. Safe to use even after buffer mutations.
         pub fn arrGetBytesCopy(self: *const Self, ofs: Offset, index: u32, dest: []u8) Error![]const u8 {
+            try ensureUsable(self);
             const src = try self.arrGetBytes(ofs, index);
             if (src.len > dest.len) return Error.NoBufferSpace;
             @memcpy(dest[0..src.len], src);
@@ -714,6 +764,7 @@ fn SharedMethods(comptime Self: type) type {
 
         /// Return the number of entries in an object or elements in an array.
         pub fn count(self: *const Self, ofs: Offset) Error!u32 {
+            try ensureUsable(self);
             var out: u32 = 0;
             const ret = if (is_ctx)
                 c.shim_lite3_ctx_count(self.raw(), @intFromEnum(ofs), &out)
@@ -728,6 +779,7 @@ fn SharedMethods(comptime Self: type) type {
         /// WARNING: The iterator captures the buffer pointer at creation time.
         /// Any mutation (or Context reallocation) invalidates the iterator.
         pub fn iterate(self: *const Self, ofs: Offset) Error!Iterator {
+            try ensureUsable(self);
             const buf_ptr: [*]const u8 = if (is_ctx) c.shim_lite3_ctx_buf(self.raw()) else self.buf;
             const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.raw()) else self.len;
             var iter: c.shim_lite3_iter = undefined;
@@ -745,6 +797,7 @@ fn SharedMethods(comptime Self: type) type {
         /// Encode the buffer contents as a JSON string.
         /// The returned `JsonString` is allocated by the C library and must be freed with `.deinit()`.
         pub fn jsonEncode(self: *const Self, ofs: Offset) Error!JsonString {
+            try ensureUsable(self);
             if (!json_enabled) return Error.InvalidArgument;
             const buf_ptr: [*]const u8 = if (is_ctx) c.shim_lite3_ctx_buf(self.raw()) else self.buf;
             const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.raw()) else self.len;
@@ -758,6 +811,7 @@ fn SharedMethods(comptime Self: type) type {
         /// Encode the buffer contents as a pretty-printed JSON string.
         /// The returned `JsonString` is allocated by the C library and must be freed with `.deinit()`.
         pub fn jsonEncodePretty(self: *const Self, ofs: Offset) Error!JsonString {
+            try ensureUsable(self);
             if (!json_enabled) return Error.InvalidArgument;
             const buf_ptr: [*]const u8 = if (is_ctx) c.shim_lite3_ctx_buf(self.raw()) else self.buf;
             const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.raw()) else self.len;
@@ -771,6 +825,7 @@ fn SharedMethods(comptime Self: type) type {
         /// Get the value at the given key as a tagged union.
         /// WARNING: String and bytes slices point into the buffer; see getStr safety notes.
         pub fn getValue(self: *const Self, ofs: Offset, key: []const u8) Error!Value {
+            try ensureUsable(self);
             const t = try self.getType(ofs, key);
             return switch (t) {
                 .null => .null,
@@ -870,8 +925,20 @@ pub const Buffer = struct {
         };
     }
 
+    /// Construct a buffer view from existing Lite3 bytes copied into `mem`.
+    pub fn fromSerialized(mem: []align(4) u8, used_len: usize) Error!Buffer {
+        if (used_len == 0 or used_len > mem.len) return Error.InvalidArgument;
+        return Buffer{
+            .buf = mem.ptr,
+            .len = used_len,
+            .capacity = mem.len,
+        };
+    }
+
     /// Return the underlying buffer as a slice of the used portion.
     pub fn data(self: *const Buffer) []const u8 {
+        if (self.capacity == 0 and self.len == 0) return &.{};
+        if (self.len > self.capacity) return &.{};
         return self.buf[0..self.len];
     }
 
@@ -912,9 +979,14 @@ extern fn lite3_init_arr(buf: [*]u8, out_buflen: *usize, bufsz: usize) c_int;
 /// by the C library (malloc/free).
 pub const Context = struct {
     ctx: ?*c.lite3_ctx,
+    const dead_storage: [4]u8 align(4) = .{ 0, 0, 0, 0 };
 
     inline fn raw(self: *const Context) *c.lite3_ctx {
-        return self.ctx orelse @panic("Context used after deinit");
+        return self.ctx.?;
+    }
+
+    inline fn ensureAlive(self: *const Context) Error!void {
+        if (self.ctx == null) return Error.InvalidState;
     }
 
     // Import shared methods
@@ -997,11 +1069,13 @@ pub const Context = struct {
 
     /// Return the underlying buffer pointer.
     pub fn bufPtr(self: *const Context) [*]const u8 {
+        if (self.ctx == null) return @constCast(&dead_storage)[0..].ptr;
         return c.shim_lite3_ctx_buf(self.raw());
     }
 
     /// Return the underlying buffer as a slice of the used portion.
     pub fn data(self: *const Context) []const u8 {
+        if (self.ctx == null) return &.{};
         const buf = c.shim_lite3_ctx_buf(self.raw());
         const buflen = c.shim_lite3_ctx_buflen(self.raw());
         return buf[0..buflen];
@@ -1009,12 +1083,14 @@ pub const Context = struct {
 
     /// Reset the context root value to an object.
     pub fn resetObj(self: *Context) Error!void {
+        try self.ensureAlive();
         const ret = c.shim_lite3_ctx_init_obj(self.raw());
         if (ret < 0) return translateError(ret);
     }
 
     /// Reset the context root value to an array.
     pub fn resetArr(self: *Context) Error!void {
+        try self.ensureAlive();
         const ret = c.shim_lite3_ctx_init_arr(self.raw());
         if (ret < 0) return translateError(ret);
     }
@@ -1022,12 +1098,14 @@ pub const Context = struct {
     /// Decode a JSON string into this context.
     pub fn jsonDecode(self: *Context, json: []const u8) Error!void {
         if (!json_enabled) return Error.InvalidArgument;
+        try self.ensureAlive();
         const ret = c.shim_lite3_ctx_json_dec(self.raw(), json.ptr, json.len);
         if (ret < 0) return translateError(ret);
     }
 
     /// Import data from an existing buffer into this context.
     pub fn importFromBuf(self: *Context, buf: []const u8) Error!void {
+        try self.ensureAlive();
         const ret = c.shim_lite3_ctx_import_from_buf(self.raw(), buf.ptr, buf.len);
         if (ret < 0) return translateError(ret);
     }
@@ -1054,17 +1132,19 @@ pub const ManagedContext = struct {
     const dead_storage: [4]u8 align(4) = .{ 0, 0, 0, 0 };
 
     inline fn innerBuf(self: *ManagedContext) *Buffer {
-        if (self.storage == null) @panic("ManagedContext used after deinit");
         return &self.inner;
     }
 
     inline fn innerBufConst(self: *const ManagedContext) *const Buffer {
-        if (self.storage == null) @panic("ManagedContext used after deinit");
         return &self.inner;
     }
 
     inline fn storageSlice(self: *ManagedContext) []align(4) u8 {
-        return self.storage orelse @panic("ManagedContext used after deinit");
+        return self.storage orelse @constCast(dead_storage[0..]);
+    }
+
+    inline fn ensureAlive(self: *const ManagedContext) Error!void {
+        if (self.storage == null) return Error.InvalidState;
     }
 
     fn clampCapacity(requested_capacity: usize) Error!usize {
@@ -1081,6 +1161,7 @@ pub const ManagedContext = struct {
     }
 
     fn grow(self: *ManagedContext) Error!void {
+        try self.ensureAlive();
         const old_mem = self.storageSlice();
         const new_cap = try nextCapacity(old_mem.len);
         const new_mem = self.allocator.realloc(old_mem, new_cap) catch return Error.OutOfMemory;
@@ -1090,6 +1171,7 @@ pub const ManagedContext = struct {
     }
 
     fn ensureCapacity(self: *ManagedContext, required: usize) Error!void {
+        try self.ensureAlive();
         if (required > max_capacity) return Error.InvalidArgument;
         while (self.storageSlice().len < required) {
             try self.grow();
@@ -1097,6 +1179,7 @@ pub const ManagedContext = struct {
     }
 
     fn callWithGrowth(self: *ManagedContext, comptime func: anytype, args: anytype) @TypeOf(@call(.auto, func, args)) {
+        try self.ensureAlive();
         while (true) {
             return @call(.auto, func, args) catch |err| switch (err) {
                 Error.NoBufferSpace => {
@@ -1150,21 +1233,25 @@ pub const ManagedContext = struct {
 
     /// Return the current used bytes.
     pub fn data(self: *const ManagedContext) []const u8 {
+        if (self.storage == null) return &.{};
         return self.innerBufConst().data();
     }
 
     /// Return the current backing capacity in bytes.
     pub fn capacity(self: *const ManagedContext) usize {
+        if (self.storage == null) return 0;
         return self.innerBufConst().capacity;
     }
 
     /// Reset the root value to an object.
     pub fn resetObj(self: *ManagedContext) Error!void {
+        try self.ensureAlive();
         self.inner = try Buffer.initObj(self.storageSlice());
     }
 
     /// Reset the root value to an array.
     pub fn resetArr(self: *ManagedContext) Error!void {
+        try self.ensureAlive();
         self.inner = try Buffer.initArr(self.storageSlice());
     }
 
@@ -1182,6 +1269,7 @@ pub const ManagedContext = struct {
     /// Decode JSON into the managed buffer, growing as needed.
     pub fn jsonDecode(self: *ManagedContext, json: []const u8) Error!void {
         if (!json_enabled) return Error.InvalidArgument;
+        try self.ensureAlive();
         while (true) {
             const mem = self.storageSlice();
             self.inner = Buffer.jsonDecode(mem, json) catch |err| switch (err) {
@@ -1392,17 +1480,19 @@ pub const ExternalContext = struct {
     const dead_storage: [4]u8 align(4) = .{ 0, 0, 0, 0 };
 
     inline fn innerBuf(self: *ExternalContext) *Buffer {
-        if (self.storage == null) @panic("ExternalContext used after deinit");
         return &self.inner;
     }
 
     inline fn innerBufConst(self: *const ExternalContext) *const Buffer {
-        if (self.storage == null) @panic("ExternalContext used after deinit");
         return &self.inner;
     }
 
     inline fn storageSlice(self: *ExternalContext) []align(4) u8 {
-        return self.storage orelse @panic("ExternalContext used after deinit");
+        return self.storage orelse @constCast(dead_storage[0..]);
+    }
+
+    inline fn ensureAlive(self: *const ExternalContext) Error!void {
+        if (self.storage == null) return Error.InvalidState;
     }
 
     fn clampCapacity(requested_capacity: usize) Error!usize {
@@ -1419,6 +1509,7 @@ pub const ExternalContext = struct {
     }
 
     fn grow(self: *ExternalContext, allocator: std.mem.Allocator) Error!void {
+        try self.ensureAlive();
         const old_mem = self.storageSlice();
         const new_cap = try nextCapacity(old_mem.len);
         const new_mem = allocator.realloc(old_mem, new_cap) catch return Error.OutOfMemory;
@@ -1428,6 +1519,7 @@ pub const ExternalContext = struct {
     }
 
     fn ensureCapacity(self: *ExternalContext, allocator: std.mem.Allocator, required: usize) Error!void {
+        try self.ensureAlive();
         if (required > max_capacity) return Error.InvalidArgument;
         while (self.storageSlice().len < required) {
             try self.grow(allocator);
@@ -1440,6 +1532,7 @@ pub const ExternalContext = struct {
         comptime func: anytype,
         args: anytype,
     ) @TypeOf(@call(.auto, func, args)) {
+        try self.ensureAlive();
         while (true) {
             return @call(.auto, func, args) catch |err| switch (err) {
                 Error.NoBufferSpace => {
@@ -1494,21 +1587,25 @@ pub const ExternalContext = struct {
 
     /// Return the current used bytes.
     pub fn data(self: *const ExternalContext) []const u8 {
+        if (self.storage == null) return &.{};
         return self.innerBufConst().data();
     }
 
     /// Return the current backing capacity in bytes.
     pub fn capacity(self: *const ExternalContext) usize {
+        if (self.storage == null) return 0;
         return self.innerBufConst().capacity;
     }
 
     /// Reset the root value to an object.
     pub fn resetObj(self: *ExternalContext) Error!void {
+        try self.ensureAlive();
         self.inner = try Buffer.initObj(self.storageSlice());
     }
 
     /// Reset the root value to an array.
     pub fn resetArr(self: *ExternalContext) Error!void {
+        try self.ensureAlive();
         self.inner = try Buffer.initArr(self.storageSlice());
     }
 
@@ -1526,6 +1623,7 @@ pub const ExternalContext = struct {
     /// Decode JSON into the external buffer, growing as needed.
     pub fn jsonDecode(self: *ExternalContext, allocator: std.mem.Allocator, json: []const u8) Error!void {
         if (!json_enabled) return Error.InvalidArgument;
+        try self.ensureAlive();
         while (true) {
             const mem = self.storageSlice();
             self.inner = Buffer.jsonDecode(mem, json) catch |err| switch (err) {
