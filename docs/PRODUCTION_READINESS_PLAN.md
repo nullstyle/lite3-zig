@@ -1,6 +1,6 @@
 # lite3-zig — Production-Readiness Review & Plan
 
-Review date: 2026-10-01 · Reviewed commit: `b7cb2b9` · Toolchain: Zig 0.15.2 (also probed 0.16.0)
+Review date: 2026-10-01 · Reviewed commit: `b7cb2b9` · Toolchain reviewed: Zig 0.15.2 (also probed 0.16.0) · Target toolchain: Zig master via mise
 
 ## 1. Verdict
 
@@ -131,138 +131,199 @@ Reviewer IDs in brackets; full register in §8.
 
 ## 5. Plan
 
-The guiding rule is red→green: each fix lands together with the failing test that proves the bug. The review already wrote those tests for every critical and high item; they are in [`REVIEW_REPRO_TESTS.md`](REVIEW_REPRO_TESTS.md). Phases 1–3 are non-breaking and can ship as `0.1.x`. Phase 4 is the deliberate `0.2.0` API break.
+The maintainer's decisions (§7) shape the plan:
 
-### Phase 0 — Safety net (do first; makes everything else verifiable) · ~1–2 days
+- **No users yet.** The plan does not fix the four current document types and then replace them. It fixes the C layer once, builds the new design directly on top of it, and ships a single `v0.1.0` release with no deprecation shims.
+- **Zig master, installed with mise.** The project tracks `master`, so `std.Io`-era APIs are the baseline. CI has to absorb upstream churn.
+- **Untrusted buffers are supported.** Validation is the default path, not an opt-in.
 
-1. **`-Dc-optimize` option.** It defaults to the user's `optimize`. Define `LITE3_DISABLE_PREFETCHING` for Debug and ReleaseSafe, and keep ReleaseFast with prefetching as opt-in. Fix the `build.zig` comment. [BLD-1, CSH-6]
-2. **Local vendor patch for the prefetch `kv_ofs[7]` index**, so a UBSan build runs clean. [PRF-11]
-3. **`check` step:** compile tests, examples and bench without running them. Set `skip_foreign_checks` so `-Dtarget=` works as a compile check. [BLD-3, OPS-3]
-4. **Backend-generic test harness:** `inline for` over Buffer (large), Context, Managed, External (through an adapter). [TST-5]
-5. **Deterministic model-based property test** in the normal `test` step:
-   - Apply random operations to each backend and to a `StringHashMap`/`ArrayList` model, then compare.
-   - Seed it from `std.testing.random_seed` and print the seed on failure.
-   - Read the iteration count from a build option.
+The guiding rule is red→green: each fix lands together with the failing test that proves the bug. The review already wrote those tests for every critical and high item; they are in [`REVIEW_REPRO_TESTS.md`](REVIEW_REPRO_TESTS.md). Tests written against the old types get ported to the new API in Phase 3. Their scenarios (growth across node splits, self-aliasing values, a failed decode, iteration after a mutation) carry over unchanged.
 
-   [TST-4]
-6. **`checkAllAllocationFailures` tests** for Managed and External, plus `std.testing.allocator` leak checks everywhere. [TST-8, ALC-9]
+### Phase 0 — Toolchain on Zig master · ~0.5–1 day
 
-Expected outcome: the new tests go red on C1–C4, H2 and H5. That is the point of this phase.
+1. **Pin the toolchain.** Set `.mise.toml` to `zig = "master"`. Record the known-good dev version (`zig version`) as `minimum_zig_version` in `build.zig.zon`, and bump it deliberately.
+2. **Port the examples and bench** to master's `std.Io` / `std.process.Init` main signature. Under 0.16.0 this was about 4 lines per example and about 12 in bench; master may need more. The library and tests built unchanged on 0.16.0, so re-check them on master.
+3. **Handle master churn in CI.**
+   - Add a scheduled nightly job that runs `mise install` (latest master) and the full suite, so breakage from upstream is noticed within a day rather than mid-PR.
+   - PR jobs use the same `mise` resolution. If master breaks and blocks a PR, the escape hatch is a temporary pin of an exact dev version in `.mise.toml`; record it in the CHANGELOG.
+4. **Remove the 0.15-specific code paths and doc references.** Update the README's supported version to "Zig master (tested with `<version>`)".
 
-### Phase 1 — Correctness hotfixes (P0) · ~2–3 days
+> **Environment note.** This review container cannot download Zig master: its network policy denies `ziglang.org`. The latest release available here, through PyPI, is 0.16.0. Implementation sessions need `ziglang.org` on the allowed-domains list, or a broader network access level, for `mise install` to work.
 
-| Step | Change | Files | Closes |
-|---|---|---|---|
-| 1.1 | Delete `saveLen`/`restoreLen` and let lite3 own `len`; the upstream contract allows `len` to grow on `ENOBUFS`. Rewrite the test at `tests.zig:1377` to assert that committed keys stay readable. | `lite3.zig`, `tests.zig` | C1 |
-| 1.2 | Fix the iterator key length. Add a local patch to `lite3.c:403` (`len = (tag >> KEY_SIZE_SHIFT) - 1`, plus a NUL check) and a defensive bounded `strnlen` in the shim. Report it upstream. Add byte-exact key tests (1-byte, 63- and 64-byte tag boundary, key at the end of the buffer). | `vendor/…/lite3.c`, `lite3_shim.c` | C2, SEC-3, CSH-11 |
-| 1.3 | Initialise `lite3_str key = {0}` in the shim. Decide object versus array once, at `iterate()` time. | `lite3_shim.c` | H2 |
-| 1.4 | Add a `checkedSlice` helper in SharedMethods. Every slice-returning getter and the iterator key go through it: bounds plus NUL check, returning `CorruptData`. Also patch lite3 locally to reject a stored string size of 0. | `lite3.zig`, vendor | C3 |
-| 1.5 | Overlap detection in `setStr`/`setBytes`/`arrAppendStr`/`arrAppendBytes`: copy the value aside before any growth. Do it in the Managed/External forwarders, before `callWithGrowth`. Also handle `importFromBuf(self.data())` with a memmove or no-op. | `lite3.zig` | C4, TST-7, ALC-10 |
-| 1.6 | `Context.importFromBuf`: create a new context from the buffer, then swap it in, so failure is OOM-safe. Add a malloc-before-free vendor patch and report it upstream. | `lite3.zig`/shim | H4 |
-| 1.7 | `jsonDecode` strong guarantee. Managed/External decode into a fresh allocation and swap it in on success. Context decodes into a new ctx and swaps. Buffer documents that `mem` is clobbered on failure. A scalar root becomes an error. | `lite3.zig`, shim | H5 |
-| 1.8 | **Re-vendor upstream `48ab0e9`**, applying the patches from 1.2, 1.4, 1.6 and Phase 0 step 2 plus the prefetch guard. Each patch lives under `vendor/patches/*.patch`. Record the source in `vendor/lite3/UPSTREAM` (URL, SHA, date, yyjson version). Replace the `update-vendor` placeholder with a script. Trim `img/`, `examples/` and `tests/` from the tree; they are about 1.2 MB, and `tests/` moves to a build step (Phase 3). | `vendor/`, `Justfile` | H1 |
-| 1.9 | Wrapper-side checks on container `Offset` arguments: reject anything misaligned or `> maxInt(u32)` with `InvalidArgument`. Assert that the offsets `setObj`/`setArr` return are 4-aligned. | `lite3.zig` | CSH-12, CRT-8 |
+### Phase 1 — C layer: re-vendor, patches, safety net · ~2–3 days
+
+All of this is independent of the Zig API, so it lands first.
+
+1. **Re-vendor upstream `48ab0e9`.**
+   - Put local changes in `vendor/patches/*.patch`: the prefetch guard, plus the fixes below.
+   - Record provenance in `vendor/lite3/UPSTREAM` (URL, SHA, date, yyjson version).
+   - Replace the `update-vendor` placeholder with a script.
+   - Trim `img/`, `examples/` and `Makefile` from the vendored tree.
+   - Keep `tests/` for step 6.
+
+   [H1]
+2. **Local C patches**, each with a test and an upstream report (§6):
+   - Iterator key length: `(tag >> KEY_SIZE_SHIFT) - 1`, plus a NUL check. [C2]
+   - Reject a stored string size of 0. [C3]
+   - `json_enc`: use `yyjson_mut_strn` with the decoded length. [SEC-3]
+   - `json_dec`: reject NUL in keys, and reject a scalar root. [SEC-8, SEC-11]
+   - Malloc before free in `lite3_ctx_import_from_buf`. This only matters if any `ctx_api` is kept; see Phase 3.1. [H4]
+   - Clamp the `kv_ofs[7]` prefetch index. [PRF-11]
+   - Guard the nibble_base64 `int` overflow. [CSH-10]
+   - Send error messages to stderr, not stdout. [CSH-20]
+3. **Shim rework.**
+   - Each shim function returns a stable `LITE3ZIG_E_*` status code, translated from `errno` inside C right after the call. Zig never reads `errno`.
+   - Initialise the iterator's `lite3_str`.
+   - `getType`/`exists` propagate real errors.
+   - JSON functions pass yyjson error codes and positions through, calling `yyjson_read_opts` and then `_lite3_json_dec_doc`.
+
+   [H2, H6, API-7, CRT-5]
+4. **Symbol hygiene.** Use a unity C translation unit with `#define yyjson_api static`, so only `shim_*` and `lite3_*` are exported. [CRT-3]
+5. **Build modes.**
+   - `-Dc-optimize` defaults to the user's `optimize`, with prefetching disabled outside ReleaseFast, so Debug runs under UBSan.
+   - Add a `-Werror` lint step for the project's own C.
+   - Make LTO opt-in (`-Dlto` sets `want_lto`).
+   - Make big-endian rejection a single clear `@compileError`.
+
+   [BLD-1, CSH-6, CSH-16, PRF-3, BLD-6]
+6. **`zig build test-upstream`** compiles and runs `vendor/lite3/tests/*.c` normally and under UBSan. [TST-9]
+
+Exit criteria: the C-level reproduction tests (iterator key, size-0 string, unterminated key, NUL key in JSON, misaligned overwrite, `{"":null}`) pass under UBSan and valgrind.
+
+### Phase 2 — Untrusted-input core · ~3–4 days
+
+Untrusted buffers are a supported use case. The wrapper's contract becomes: **no API reachable from safe-looking code reads or writes outside the document, loops without bound, or crashes, whatever bytes it is given.**
+
+1. **`validate(bytes) error{CorruptData}!void`** is written in Zig, so it can be fuzzed and has no recursion. It walks the whole document once with an explicit stack (tree height ≤ 9 per container, nesting ≤ 32) and keeps a visited bitset of `len/4` bits. It rejects:
+   - shared or cyclic node or kv offsets
+   - misaligned or out-of-range offsets
+   - `key_count > 7` and unsorted hashes
+   - a `size` field that doesn't match the walked count
+   - key tags that don't decode, and keys with no NUL terminator
+   - zero-size strings
+   - unknown type tags and non-0/1 booleans
+
+   [SEC-4, SEC-16, CSH-21]
+2. **Constructors that take foreign bytes validate by default.** That covers `View.fromBytes`, `Buffer.fromBytes`, `Document.initFromBytes` and `importBytes`. A clearly named `fromBytesUnchecked` exists for data the program itself produced, with documentation stating it gives up the guarantee.
+3. **Defence in depth that is always on:**
+   - Every slice-returning read goes through `checkedSlice`: bounds plus NUL check, returning `CorruptData`. [C3]
+   - Container `Offset` arguments are range- and alignment-checked. [CSH-12, CRT-8]
+   - The iterator caps its yield count at the validated entry count.
+4. **Resource limits.**
+   - `max_capacity` on growable documents. [ALC-5]
+   - A JSON input size and expansion cap. [ALC-5]
+   - A distinct error for hash-probe exhaustion: an attacker can still block the insertion of colliding keys, and that limitation is documented. [SEC-12, CSH-17]
+5. **Fuzzing.**
+   - `std.testing.fuzz` targets for `validate` + read APIs over mutated documents, for JSON decode, and for random operation sequences.
+   - A seed corpus is checked in.
+   - A short `--fuzz` run goes in nightly CI. The deterministic PRNG model test (Phase 3.6) runs on every PR.
+
+   [TST-4, CSH-23]
+6. **`SECURITY.md`.** Write the threat model:
+   - what is guaranteed for untrusted lite3 bytes and for untrusted JSON
+   - known limitations: the hash collision limit, bytes that come back as strings after a JSON round-trip, and nesting depth 32
+   - how to report a vulnerability
+
+   [SEC-16]
 
 Exit criteria:
 
-- Every reproduction test from the review passes.
-- The full suite passes with `-Dc-optimize=Debug` (UBSan) and under valgrind.
-- Mutation re-run: 18 or more of the 21 mutants are killed.
+- The SEC-2/3/4 reproduction tests pass.
+- A one-hour local `--fuzz` run on each target finds nothing.
+- Valgrind and UBSan are clean on the fuzz corpus.
 
-### Phase 2 — Error model & safety contract (non-breaking where possible) · ~3–4 days
+### Phase 3 — New API (single release) · ~1–2 weeks
 
-1. **Shim returns stable status codes.** The shim translates `errno` inside C, right after each call, into a small `LITE3ZIG_E_*` enum. Zig then does a pure integer switch: no thread-local errno, and the same behaviour on every target. This unblocks Windows. [API-7, CSH-19, MEM-16, BLD-7]
-2. **Getters propagate errors.** `getType`, `arrGetType` and `exists` return errors; only a truly absent key gives `NotFound`/`false`. `EFAULT` on read paths becomes `CorruptData`. JSON-encode failures get specific errors (`NoSpaceLeft`, `NonFiniteNumber`, `InvalidUtf8`). Note the behaviour change in the CHANGELOG. [H6]
-3. **Iterator safety.** The iterator re-reads its owner's buffer on each `next()` and checks a wrapper-side mutation epoch, returning `error.StaleIterator`. Either make `StaleReference` real or deprecate it. Add a lifetime doc comment ("valid until the next mutating call") to every borrowing method. [H3]
-4. **Untrusted input:**
-   - `pub fn validate()` walks the document once with an explicit stack and a visited bitset. It rejects shared or cyclic offsets, misalignment, `key_count > 7`, a size-field mismatch, unterminated keys and zero-size strings.
-   - Add `fromSerializedValidated` (or an options flag).
-   - The JSON decode path rejects NUL in keys; this is a vendor patch.
-   - Write a SECURITY.md threat model.
+There are no users, so this replaces the four current types outright: no aliases, no deprecations.
 
-   [H7, SEC-12, CSH-17]
-5. **Keys.** Raise or remove the 255-byte key limit: keep a stack fast path and fall back to `std.heap.c_allocator`. Add a zero-copy `[:0]const u8` key path and expose `max_key_len`. [API-8, MEM-11]
-6. **Growth policy:**
-   - Add `max_capacity` through `initWithOptions`.
-   - Pre-reserve from the known value size.
-   - `jsonDecode` pre-sizes from `json.len` and retries with free+alloc rather than realloc.
-   - Add `reserve()`, `shrinkToFit()` and `capacity()` on all types.
+1. **Types:**
+   - **`View`:** read-only, over `[]align(4) const u8`. It implements every read, iteration, JSON output and `format()` once.
+   - **`Buffer`:** fixed capacity, caller-owned memory.
+   - **`Document`:** unmanaged and growable. `gpa` is passed per call, on the `ArrayList` model. In safe builds it checks that the allocator matches. [MEM-17]
+   - **`ManagedDocument`:** a thin wrapper that stores `gpa`.
+   - **No C-heap `Context`:** it is dropped. `Document` covers its use cases with an explicit allocator, and dropping it removes `ctx_api.c` along with H4's upstream path.
 
-   [ALC-5, PRF-4/5/9, ALC-12..14]
-7. **Space reclamation.** Add `compact()`/`clone()` by re-emitting the document through the fixed iterator, and document the append-only overwrite cost. [H8]
-8. **JSON:**
-   - `jsonEncodeBuf` returns `NoSpaceLeft` and runs `ensureUsable`.
-   - Add a `jsonDecode` diagnostic with byte position by calling `yyjson_read_opts` from the shim and then `_lite3_json_dec_doc`.
-   - Write a JSON mapping table to the README: bytes become base64 one-way, u64 above `maxInt(i64)` becomes f64, NaN/Inf are rejected, nesting depth is limited to 32.
+   This removes about 700 lines of forwarders and the drift that comes with them. [API-9/10, ALC-7/8]
+2. **Mutation semantics are designed in rather than patched:**
+   - No `restoreLen`: lite3 owns `len`, and a failed write may leave grown but valid split nodes. [C1]
+   - Values that alias the document are copied aside before any write or growth. [C4]
+   - Growth pre-reserves from the known value size. [PRF-5]
+   - Growth retries are correct across node splits. [C1]
+   - `decodeJson` decodes into a fresh allocation and swaps it in on success, giving the strong guarantee. [H5]
+   - `importBytes` validates, then copies with overlap handling. [TST-7]
+   - `compact()` and `clone()` rebuild the document to reclaim space left by overwrites. [H8]
+3. **Lifetimes:**
+   - Iterators hold a pointer to their document and check a mutation epoch, returning `error.StaleIterator`.
+   - Every borrowing method documents "valid until the next mutating call".
+   - `StaleReference` is removed.
+   - By-value copies of documents are caught in safe builds by a self-pointer check, or the type is made non-copyable through a pinned-handle pattern.
 
-   [CSH-14, CRT-2, CRT-5, PRF-8]
+   [H3, MEM-12]
+4. **Errors:**
+   - Per-operation error sets: `ReadError`, `WriteError`, `DecodeError`, `EncodeError`.
+   - `CorruptData` is distinct from `NotFound`, and there is a `TypeMismatch` error.
+   - No catch-all `InvalidArgument`.
 
-### Phase 3 — Build, CI, portability, packaging · ~2 days (can run in parallel with Phase 2)
+   [H6, API-2]
+5. **Ergonomics and performance:**
+   - Typed `ObjectIterator` yields `{ key, value }`; `ArrayIterator` yields `{ index, value }`. [API-11]
+   - `arrSet(index, value)` and `rootType()`. [API-13]
+   - Generic `set(at, key, value: anytype)` / `get(T, at, key)`, plus optional comptime struct (de)serialization. [API-14]
+   - Comptime keys: `lite3.key("name")` precomputes the hash, and a shim entry point accepts key data, so the hot path skips `toKeyZ`. The 255-byte key limit goes. [PRF-1/2, API-8]
+   - A pure-Zig `writeJson(*std.Io.Writer)` and `jsonAlloc(gpa)` that work with `json=false`. Decoding goes through a `yyjson_alc` bridge to the Zig allocator. [API-12, ALC-4]
+6. **Tests for the new API:**
+   - Port every reproduction test.
+   - Backend-generic tests over `Buffer`, `Document` and `ManagedDocument`.
+   - A deterministic model-based property test that prints its seed.
+   - `checkAllAllocationFailures` on every growable operation.
+   - Golden-byte fixtures that lock the wire format.
+   - Exact-value assertions, including f64 compared bit for bit.
 
-1. **CI matrix:**
-   - Linux and macOS × Debug, ReleaseSafe and ReleaseFast × json on/off (existing).
-   - `x86-linux-musl` and `x86_64-linux-musl` test runs (native).
+   [TST-3..13, CRT-7]
+
+   Re-run the mutation test and aim for at least 90% of mutants killed.
+
+Exit criteria:
+
+- All reproduction tests ported and green.
+- Mutation kill rate ≥ 90%.
+- `checkAllAllocationFailures` is clean.
+- Benchmark overhead against raw lite3 is ≤ 15% on comptime-key paths.
+
+### Phase 4 — CI, packaging, docs, release · ~2 days (CI parts can start alongside Phase 1)
+
+1. **CI matrix:** every job installs Zig master through mise.
+   - Linux and macOS × Debug, ReleaseSafe and ReleaseFast × json on/off.
+   - Native `x86-linux-musl` and `x86_64-linux-musl` test runs, after fixing the test that assumes a 64-bit `usize`. [BLD-4, TST-10]
    - A sanitized-C Debug job.
    - A valgrind job (`-Dcpu=x86_64_v3`).
    - A cross `check` job for arm, aarch64, riscv64, aarch64-macos and wasm32-wasi.
    - A consumer-package job (`git archive` → `zig fetch` → build with `.json = false`).
-   - A non-blocking Zig 0.16 canary.
+   - The nightly master and fuzz jobs from Phases 0 and 2.
 
-   [OPS-1..3, BLD-3/4]
-2. **Fix the 32-bit test** (it assumes a 64-bit `usize`). Pre-validate `initWithSize > maxInt(u32)` in Zig. [BLD-4, TST-10]
-3. **`zig build test-upstream`** compiles and runs `vendor/lite3/tests/*.c` with the same flags and macros, including a UBSan variant. [TST-9]
-4. **Make LTO opt-in.** `-Dlto` sets `want_lto` and forces LLVM in Debug; document the consumer requirement. Flip the CI assertion so LTO must pass. [PRF-3, BLD-8]
-5. **Symbol hygiene.** Use a unity C translation unit with `#define yyjson_api static`, so that only `shim_*` and `lite3_*` are exported. [CRT-3]
-6. **Build cleanup:**
-   - Surface C warnings with a `-Werror` lint step for the project's own C.
-   - Drop redundant include and link calls.
-   - Add `fmt`, `docs` and `run-examples` steps.
-   - Make big-endian rejection a single clear `@compileError`.
-
-   [CSH-16, BLD-6/9/10/12]
-7. **Workflow hygiene:**
+   [OPS-1..3, BLD-3]
+2. **Workflow hygiene:**
    - Add `permissions: contents: read`, `concurrency` and `timeout-minutes`.
    - Pin actions by SHA and add Dependabot for actions.
-   - Delete `ci-local.yml`, or fix `just act-local` with `-e workflow_dispatch`.
+   - Delete `ci-local.yml`.
    - Cache `~/.cache/zig`.
    - Make the fmt check cover the whole tree.
+   - Add `fmt`, `docs`, `check` and `run-examples` build steps.
 
-   [OPS-4/5/14]
+   [OPS-4/5/14, BLD-9/12]
+3. **Docs:**
+   - Rewrite the README for the new API.
+   - Fix the dependency section (`zig fetch --save git+…#v0.1.0`, `b.dependency("lite3_zig", .{ .json = … })`).
+   - Add a supported-platforms table, a JSON mapping table and the wire-format contract.
+   - Compile-test every snippet in CI.
+   - Add `SECURITY.md` (Phase 2), `CHANGELOG.md` and `CONTRIBUTING.md`.
+   - Add third-party notices and LICENSE files to `.paths`.
+   - Delete `FIX_PLAN.md`.
+   - Examples assert their results.
+   - Remove the "vibe-coded" warning once all of the above is green.
 
-### Phase 4 — API redesign → `0.2.0` (breaking; after Phases 1–2) · ~1–2 weeks
-
-1. **One generic implementation.**
-   - `View` (read-only, over `[]align(4) const u8`) implements every read, iteration, JSON output and `format()` once.
-   - `Buffer` is fixed-capacity.
-   - `Document` is an unmanaged growable type taking `gpa`, with `ManagedDocument` as a thin wrapper, following the `ArrayList` pattern.
-   - Either deprecate the C-heap `Context` or keep it as an alias.
-
-   This removes about 700 lines of forwarders and makes drift impossible by construction. [API-9/10, ALC-8, ALC-7]
-2. **Typed iteration.** `ObjectIterator` yields `{ key, value: Value }` and `ArrayIterator` yields `{ index, value }`. Add `arrGetValue` and `arrSet(index, value)`. [API-11, API-13]
-3. **Per-operation error sets** (`ReadError`, `WriteError`, `JsonDecodeError`), keeping an `Error` superset for one release. [API-2]
-4. **Comptime keys.** `lite3.key("name")` precomputes the DJB2 hash and size, and the keyed methods accept `anytype`. Add a test that the comptime hash matches `lite3_get_key_data` at lengths 0, 1, 63, 64 and 255. Add a middle-step shim entry point that takes the key data and skips `toKeyZ`. Target: close most of the 30–55% overhead. [PRF-1/2]
-5. **Pure-Zig JSON writer** on `std.Io.Writer` (`writeJson`, `jsonAlloc`, `std.json` stringify interop). It works with `json=false` and its allocator is explicit. Bridge yyjson to a `yyjson_alc` that forwards to the Zig allocator for decoding. [API-12, ALC-4]
-6. **Optional comptime struct (de)serialization:** `set(T)` and `get(T)`. [API-14]
-7. **Idiomatic naming:** `Value` tags without trailing underscores, private invariant-bearing fields, and `//!` module docs. [API-16/17, MEM-15]
-
-### Phase 5 — Docs & release · ~1 day (ongoing)
-
-- **README:**
-  - Fix the dependency section: `zig fetch --save git+…#v0.1.1`, `b.dependency("lite3_zig", .{ .json = … })`.
-  - Remove `Buffer.Iterator`.
-  - Add a supported-platforms table and a JSON mapping table.
-  - State the wire-format contract and add golden-byte fixture tests.
-  - Compile-test every README snippet in CI.
-
-  [OPS-7/8/12, CRT-7, BLD-13]
-- **Repository files:**
-  - Add `SECURITY.md` (the threat model from Phase 2), `CHANGELOG.md` and `CONTRIBUTING.md`.
-  - Add third-party notices for yyjson and nibble_base64, and add their LICENSE files to `.paths`.
-  - Retire `FIX_PLAN.md`.
-
-  [OPS-11/13, API-19]
-- **Examples assert their results.** Add an allocator-context example and an iteration example. [OPS-10, TST-14]
-- **Releases:** tag `v0.1.1` after Phase 1, `v0.1.2` after Phases 2–3, and `v0.2.0` after Phase 4. Write a semver policy for 0.x.
+   [OPS-7..13, CRT-2/7, TST-14]
+4. **Release:** tag `v0.1.0` and record the exact Zig master version it was tested with.
 
 ## 6. Upstream contributions
 
@@ -279,12 +340,12 @@ These bugs are still present at upstream HEAD `48ab0e9`. Each one should be carr
 - the upper bound check in `_verify_key` (SEC-7, partially fixed upstream)
 - the `lite3_get` macro precedence bug (CSH-13)
 
-## 7. Decisions needed from the maintainer
+## 7. Decisions (resolved 2026-10-01)
 
-1. **Zig version policy.** Option A: stay on 0.15.2 and run a 0.16 canary. Option B: move to 0.16. Moving costs about 4 lines per example and about 12 in bench; the library itself needs no changes. Recommendation: A for `0.1.x`, B for `0.2.0`.
-2. **Untrusted buffers.** Option A: support them, via `validate()` plus the hardening in Phase 2.4. Option B: document them as "trusted input only". Recommendation: A, because lite3 is a wire format.
-3. **The C-heap `Context` type.** Keep it, or deprecate it in favour of `Document(gpa)`. Recommendation: deprecate it in 0.2.0.
-4. **Breaking-change appetite.** Should Phase 4 ship as one `0.2.0`, or be staged behind deprecations?
+1. **Zig version:** track **Zig master**, installed with mise. Phase 0 covers it.
+2. **Untrusted buffers:** **supported**. Validation is on by default, and Phase 2 covers it.
+3. **Release strategy:** **one release** (`v0.1.0`) with the new design. There are no users yet, so there are no deprecation shims or staged releases.
+4. **The C-heap `Context` type:** **dropped**. This follows from decision 3: `Document` covers its use cases with an explicit allocator. Revisit only if lite3 C-API interop (handing a `lite3_ctx*` to C code) becomes a requirement.
 
 ## 8. Findings register (deduplicated)
 
