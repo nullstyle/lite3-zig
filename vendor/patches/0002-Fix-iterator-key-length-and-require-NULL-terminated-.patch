@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: lite3-zig <noreply@anthropic.com>
 Date: Sat, 3 Oct 2026 07:17:32 +0000
-Subject: [PATCH 2/2] Fix iterator key length and require NULL-terminated key
+Subject: [PATCH 2/8] Fix iterator key length and require NULL-terminated key
  entries
 
 lite3_iter_next() copied the raw key tag into out_key->len and only

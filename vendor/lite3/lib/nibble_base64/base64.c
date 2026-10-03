@@ -78,9 +78,7 @@ char* nibble_base64( const void* binaryData, int len, int *flen )
   // which is NOT counted in flen.
   if( !base64String )
   {
-    puts( "ERROR: base64 could not allocate enough memory." ) ;
-    puts( "I must stop because I could not get enough" ) ;
-    return 0;
+    return 0; // caller reports the allocation failure
   }
   
   // EXTRACTING SEXTETS FROM THE OCTETS.
@@ -258,8 +256,6 @@ unsigned char* nibble_unbase64( const char* ascii, int len, int *flen )
   unsigned char *bin = (unsigned char*)malloc( *flen );
   if( !bin )
   {
-    puts( "ERROR: unbase64 could not allocate enough memory." ) ;
-    puts( "I must stop because I could not get enough" ) ;
     return 0;
   }
   

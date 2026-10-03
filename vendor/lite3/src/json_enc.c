@@ -36,6 +36,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
+#include <limits.h>
 
 #include "yyjson/yyjson.h"
 #include "nibble_base64/base64.h"
@@ -80,10 +81,17 @@ int _lite3_json_enc_switch(const unsigned char *buf, size_t buflen, size_t nesti
                 ;
                 size_t bytes_len;
                 const u8 *bytes = lite3_val_bytes(val, &bytes_len);
+                // nibble_base64() computes 4 * (len + pad) in an int; keep that from overflowing.
+                if (bytes_len > (size_t)(INT_MAX / 4) - 3) {
+                	LITE3_PRINT_ERROR("BYTES VALUE TOO LARGE FOR BASE64 CONVERSION\n");
+                	errno = EMSGSIZE;
+                	return -1;
+                }
                 int b64_len;
                 char *b64 = nibble_base64(bytes, (int)bytes_len, &b64_len);
                 if (!b64) {
                 	LITE3_PRINT_ERROR("FAILED TO CONVERT BYTES TO BASE64\n");
+                	errno = ENOMEM;
                 	// No need to free the `b64` pointer, since the allocation would have failed anyways.
                 	return -1;
                 }

@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lite3-zig <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 07:21:39 +0000
+Subject: [PATCH 8/8] Print error messages to stderr; fix size_t format
+ specifier
+
+With LITE3_ERROR_MESSAGES defined the library printed diagnostics to
+stdout, which corrupts the output of programs that use stdout for data.
+Use stderr. yyjson's error position is a size_t, so print it with %zu
+rather than %lu (wrong on 32-bit and LLP64 targets).
+---
+ include/lite3.h | 4 ++--
+ src/json_dec.c  | 6 +++---
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/include/lite3.h b/include/lite3.h
+index 056e0e0..e56cefe 100644
+--- a/include/lite3.h
++++ b/include/lite3.h
+@@ -192,7 +192,7 @@ Define `LITE3_DISABLE_PREFETCHING` to turn it off without editing this header.
+ #endif // DOXYGEN_ONLY
+ 
+ /**
+-Print library-specific error messages to `stdout`.
++Print library-specific error messages to `stderr`.
+ 
+ Disabled by default.
+ 
+@@ -207,7 +207,7 @@ It is recommended to enable this during development.
+ #ifndef DOXYGEN_IGNORE
+ #ifdef LITE3_ERROR_MESSAGES
+         #include <stdio.h>
+-        #define LITE3_PRINT_ERROR(format, ...) printf(format, ##__VA_ARGS__)
++        #define LITE3_PRINT_ERROR(format, ...) fprintf(stderr, format, ##__VA_ARGS__)
+ #else
+         #define LITE3_PRINT_ERROR(format, ...) /* nothing */
+ #endif
+diff --git a/src/json_dec.c b/src/json_dec.c
+index d8b4b4f..3e26a56 100644
+--- a/src/json_dec.c
++++ b/src/json_dec.c
+@@ -298,7 +298,7 @@ int lite3_json_dec(unsigned char *buf, size_t *restrict out_buflen, size_t bufsz
+         yyjson_read_err err;
+         yyjson_doc *doc = yyjson_read_opts((char *)json_str, json_len, YYJSON_READ_NOFLAG , NULL, &err);
+         if (!doc) {
+-                LITE3_PRINT_ERROR("FAILED TO READ JSON STRING\tyyjson error code: %u\tmsg:%s\tat byte position: %lu\n", err.code, err.msg, err.pos);
++                LITE3_PRINT_ERROR("FAILED TO READ JSON STRING\tyyjson error code: %u\tmsg:%s\tat byte position: %zu\n", err.code, err.msg, err.pos);
+                 errno = EINVAL;
+                 return -1;
+         }
+@@ -310,7 +310,7 @@ int lite3_json_dec_file(unsigned char *buf, size_t *restrict out_buflen, size_t
+         yyjson_read_err err;
+         yyjson_doc *doc = yyjson_read_file(path, YYJSON_READ_NOFLAG , NULL, &err);
+         if (!doc) {
+-                LITE3_PRINT_ERROR("FAILED TO READ JSON FILE\tyyjson error code: %u\tmsg:%s\tat byte position: %lu\n", err.code, err.msg, err.pos);
++                LITE3_PRINT_ERROR("FAILED TO READ JSON FILE\tyyjson error code: %u\tmsg:%s\tat byte position: %zu\n", err.code, err.msg, err.pos);
+                 errno = EINVAL;
+                 return -1;
+         }
+@@ -322,7 +322,7 @@ int lite3_json_dec_fp(unsigned char *buf, size_t *restrict out_buflen, size_t bu
+         yyjson_read_err err;
+         yyjson_doc *doc = yyjson_read_fp(fp, YYJSON_READ_NOFLAG , NULL, &err);
+         if (!doc) {
+-                LITE3_PRINT_ERROR("FAILED TO READ JSON FILE POINTER\tyyjson error code: %u\tmsg:%s\tat byte position: %lu\n", err.code, err.msg, err.pos);
++                LITE3_PRINT_ERROR("FAILED TO READ JSON FILE POINTER\tyyjson error code: %u\tmsg:%s\tat byte position: %zu\n", err.code, err.msg, err.pos);
+                 errno = EINVAL;
+                 return -1;
+         }

@@ -224,6 +224,18 @@ static inline int _verify_val(
 			errno = EFAULT;
 			return -1;
 		}
+		// Strings store their size including the NULL-terminator; readers subtract 1 and rely on the
+		// terminator, so a size of 0 (which would underflow) or a missing terminator is corrupt.
+		if (type == LITE3_TYPE_STRING && LITE3_UNLIKELY(byte_count == 0 || buf[*inout_ofs + _val_entry_size - 1] != 0)) {
+			LITE3_PRINT_ERROR("STRING VALUE NOT NULL-TERMINATED\n");
+			errno = EBADMSG;
+			return -1;
+		}
+	}
+	if (type == LITE3_TYPE_BOOL && LITE3_UNLIKELY(buf[*inout_ofs + LITE3_VAL_SIZE] > 1)) {	// loaded as C _Bool
+		LITE3_PRINT_ERROR("BOOL VALUE NOT 0 OR 1\n");
+		errno = EBADMSG;
+		return -1;
 	}
 	*inout_ofs += _val_entry_size;
 	return 0;
@@ -468,12 +480,12 @@ int lite3_iter_next(const unsigned char *buf, size_t buflen, lite3_iter *iter, l
 		#endif
 	}
 	#ifdef LITE3_PREFETCHING
-	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 0) & LITE3_NODE_KEY_COUNT_MASK],      0, 0); // prefetch next items
-	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 0) & LITE3_NODE_KEY_COUNT_MASK] + 64, 0, 0);
-	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 1) & LITE3_NODE_KEY_COUNT_MASK],      0, 0);
-	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 1) & LITE3_NODE_KEY_COUNT_MASK] + 64, 0, 0);
-	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 2) & LITE3_NODE_KEY_COUNT_MASK],      0, 0);
-	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 2) & LITE3_NODE_KEY_COUNT_MASK] + 64, 0, 0);
+	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 0) % (u32)LITE3_NODE_KEY_COUNT_MAX],      0, 0); // prefetch next items
+	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 0) % (u32)LITE3_NODE_KEY_COUNT_MAX] + 64, 0, 0);
+	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 1) % (u32)LITE3_NODE_KEY_COUNT_MAX],      0, 0);
+	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 1) % (u32)LITE3_NODE_KEY_COUNT_MAX] + 64, 0, 0);
+	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 2) % (u32)LITE3_NODE_KEY_COUNT_MAX],      0, 0);
+	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 2) % (u32)LITE3_NODE_KEY_COUNT_MAX] + 64, 0, 0);
 	#endif
 	return LITE3_ITER_ITEM;
 }

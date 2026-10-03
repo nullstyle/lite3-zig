@@ -6,3 +6,9 @@ yyjson: 0.12.0
 patches:
   - 0001-Allow-disabling-prefetching-with-LITE3_DISABLE_PREFE.patch
   - 0002-Fix-iterator-key-length-and-require-NULL-terminated-.patch
+  - 0003-Reject-zero-size-strings-and-non-0-1-booleans-in-_ve.patch
+  - 0004-json_dec-reject-NULL-characters-in-keys-and-fail-on-.patch
+  - 0005-ctx_api-allocate-before-freeing-in-lite3_ctx_import_.patch
+  - 0006-Keep-iterator-prefetch-indexes-inside-kv_ofs.patch
+  - 0007-Guard-base64-conversion-against-int-overflow-drop-pu.patch
+  - 0008-Print-error-messages-to-stderr-fix-size_t-format-spe.patch

@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lite3-zig <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 07:20:43 +0000
+Subject: [PATCH 5/8] ctx_api: allocate before freeing in
+ lite3_ctx_import_from_buf()
+
+The old buffer was freed before malloc(); on allocation failure the
+context kept dangling pointers, so later reads used freed memory and
+lite3_ctx_destroy() double-freed. Importing a slice of the context's own
+buffer also read freed memory when growth was needed, and used an
+overlapping memcpy() otherwise.
+
+Allocate and copy first, free the old buffer only on success, set
+errno = ENOMEM explicitly, and use memmove() for the in-place path.
+---
+ src/ctx_api.c | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/src/ctx_api.c b/src/ctx_api.c
+index b424ed4..1a25c18 100644
+--- a/src/ctx_api.c
++++ b/src/ctx_api.c
+@@ -212,17 +212,24 @@ int lite3_ctx_import_from_buf(lite3_ctx *ctx, const unsigned char *buf, size_t b
+                         errno = EOVERFLOW;
+                         return -1;
+                 }
+-                free(ctx->underlying_buf);
++                // Allocate and copy before freeing: on failure the context stays intact, and
++                // `buf` may point into the old buffer.
+                 void *new = malloc(new_size);
+-                if (!new)
++                if (!new) {
++                        errno = ENOMEM;
+                         return -1;
+-                ctx->underlying_buf = new;
++                }
+                 u8 *new_buf = (u8 *)(((uintptr_t)new + LITE3_NODE_ALIGNMENT_MASK) & ~LITE3_NODE_ALIGNMENT_MASK);
++                memcpy(new_buf, buf, buflen);
++                free(ctx->underlying_buf);
++                ctx->underlying_buf = new;
+                 ctx->buf = new_buf;
+                 ctx->bufsz = (size_t)((uintptr_t)new + (uintptr_t)new_size - (uintptr_t)new_buf);
++                ctx->buflen = buflen;
++                return 0;
+         }
+         ctx->buflen = buflen;
+-        memcpy(ctx->buf, buf, buflen);
++        memmove(ctx->buf, buf, buflen); // `buf` may overlap the context's own buffer
+         return 0;
+ }
+ 

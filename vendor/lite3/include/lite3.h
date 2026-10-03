@@ -192,7 +192,7 @@ Define `LITE3_DISABLE_PREFETCHING` to turn it off without editing this header.
 #endif // DOXYGEN_ONLY
 
 /**
-Print library-specific error messages to `stdout`.
+Print library-specific error messages to `stderr`.
 
 Disabled by default.
 
@@ -207,7 +207,7 @@ It is recommended to enable this during development.
 #ifndef DOXYGEN_IGNORE
 #ifdef LITE3_ERROR_MESSAGES
         #include <stdio.h>
-        #define LITE3_PRINT_ERROR(format, ...) printf(format, ##__VA_ARGS__)
+        #define LITE3_PRINT_ERROR(format, ...) fprintf(stderr, format, ##__VA_ARGS__)
 #else
         #define LITE3_PRINT_ERROR(format, ...) /* nothing */
 #endif

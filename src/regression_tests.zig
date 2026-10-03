@@ -100,3 +100,82 @@ test "SEC-3: unterminated key entry is rejected as corrupt" {
     try testing.expectError(lite3.Error.CorruptData, it.next());
     if (lite3.json_enabled) try testing.expectError(lite3.Error.CorruptData, d.buf.jsonEncode(lite3.root));
 }
+
+/// Offset of the first byte of the value stored right after `key` in a
+/// one-entry object (key bytes, NUL, then the value's type byte).
+fn valueOffset(data: []const u8, key: []const u8) !usize {
+    var needle: [32]u8 = undefined;
+    @memcpy(needle[0..key.len], key);
+    needle[key.len] = 0;
+    const at = std.mem.indexOf(u8, data, needle[0 .. key.len + 1]) orelse return error.TestKeyNotFound;
+    return at + key.len + 1;
+}
+
+test "SEC-2: string with stored size 0 is corrupt, not a 4 GiB slice" {
+    var mem: [1024]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    try buf.setStr(lite3.root, "s", "hi");
+    const val = try valueOffset(buf.data(), "s");
+    // Value layout: type byte, u32 size (including NUL), bytes.
+    try testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, mem[val + 1 ..][0..4], .little));
+    std.mem.writeInt(u32, mem[val + 1 ..][0..4], 0, .little);
+
+    try testing.expectError(lite3.Error.CorruptData, buf.getStr(lite3.root, "s"));
+    var it = try buf.iterate(lite3.root);
+    try testing.expectError(lite3.Error.CorruptData, it.next());
+}
+
+test "SEC-2: string in an array with stored size 0 is corrupt" {
+    var mem: [1024]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initArr(&mem);
+    try buf.arrAppendStr(lite3.root, "hi");
+    const at = std.mem.indexOf(u8, buf.data(), "hi\x00") orelse return error.TestValueNotFound;
+    std.mem.writeInt(u32, mem[at - 4 ..][0..4], 0, .little);
+    try testing.expectError(lite3.Error.CorruptData, buf.arrGetStr(lite3.root, 0));
+}
+
+test "SEC-2: string without a NUL terminator is corrupt" {
+    var mem: [1024]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    try buf.setStr(lite3.root, "s", "hi");
+    const at = std.mem.indexOf(u8, buf.data(), "hi\x00") orelse return error.TestValueNotFound;
+    mem[at + 2] = '!';
+    try testing.expectError(lite3.Error.CorruptData, buf.getStr(lite3.root, "s"));
+}
+
+test "CSH-21: bool byte other than 0 or 1 is corrupt" {
+    var mem: [1024]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    try buf.setBool(lite3.root, "flag", true);
+    const val = try valueOffset(buf.data(), "flag");
+    try testing.expectEqual(@as(u8, 1), mem[val + 1]);
+    mem[val + 1] = 2;
+    try testing.expectError(lite3.Error.CorruptData, buf.getBool(lite3.root, "flag"));
+}
+
+test "SEC-8: JSON key containing \\u0000 is rejected" {
+    if (!lite3.json_enabled) return error.SkipZigTest;
+    var mem: [1024]u8 align(4) = undefined;
+    try testing.expectError(lite3.Error.InvalidArgument, lite3.Buffer.jsonDecode(&mem, "{\"a\\u0000b\":1}"));
+    // Without the patch this decoded to {"a":2}: the second key overwrote the first.
+    try testing.expectError(lite3.Error.InvalidArgument, lite3.Buffer.jsonDecode(&mem, "{\"a\":1,\"a\\u0000b\":2}"));
+}
+
+test "SEC-11: scalar JSON root is an error, not an empty success" {
+    if (!lite3.json_enabled) return error.SkipZigTest;
+    var mem: [1024]u8 align(4) = undefined;
+    for ([_][]const u8{ "42", "\"str\"", "true", "null" }) |json| {
+        try testing.expectError(lite3.Error.InvalidArgument, lite3.Buffer.jsonDecode(&mem, json));
+    }
+}
+
+test "ALC-10: Context.importFromBuf with its own data keeps the document" {
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
+    try ctx.resetObj();
+    try ctx.setStr(lite3.root, "name", "Alice");
+    try ctx.setI64(lite3.root, "age", 30);
+    try ctx.importFromBuf(ctx.data());
+    try testing.expectEqualStrings("Alice", try ctx.getStr(lite3.root, "name"));
+    try testing.expectEqual(@as(i64, 30), try ctx.getI64(lite3.root, "age"));
+}

@@ -34,6 +34,7 @@
 #ifdef LITE3_JSON
 #include <stdint.h>
 #include <errno.h>
+#include <string.h>
 
 #include "yyjson/yyjson.h"
 
@@ -46,6 +47,13 @@ int _lite3_json_dec_arr(unsigned char *buf, size_t *restrict inout_buflen, size_
 int _lite3_json_dec_obj_switch(unsigned char *buf, size_t *restrict inout_buflen, size_t ofs, size_t bufsz, size_t nesting_depth, yyjson_doc *doc, yyjson_val *yy_key, yyjson_val *yy_val)
 {
         const char *key = yyjson_get_str(yy_key);
+        // Lite³ keys are NULL-terminated strings; a JSON key containing \u0000 would be
+        // silently truncated and could overwrite a different key.
+        if (memchr(key, 0, yyjson_get_len(yy_key)) != NULL) {
+                LITE3_PRINT_ERROR("FAILED TO READ JSON: KEY CONTAINS NULL CHARACTER\n");
+                errno = EINVAL;
+                return -1;
+        }
         yyjson_type type = yyjson_get_type(yy_val);
         int ret;
         switch (type) {
@@ -275,6 +283,7 @@ int _lite3_json_dec_doc(unsigned char *buf, size_t *restrict out_buflen, size_t 
         default:
                 LITE3_PRINT_ERROR("FAILED TO READ JSON: EXPECTING ARRAY OR OBJECT TYPE\n");
                 errno = EINVAL;
+                ret = -1;
                 goto error;
         }
         yyjson_doc_free(doc);
@@ -289,7 +298,7 @@ int lite3_json_dec(unsigned char *buf, size_t *restrict out_buflen, size_t bufsz
         yyjson_read_err err;
         yyjson_doc *doc = yyjson_read_opts((char *)json_str, json_len, YYJSON_READ_NOFLAG , NULL, &err);
         if (!doc) {
-                LITE3_PRINT_ERROR("FAILED TO READ JSON STRING\tyyjson error code: %u\tmsg:%s\tat byte position: %lu\n", err.code, err.msg, err.pos);
+                LITE3_PRINT_ERROR("FAILED TO READ JSON STRING\tyyjson error code: %u\tmsg:%s\tat byte position: %zu\n", err.code, err.msg, err.pos);
                 errno = EINVAL;
                 return -1;
         }
@@ -301,7 +310,7 @@ int lite3_json_dec_file(unsigned char *buf, size_t *restrict out_buflen, size_t 
         yyjson_read_err err;
         yyjson_doc *doc = yyjson_read_file(path, YYJSON_READ_NOFLAG , NULL, &err);
         if (!doc) {
-                LITE3_PRINT_ERROR("FAILED TO READ JSON FILE\tyyjson error code: %u\tmsg:%s\tat byte position: %lu\n", err.code, err.msg, err.pos);
+                LITE3_PRINT_ERROR("FAILED TO READ JSON FILE\tyyjson error code: %u\tmsg:%s\tat byte position: %zu\n", err.code, err.msg, err.pos);
                 errno = EINVAL;
                 return -1;
         }
@@ -313,7 +322,7 @@ int lite3_json_dec_fp(unsigned char *buf, size_t *restrict out_buflen, size_t bu
         yyjson_read_err err;
         yyjson_doc *doc = yyjson_read_fp(fp, YYJSON_READ_NOFLAG , NULL, &err);
         if (!doc) {
-                LITE3_PRINT_ERROR("FAILED TO READ JSON FILE POINTER\tyyjson error code: %u\tmsg:%s\tat byte position: %lu\n", err.code, err.msg, err.pos);
+                LITE3_PRINT_ERROR("FAILED TO READ JSON FILE POINTER\tyyjson error code: %u\tmsg:%s\tat byte position: %zu\n", err.code, err.msg, err.pos);
                 errno = EINVAL;
                 return -1;
         }
