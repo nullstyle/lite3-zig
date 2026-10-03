@@ -77,3 +77,12 @@ int64_t lite3_json_enc_pretty_buf(const unsigned char *buf, size_t buflen, size_
     (void)json_bufsz;
     return lite3_json_disabled_error();
 }
+
+#include "lite3_shim.h"
+
+int lite3zig_json_syntax_error(const char *json_str, size_t json_len, shim_json_diag *diag) {
+    (void)json_str;
+    (void)json_len;
+    (void)diag;
+    return 0;
+}

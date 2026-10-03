@@ -25,7 +25,7 @@ comptime {
     if (builtin.target.cpu.arch.endian() == .big)
         @compileError("lite3 requires a little-endian target");
     if (builtin.target.os.tag == .windows)
-        @compileError("lite3-zig does not yet support Windows (errno mapping is incomplete)");
+        @compileError("lite3-zig is not yet tested on Windows");
 }
 
 // ---------------------------------------------------------------------------
@@ -53,38 +53,41 @@ pub const Error = error{
     InvalidState,
 };
 
-/// Translate a C return code (< 0 on error) into a Zig error.
-/// The lite3 C library returns -1 and sets errno on failure.
+/// Translate a negative shim return value (`-LITE3ZIG_E_*`) into a Zig error.
+/// The shim derives the status from errno inside C, so nothing here depends
+/// on the platform's errno values or on thread-local state.
 fn translateError(ret: c_int) Error {
     std.debug.assert(ret < 0);
-    const raw_errno = std.c._errno().*;
-    // In debug builds, catch cases where C returned an error but forgot to set errno.
-    std.debug.assert(raw_errno != 0);
-    return mapErrno(raw_errno);
-}
-
-/// Translate the current errno value into a Zig error.
-/// Used for C functions that signal failure via NULL return rather than a negative code.
-fn translateErrno() Error {
-    const raw_errno = std.c._errno().*;
-    if (raw_errno == 0) return Error.Unexpected;
-    return mapErrno(raw_errno);
-}
-
-/// Map a raw errno integer to a Zig error.
-fn mapErrno(raw_errno: c_int) Error {
-    const raw_u16 = std.math.cast(u16, raw_errno) orelse return Error.Unexpected;
-    const e_val: std.posix.E = @fromBackingInt(@intCast(raw_u16));
-    return switch (e_val) {
-        .NOENT => Error.NotFound,
-        .INVAL => Error.InvalidArgument,
-        .NOBUFS, .MSGSIZE => Error.NoBufferSpace,
-        .BADMSG => Error.CorruptData,
-        .NOMEM => Error.OutOfMemory,
-        .IO, .FAULT, .OVERFLOW => Error.Unexpected,
+    return switch (-ret) {
+        c.LITE3ZIG_E_NOT_FOUND => Error.NotFound,
+        c.LITE3ZIG_E_INVALID, c.LITE3ZIG_E_JSON_SYNTAX => Error.InvalidArgument,
+        c.LITE3ZIG_E_NO_SPACE, c.LITE3ZIG_E_OVERFLOW => Error.NoBufferSpace,
+        // An offset pointing outside the document only happens with corrupt
+        // data or an Offset that does not belong to this document.
+        c.LITE3ZIG_E_CORRUPT, c.LITE3ZIG_E_OUT_OF_BOUNDS => Error.CorruptData,
+        c.LITE3ZIG_E_NO_MEMORY => Error.OutOfMemory,
         else => Error.Unexpected,
     };
 }
+
+/// Where JSON parsing failed, filled by the `*Diagnostics` decode variants
+/// when the input is not valid JSON.
+pub const JsonDiagnostics = struct {
+    /// yyjson error code.
+    code: u32 = 0,
+    /// Byte offset into the JSON input.
+    position: usize = 0,
+    /// Static description of the error.
+    message: []const u8 = "",
+
+    fn fromShim(self: *JsonDiagnostics, d: c.shim_json_diag) void {
+        self.* = .{
+            .code = d.code,
+            .position = d.position,
+            .message = if (d.message) |m| std.mem.span(m) else "",
+        };
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Value types
@@ -101,8 +104,6 @@ pub const Type = enum(u8) {
     object = 6,
     array = 7,
     invalid = 8,
-
-    const max_valid: u8 = 8;
 };
 
 /// A tagged union representing any Lite3 value, useful for dynamic access.
@@ -373,20 +374,21 @@ fn SharedMethods(comptime Self: type) type {
             else
                 c.shim_lite3_get_type(self.buf, self.len, @backingInt(ofs), &kz);
             if (ret < 0) return translateError(ret);
-            if (ret > Type.max_valid) return Error.CorruptData;
-            const t: Type = @fromBackingInt(@intCast(@as(u8, @intCast(ret))));
-            if (t == .invalid) return Error.NotFound;
-            return t;
+            if (ret >= @backingInt(Type.invalid)) return Error.CorruptData;
+            return @fromBackingInt(@intCast(ret));
         }
 
-        /// Check if a key exists. Returns an error if the key conversion fails.
+        /// Check if a key exists. Only a missing key returns `false`; corrupt
+        /// data or a non-object `ofs` is an error.
         pub fn exists(self: *const Self, ofs: Offset, key: []const u8) Error!bool {
             try ensureUsable(self);
             var kz = try toKeyZ(key);
-            return if (is_ctx)
-                c.shim_lite3_ctx_exists(self.raw(), @backingInt(ofs), &kz) != 0
+            const ret = if (is_ctx)
+                c.shim_lite3_ctx_exists(self.raw(), @backingInt(ofs), &kz)
             else
-                c.shim_lite3_exists(self.buf, self.len, @backingInt(ofs), &kz) != 0;
+                c.shim_lite3_exists(self.buf, self.len, @backingInt(ofs), &kz);
+            if (ret < 0) return translateError(ret);
+            return ret != 0;
         }
 
         /// Get a boolean value by key.
@@ -732,9 +734,8 @@ fn SharedMethods(comptime Self: type) type {
             else
                 c.shim_lite3_arr_get_type(self.buf, self.len, @backingInt(ofs), index);
             if (t < 0) return translateError(t);
-            if (t > Type.max_valid) return Error.CorruptData;
-            const ret: Type = @fromBackingInt(@intCast(@as(u8, @intCast(t))));
-            if (ret == .invalid) return Error.NotFound;
+            if (t >= @backingInt(Type.invalid)) return Error.CorruptData;
+            const ret: Type = @fromBackingInt(@intCast(t));
             return ret;
         }
 
@@ -800,10 +801,10 @@ fn SharedMethods(comptime Self: type) type {
             const buf_ptr: [*]const u8 = if (is_ctx) c.shim_lite3_ctx_buf(self.raw()) else self.buf;
             const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.raw()) else self.len;
             var out_len: usize = 0;
-            std.c._errno().* = 0;
-            const ptr: ?[*]u8 = @ptrCast(c.shim_lite3_json_enc(buf_ptr, buf_len, @backingInt(ofs), &out_len));
-            if (ptr) |p| return JsonString{ .ptr = p, .len = out_len };
-            return translateErrno();
+            var out: [*c]u8 = null;
+            const ret = c.shim_lite3_json_enc(buf_ptr, buf_len, @backingInt(ofs), &out, &out_len);
+            if (ret < 0) return translateError(ret);
+            return JsonString{ .ptr = out, .len = out_len };
         }
 
         /// Encode the buffer contents as a pretty-printed JSON string.
@@ -814,10 +815,10 @@ fn SharedMethods(comptime Self: type) type {
             const buf_ptr: [*]const u8 = if (is_ctx) c.shim_lite3_ctx_buf(self.raw()) else self.buf;
             const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.raw()) else self.len;
             var out_len: usize = 0;
-            std.c._errno().* = 0;
-            const ptr: ?[*]u8 = @ptrCast(c.shim_lite3_json_enc_pretty(buf_ptr, buf_len, @backingInt(ofs), &out_len));
-            if (ptr) |p| return JsonString{ .ptr = p, .len = out_len };
-            return translateErrno();
+            var out: [*c]u8 = null;
+            const ret = c.shim_lite3_json_enc_pretty(buf_ptr, buf_len, @backingInt(ofs), &out, &out_len);
+            if (ret < 0) return translateError(ret);
+            return JsonString{ .ptr = out, .len = out_len };
         }
 
         /// Get the value at the given key as a tagged union.
@@ -942,9 +943,17 @@ pub const Buffer = struct {
 
     /// Decode a JSON string into a buffer, reinitializing it.
     pub fn jsonDecode(mem: []align(4) u8, json: []const u8) Error!Buffer {
+        return jsonDecodeDiagnostics(mem, json, null);
+    }
+
+    /// Like `jsonDecode`; if the input is not valid JSON, also fills `diag`
+    /// with the error position.
+    pub fn jsonDecodeDiagnostics(mem: []align(4) u8, json: []const u8, diag: ?*JsonDiagnostics) Error!Buffer {
         if (!json_enabled) return Error.InvalidArgument;
         var buflen: usize = 0;
-        const ret = c.shim_lite3_json_dec(mem.ptr, &buflen, mem.len, json.ptr, json.len);
+        var d: c.shim_json_diag = undefined;
+        const ret = c.shim_lite3_json_dec(mem.ptr, &buflen, mem.len, json.ptr, json.len, &d);
+        if (ret == -c.LITE3ZIG_E_JSON_SYNTAX) if (diag) |out| out.fromShim(d);
         if (ret < 0) return translateError(ret);
         return Buffer{
             .buf = mem.ptr,
@@ -954,12 +963,15 @@ pub const Buffer = struct {
     }
 
     /// Encode the buffer contents as JSON into a caller-supplied buffer.
-    /// Returns the number of bytes written.
+    /// Returns the number of bytes written (no NUL terminator), or
+    /// `error.NoBufferSpace` if `out` is too small.
     pub fn jsonEncodeBuf(self: *const Buffer, ofs: Offset, out: []u8) Error!usize {
+        try SharedMethods(Buffer).ensureUsable(self);
         if (!json_enabled) return Error.InvalidArgument;
-        const ret = c.shim_lite3_json_enc_buf(self.buf, self.len, @backingInt(ofs), out.ptr, out.len);
-        if (ret < 0) return translateError(@intCast(ret));
-        return @intCast(ret);
+        var len: usize = 0;
+        const ret = c.shim_lite3_json_enc_buf(self.buf, self.len, @backingInt(ofs), out.ptr, out.len, &len);
+        if (ret < 0) return translateError(ret);
+        return len;
     }
 };
 
@@ -1035,25 +1047,25 @@ pub const Context = struct {
 
     /// Initialize a new context with default size.
     pub fn init() Error!Context {
-        std.c._errno().* = 0;
-        const ctx = c.shim_lite3_ctx_create();
-        if (ctx == null) return translateErrno();
+        var ctx: ?*c.lite3_ctx = null;
+        const ret = c.shim_lite3_ctx_create(&ctx);
+        if (ret < 0) return translateError(ret);
         return Context{ .ctx = ctx.? };
     }
 
     /// Initialize a new context with a specific buffer size.
     pub fn initWithSize(bufsz: usize) Error!Context {
-        std.c._errno().* = 0;
-        const ctx = c.shim_lite3_ctx_create_with_size(bufsz);
-        if (ctx == null) return translateErrno();
+        var ctx: ?*c.lite3_ctx = null;
+        const ret = c.shim_lite3_ctx_create_with_size(bufsz, &ctx);
+        if (ret < 0) return translateError(ret);
         return Context{ .ctx = ctx.? };
     }
 
     /// Initialize a context by copying from an existing buffer.
     pub fn initFromBuf(buf: []const u8) Error!Context {
-        std.c._errno().* = 0;
-        const ctx = c.shim_lite3_ctx_create_from_buf(buf.ptr, buf.len);
-        if (ctx == null) return translateErrno();
+        var ctx: ?*c.lite3_ctx = null;
+        const ret = c.shim_lite3_ctx_create_from_buf(buf.ptr, buf.len, &ctx);
+        if (ret < 0) return translateError(ret);
         return Context{ .ctx = ctx.? };
     }
 
@@ -1095,9 +1107,17 @@ pub const Context = struct {
 
     /// Decode a JSON string into this context.
     pub fn jsonDecode(self: *Context, json: []const u8) Error!void {
+        return self.jsonDecodeDiagnostics(json, null);
+    }
+
+    /// Like `jsonDecode`; if the input is not valid JSON, also fills `diag`
+    /// with the error position.
+    pub fn jsonDecodeDiagnostics(self: *Context, json: []const u8, diag: ?*JsonDiagnostics) Error!void {
         if (!json_enabled) return Error.InvalidArgument;
         try self.ensureAlive();
-        const ret = c.shim_lite3_ctx_json_dec(self.raw(), json.ptr, json.len);
+        var d: c.shim_json_diag = undefined;
+        const ret = c.shim_lite3_ctx_json_dec(self.raw(), json.ptr, json.len, &d);
+        if (ret == -c.LITE3ZIG_E_JSON_SYNTAX) if (diag) |out| out.fromShim(d);
         if (ret < 0) return translateError(ret);
     }
 
@@ -1266,11 +1286,17 @@ pub const ManagedContext = struct {
 
     /// Decode JSON into the managed buffer, growing as needed.
     pub fn jsonDecode(self: *ManagedContext, json: []const u8) Error!void {
+        return self.jsonDecodeDiagnostics(json, null);
+    }
+
+    /// Like `jsonDecode`; if the input is not valid JSON, also fills `diag`
+    /// with the error position.
+    pub fn jsonDecodeDiagnostics(self: *ManagedContext, json: []const u8, diag: ?*JsonDiagnostics) Error!void {
         if (!json_enabled) return Error.InvalidArgument;
         try self.ensureAlive();
         while (true) {
             const mem = self.storageSlice();
-            self.inner = Buffer.jsonDecode(mem, json) catch |err| switch (err) {
+            self.inner = Buffer.jsonDecodeDiagnostics(mem, json, diag) catch |err| switch (err) {
                 Error.NoBufferSpace => {
                     try self.grow();
                     continue;
@@ -1620,11 +1646,17 @@ pub const ExternalContext = struct {
 
     /// Decode JSON into the external buffer, growing as needed.
     pub fn jsonDecode(self: *ExternalContext, allocator: std.mem.Allocator, json: []const u8) Error!void {
+        return self.jsonDecodeDiagnostics(allocator, json, null);
+    }
+
+    /// Like `jsonDecode`; if the input is not valid JSON, also fills `diag`
+    /// with the error position.
+    pub fn jsonDecodeDiagnostics(self: *ExternalContext, allocator: std.mem.Allocator, json: []const u8, diag: ?*JsonDiagnostics) Error!void {
         if (!json_enabled) return Error.InvalidArgument;
         try self.ensureAlive();
         while (true) {
             const mem = self.storageSlice();
-            self.inner = Buffer.jsonDecode(mem, json) catch |err| switch (err) {
+            self.inner = Buffer.jsonDecodeDiagnostics(mem, json, diag) catch |err| switch (err) {
                 Error.NoBufferSpace => {
                     try self.grow(allocator);
                     continue;

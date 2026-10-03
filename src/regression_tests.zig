@@ -179,3 +179,82 @@ test "ALC-10: Context.importFromBuf with its own data keeps the document" {
     try testing.expectEqualStrings("Alice", try ctx.getStr(lite3.root, "name"));
     try testing.expectEqual(@as(i64, 30), try ctx.getI64(lite3.root, "age"));
 }
+
+test "MEM-3/H2: array iteration never reports a key, even after an object iteration" {
+    var mem: [2048]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    try buf.setI64(lite3.root, "some_key", 1);
+    const arr = try buf.setArr(lite3.root, "arr");
+    for (0..20) |i| try buf.arrAppendI64(arr, @intCast(i));
+
+    var obj_it = try buf.iterate(lite3.root);
+    while (try obj_it.next()) |e| try testing.expect(e.key != null);
+
+    var arr_it = try buf.iterate(arr);
+    var n: usize = 0;
+    while (try arr_it.next()) |e| : (n += 1) try testing.expectEqual(@as(?[]const u8, null), e.key);
+    try testing.expectEqual(@as(usize, 20), n);
+}
+
+test "API-3/CSH-13: getType and exists report corruption instead of absence" {
+    var mem: [1024]u8 align(4) = undefined;
+    var d = try docWithKey(&mem, "ab");
+    mem[d.nul] = 'x'; // unterminated key entry
+
+    try testing.expectError(lite3.Error.CorruptData, d.buf.getType(lite3.root, "ab"));
+    try testing.expectError(lite3.Error.CorruptData, d.buf.exists(lite3.root, "ab"));
+}
+
+test "API-3/CSH-13: getType and exists on a missing key, and on an array" {
+    var mem: [1024]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    try buf.setI64(lite3.root, "a", 1);
+    const arr = try buf.setArr(lite3.root, "arr");
+
+    try testing.expectEqual(false, try buf.exists(lite3.root, "missing"));
+    try testing.expectError(lite3.Error.NotFound, buf.getType(lite3.root, "missing"));
+    try testing.expectEqual(lite3.Type.i64_, try buf.getType(lite3.root, "a"));
+    // An array is not an object: that is a caller error, not "absent".
+    try testing.expectError(lite3.Error.InvalidArgument, buf.exists(arr, "a"));
+    try testing.expectError(lite3.Error.InvalidArgument, buf.getType(arr, "a"));
+    // Out-of-range index: same error as the typed array getters (lite3 uses EINVAL).
+    try testing.expectError(lite3.Error.InvalidArgument, buf.arrGetType(arr, 0));
+}
+
+test "CSH-14/PRF-8: jsonEncodeBuf reports a too-small buffer as NoBufferSpace" {
+    if (!lite3.json_enabled) return error.SkipZigTest;
+    var mem: [1024]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    try buf.setStr(lite3.root, "name", "Alice");
+    const expected = "{\"name\":\"Alice\"}";
+
+    var exact: [expected.len]u8 = undefined;
+    const n = try buf.jsonEncodeBuf(lite3.root, &exact);
+    try testing.expectEqualStrings(expected, exact[0..n]);
+
+    var small: [expected.len - 1]u8 = undefined;
+    try testing.expectError(lite3.Error.NoBufferSpace, buf.jsonEncodeBuf(lite3.root, &small));
+}
+
+test "CRT-5: jsonDecode reports where invalid JSON fails" {
+    if (!lite3.json_enabled) return error.SkipZigTest;
+    var mem: [1024]u8 align(4) = undefined;
+    var diag: lite3.JsonDiagnostics = .{};
+    try testing.expectError(
+        lite3.Error.InvalidArgument,
+        lite3.Buffer.jsonDecodeDiagnostics(&mem, "{\"a\": 1, \"b\": }", &diag),
+    );
+    try testing.expectEqual(@as(usize, 14), diag.position);
+    try testing.expect(diag.message.len > 0);
+
+    // Valid JSON that lite3 rejects (scalar root) leaves diag untouched.
+    var diag2: lite3.JsonDiagnostics = .{};
+    try testing.expectError(lite3.Error.InvalidArgument, lite3.Buffer.jsonDecodeDiagnostics(&mem, "42", &diag2));
+    try testing.expectEqual(@as(usize, 0), diag2.message.len);
+
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
+    var diag3: lite3.JsonDiagnostics = .{};
+    try testing.expectError(lite3.Error.InvalidArgument, ctx.jsonDecodeDiagnostics("[1, 2", &diag3));
+    try testing.expectEqual(@as(usize, 5), diag3.position);
+}

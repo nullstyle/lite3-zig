@@ -18,3 +18,19 @@
 #include "../vendor/lite3/lib/nibble_base64/base64.c"
 #include "../vendor/lite3/src/json_enc.c"
 #include "../vendor/lite3/src/json_dec.c"
+
+#include "lite3_shim.h"
+
+int lite3zig_json_syntax_error(const char *json_str, size_t json_len, shim_json_diag *diag)
+{
+    yyjson_read_err err;
+    yyjson_doc *doc = yyjson_read_opts((char *)json_str, json_len, YYJSON_READ_NOFLAG, NULL, &err);
+    if (doc) {
+        yyjson_doc_free(doc);
+        return 0;
+    }
+    diag->code = err.code;
+    diag->position = err.pos;
+    diag->message = err.msg;
+    return 1;
+}
