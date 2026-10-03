@@ -376,7 +376,24 @@ Exit criteria:
 - `checkAllAllocationFailures` is clean.
 - Benchmark overhead against raw lite3 is ≤ 15% on comptime-key paths.
 
-### Phase 4 — CI, packaging, docs, release · ~2 days (CI parts can start alongside Phase 1)
+### Phase 4 — CI, packaging, docs, release · ✅ done except the tag (2026-10-03)
+
+**Status.** CI is green on PR #1. Specifics and deviations:
+
+- **Found while preparing CI:**
+  - The library did not compile for 32-bit targets: `validateStrict`'s bitmap loop ranged over `u64`. The bench had the same problem.
+  - The examples did not build for wasm32-wasi because `smp_allocator` needs threads. They now use `std.process.Init.gpa`.
+- **CI:**
+  - Actions are pinned to the latest release of the major version already in use. Dependabot proposes major upgrades.
+  - Windows is not in the matrix: the library deliberately rejects it at compile time.
+  - The Zig master canary runs nightly and on manual dispatch, never on PRs.
+- **Snippets:** the README quick start is a complete program that `zig build run-examples` extracts and runs. The other README snippets are fragments: the dependency snippet is covered by `scripts/consumer-test.sh`, and the API tables are not code.
+- **Upstream reports** are drafted in `docs/upstream-issues.md`, not filed: filing needs the maintainer's own account.
+- **Left for the maintainer:**
+  - merging PR #1
+  - tagging `v0.1.0` on `main`
+  - deciding whether to remove the README's "vibe-coded" warning
+
 
 1. **CI matrix:** every job installs the pinned Zig (0.17.0) through mise.
    - Linux and macOS × Debug, ReleaseSafe and ReleaseFast × json on/off.
