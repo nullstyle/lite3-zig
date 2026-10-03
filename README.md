@@ -15,11 +15,11 @@
 - **Iteration** — iterate over object keys or array elements.
 - **Proper error handling** — all C error codes are translated to Zig error unions.
 - **Flexible keys** — accepts `[]const u8` keys (no sentinel terminator required; embedded `\0` is rejected).
-- **Zero `@cImport` issues** — a thin C shim wraps the inline functions that Zig's translate-c cannot handle (alignment casts, flexible array members, GNU statement expressions).
+- **Clean C interop** — a thin C shim wraps the inline functions that translate-c cannot handle (alignment casts, flexible array members, GNU statement expressions); the shim header is translated by the build system (`b.addTranslateC`), as Zig 0.17 requires.
 
 ## Requirements
 
-- **Zig ≥ 0.15.2**
+- **Zig 0.17.0** (pinned in `.mise.toml`)
 - A C11-capable toolchain (provided by Zig)
 
 The C source for lite3 is vendored directly in `vendor/lite3/` — no submodules needed.
@@ -211,7 +211,7 @@ lite3-zig/
 ├── build.zig           # Zig build system
 ├── build.zig.zon       # Package metadata
 ├── Justfile            # Task automation
-├── .mise.toml          # Dev environment (Zig 0.15.2)
+├── .mise.toml          # Dev environment (Zig 0.17.0)
 ├── src/
 │   ├── lite3.zig       # Zig wrapper module
 │   ├── lite3_shim.c    # C shim for inline functions
@@ -230,7 +230,7 @@ lite3-zig/
 
 ```bash
 # With mise and just installed:
-mise install          # Install Zig 0.15.2
+mise install          # Install Zig 0.17.0
 just test             # Run tests
 just test-release     # Run tests with ReleaseSafe
 just test-no-json     # Run tests with JSON backend disabled

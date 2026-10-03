@@ -1,6 +1,6 @@
 # lite3-zig — Production-Readiness Review & Plan
 
-Review date: 2026-10-01 · Reviewed commit: `b7cb2b9` · Toolchain reviewed: Zig 0.15.2 (also probed 0.16.0) · Target toolchain: Zig master via mise
+Review date: 2026-10-01 · Reviewed commit: `b7cb2b9` · Toolchain reviewed: Zig 0.15.2 (also probed 0.16.0) · Target toolchain: Zig 0.17.0 via mise
 
 ## 1. Verdict
 
@@ -134,21 +134,22 @@ Reviewer IDs in brackets; full register in §8.
 The maintainer's decisions (§7) shape the plan:
 
 - **No users yet.** The plan does not fix the four current document types and then replace them. It fixes the C layer once, builds the new design directly on top of it, and ships a single `v0.1.0` release with no deprecation shims.
-- **Zig master, installed with mise.** The project tracks `master`, so `std.Io`-era APIs are the baseline. CI has to absorb upstream churn.
+- **Zig 0.17.0, installed with mise.** This was originally "track master"; the project now pins 0.17.0 because it was released. `std.Io`-era APIs are the baseline.
 - **Untrusted buffers are supported.** Validation is the default path, not an opt-in.
 
 The guiding rule is red→green: each fix lands together with the failing test that proves the bug. The review already wrote those tests for every critical and high item; they are in [`REVIEW_REPRO_TESTS.md`](REVIEW_REPRO_TESTS.md). Tests written against the old types get ported to the new API in Phase 3. Their scenarios (growth across node splits, self-aliasing values, a failed decode, iteration after a mutation) carry over unchanged.
 
-### Phase 0 — Toolchain on Zig master · ~0.5–1 day
+### Phase 0 — Toolchain on Zig 0.17.0 · ✅ done (2026-10-03)
 
-1. **Pin the toolchain.** Set `.mise.toml` to `zig = "master"`. Record the known-good dev version (`zig version`) as `minimum_zig_version` in `build.zig.zon`, and bump it deliberately.
-2. **Port the examples and bench** to master's `std.Io` / `std.process.Init` main signature. Under 0.16.0 this was about 4 lines per example and about 12 in bench; master may need more. The library and tests built unchanged on 0.16.0, so re-check them on master.
-3. **Handle master churn in CI.**
-   - Add a scheduled nightly job that runs `mise install` (latest master) and the full suite, so breakage from upstream is noticed within a day rather than mid-PR.
-   - PR jobs use the same `mise` resolution. If master breaks and blocks a PR, the escape hatch is a temporary pin of an exact dev version in `.mise.toml`; record it in the CHANGELOG.
-4. **Remove the 0.15-specific code paths and doc references.** Update the README's supported version to "Zig master (tested with `<version>`)".
+Zig 0.17.0 was released after the decision to track master, so the project pins that release instead. It gets master's `std.Io` APIs without master's churn.
 
-> **Environment note.** This review container cannot download Zig master: its network policy denies `ziglang.org`. The latest release available here, through PyPI, is 0.16.0. Implementation sessions need `ziglang.org` on the allowed-domains list, or a broader network access level, for `mise install` to work.
+- `.mise.toml` pins `zig = "0.17.0"`, and `build.zig.zon` has `minimum_zig_version = "0.17.0"`. CI installs Zig through mise, so it follows automatically.
+- `@cImport` was removed in 0.17. The shim header is now translated by `b.addTranslateC` in `build.zig` and imported as the private module `lite3_c`. This also removes the redundant per-module include and link calls (BLD-9).
+- The examples and bench use the `main(init: std.process.Init)` entry point and `std.Io.File`. The bench uses `std.Io.Timestamp` in place of the removed `std.time.Timer`.
+- The tests use a comptime `repeat` helper in place of the removed `**` operator.
+- `zig fmt` migrated `@enumFromInt`/`@intFromEnum` to `@fromBackingInt`/`@backingInt`.
+- Verified: 117/117 tests pass in Debug, ReleaseSafe and ReleaseFast with JSON on and off. The examples run. The bench runs. Cross-compiling to aarch64/x86_64 Linux and macOS works. `zig fmt --check` is clean.
+- Optional follow-up: a non-blocking nightly job against Zig master, as an early warning for 0.18.
 
 ### Phase 1 — C layer: re-vendor, patches, safety net · ~2–3 days
 
@@ -292,14 +293,14 @@ Exit criteria:
 
 ### Phase 4 — CI, packaging, docs, release · ~2 days (CI parts can start alongside Phase 1)
 
-1. **CI matrix:** every job installs Zig master through mise.
+1. **CI matrix:** every job installs the pinned Zig (0.17.0) through mise.
    - Linux and macOS × Debug, ReleaseSafe and ReleaseFast × json on/off.
    - Native `x86-linux-musl` and `x86_64-linux-musl` test runs, after fixing the test that assumes a 64-bit `usize`. [BLD-4, TST-10]
    - A sanitized-C Debug job.
    - A valgrind job (`-Dcpu=x86_64_v3`).
    - A cross `check` job for arm, aarch64, riscv64, aarch64-macos and wasm32-wasi.
    - A consumer-package job (`git archive` → `zig fetch` → build with `.json = false`).
-   - The nightly master and fuzz jobs from Phases 0 and 2.
+   - The nightly fuzz job from Phase 2, plus an optional non-blocking Zig master canary.
 
    [OPS-1..3, BLD-3]
 2. **Workflow hygiene:**
@@ -323,7 +324,7 @@ Exit criteria:
    - Remove the "vibe-coded" warning once all of the above is green.
 
    [OPS-7..13, CRT-2/7, TST-14]
-4. **Release:** tag `v0.1.0` and record the exact Zig master version it was tested with.
+4. **Release:** tag `v0.1.0` and state that it was tested with Zig 0.17.0.
 
 ## 6. Upstream contributions
 
@@ -342,7 +343,7 @@ These bugs are still present at upstream HEAD `48ab0e9`. Each one should be carr
 
 ## 7. Decisions (resolved 2026-10-01)
 
-1. **Zig version:** track **Zig master**, installed with mise. Phase 0 covers it.
+1. **Zig version:** use **Zig 0.17.0**, installed with mise. The project tracked master until 0.17.0 was released. Phase 0 is done.
 2. **Untrusted buffers:** **supported**. Validation is on by default, and Phase 2 covers it.
 3. **Release strategy:** **one release** (`v0.1.0`) with the new design. There are no users yet, so there are no deprecation shims or staged releases.
 4. **The C-heap `Context` type:** **dropped**. This follows from decision 3: `Document` covers its use cases with an explicit allocator. Revisit only if lite3 C-API interop (handing a `lite3_ctx*` to C code) becomes a requirement.

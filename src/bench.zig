@@ -6,7 +6,22 @@
 const std = @import("std");
 const lite3 = @import("lite3");
 
-const Timer = std.time.Timer;
+/// Process I/O handle, set once in `main`. Needed for clock access.
+var io: std.Io = undefined;
+
+/// Monotonic stopwatch (std.time.Timer was removed in Zig 0.17).
+const Timer = struct {
+    start_ts: std.Io.Timestamp,
+
+    fn start() !Timer {
+        return .{ .start_ts = std.Io.Timestamp.now(io, .awake) };
+    }
+
+    fn read(self: Timer) u64 {
+        const elapsed = self.start_ts.durationTo(std.Io.Timestamp.now(io, .awake));
+        return @intCast(@max(elapsed.nanoseconds, 0));
+    }
+};
 
 const NUM_TRIALS = 5;
 
@@ -152,7 +167,7 @@ fn benchIterate() !void {
         var iter = try buf.iterate(lite3.root);
         var sink: usize = 0;
         while (try iter.next()) |entry| {
-            sink +%= @intFromEnum(entry.val_offset);
+            sink +%= @backingInt(entry.val_offset);
         }
         std.mem.doNotOptimizeAway(&sink);
     }
@@ -162,7 +177,7 @@ fn benchIterate() !void {
             var iter = try buf.iterate(lite3.root);
             var sink: usize = 0;
             while (try iter.next()) |entry| {
-                sink +%= @intFromEnum(entry.val_offset);
+                sink +%= @backingInt(entry.val_offset);
             }
             std.mem.doNotOptimizeAway(&sink);
         }
@@ -286,7 +301,8 @@ fn benchContextVsBuffer() !void {
     });
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    io = init.io;
     std.debug.print("\nlite3-zig benchmarks ({d} trials each)\n", .{NUM_TRIALS});
     std.debug.print("=========================================\n\n", .{});
 

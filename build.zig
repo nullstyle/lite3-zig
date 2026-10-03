@@ -115,14 +115,27 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(lite3_lib);
 
+    // --- C bindings ---
+    // Zig 0.17 removed @cImport; the shim header is translated here instead.
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/lite3_shim.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    translate_c.addIncludePath(lite3_include_path);
+    translate_c.addIncludePath(shim_include_path);
+    const c_mod = translate_c.createModule();
+
     // --- Public Zig module ---
     const zig_mod = b.addModule("lite3", .{
         .root_source_file = b.path("src/lite3.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "lite3_c", .module = c_mod },
+        },
     });
     zig_mod.addOptions("lite3_build_options", build_options);
-    zig_mod.addIncludePath(shim_include_path);
     zig_mod.linkLibrary(lite3_lib);
 
     // --- Tests ---
@@ -134,8 +147,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lite3", .module = zig_mod },
         },
     });
-    test_mod.addIncludePath(shim_include_path);
-    test_mod.linkLibrary(lite3_lib);
 
     const tests = b.addTest(.{
         .root_module = test_mod,
@@ -154,8 +165,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lite3", .module = zig_mod },
         },
     });
-    bench_mod.addIncludePath(shim_include_path);
-    bench_mod.linkLibrary(lite3_lib);
 
     const bench_exe = b.addExecutable(.{
         .name = "lite3-bench",
@@ -183,8 +192,6 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "lite3", .module = zig_mod },
             },
         });
-        ex_mod.addIncludePath(shim_include_path);
-        ex_mod.linkLibrary(lite3_lib);
 
         const ex_exe = b.addExecutable(.{
             .name = ex.name,

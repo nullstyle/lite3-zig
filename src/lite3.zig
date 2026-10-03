@@ -16,9 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("lite3_build_options");
 
-const c = @cImport({
-    @cInclude("lite3_shim.h");
-});
+const c = @import("lite3_c");
 
 /// True when JSON conversion support is compiled in.
 pub const json_enabled: bool = build_options.json_enabled;
@@ -76,7 +74,7 @@ fn translateErrno() Error {
 /// Map a raw errno integer to a Zig error.
 fn mapErrno(raw_errno: c_int) Error {
     const raw_u16 = std.math.cast(u16, raw_errno) orelse return Error.Unexpected;
-    const e_val: std.posix.E = @enumFromInt(raw_u16);
+    const e_val: std.posix.E = @fromBackingInt(@intCast(raw_u16));
     return switch (e_val) {
         .NOENT => Error.NotFound,
         .INVAL => Error.InvalidArgument,
@@ -185,7 +183,7 @@ pub const Iterator = struct {
         const entry_key: ?[]const u8 = if (key_ptr) |p| p[0..key_len] else null;
         return Entry{
             .key = entry_key,
-            .val_offset = @enumFromInt(val_ofs),
+            .val_offset = @fromBackingInt(@intCast(val_ofs)),
         };
     }
 };
@@ -246,9 +244,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_null(self.raw(), @intFromEnum(ofs), &kz)
+                c.shim_lite3_ctx_set_null(self.raw(), @backingInt(ofs), &kz)
             else
-                c.shim_lite3_set_null(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz);
+                c.shim_lite3_set_null(self.buf, &self.len, @backingInt(ofs), self.capacity, &kz);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -261,9 +259,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_bool(self.raw(), @intFromEnum(ofs), &kz, value)
+                c.shim_lite3_ctx_set_bool(self.raw(), @backingInt(ofs), &kz, value)
             else
-                c.shim_lite3_set_bool(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, value);
+                c.shim_lite3_set_bool(self.buf, &self.len, @backingInt(ofs), self.capacity, &kz, value);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -276,9 +274,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_i64(self.raw(), @intFromEnum(ofs), &kz, value)
+                c.shim_lite3_ctx_set_i64(self.raw(), @backingInt(ofs), &kz, value)
             else
-                c.shim_lite3_set_i64(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, value);
+                c.shim_lite3_set_i64(self.buf, &self.len, @backingInt(ofs), self.capacity, &kz, value);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -291,9 +289,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_f64(self.raw(), @intFromEnum(ofs), &kz, value)
+                c.shim_lite3_ctx_set_f64(self.raw(), @backingInt(ofs), &kz, value)
             else
-                c.shim_lite3_set_f64(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, value);
+                c.shim_lite3_set_f64(self.buf, &self.len, @backingInt(ofs), self.capacity, &kz, value);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -306,9 +304,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_str(self.raw(), @intFromEnum(ofs), &kz, value.ptr, value.len)
+                c.shim_lite3_ctx_set_str(self.raw(), @backingInt(ofs), &kz, value.ptr, value.len)
             else
-                c.shim_lite3_set_str(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, value.ptr, value.len);
+                c.shim_lite3_set_str(self.buf, &self.len, @backingInt(ofs), self.capacity, &kz, value.ptr, value.len);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -321,9 +319,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_bytes(self.raw(), @intFromEnum(ofs), &kz, value.ptr, value.len)
+                c.shim_lite3_ctx_set_bytes(self.raw(), @backingInt(ofs), &kz, value.ptr, value.len)
             else
-                c.shim_lite3_set_bytes(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, value.ptr, value.len);
+                c.shim_lite3_set_bytes(self.buf, &self.len, @backingInt(ofs), self.capacity, &kz, value.ptr, value.len);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -337,14 +335,14 @@ fn SharedMethods(comptime Self: type) type {
             const saved = saveLen(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_obj(self.raw(), @intFromEnum(ofs), &kz, &out_ofs)
+                c.shim_lite3_ctx_set_obj(self.raw(), @backingInt(ofs), &kz, &out_ofs)
             else
-                c.shim_lite3_set_obj(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, &out_ofs);
+                c.shim_lite3_set_obj(self.buf, &self.len, @backingInt(ofs), self.capacity, &kz, &out_ofs);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
             }
-            return @enumFromInt(out_ofs);
+            return @fromBackingInt(@intCast(out_ofs));
         }
 
         /// Set a nested array for the given key. Returns the offset of the new array.
@@ -354,14 +352,14 @@ fn SharedMethods(comptime Self: type) type {
             const saved = saveLen(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_arr(self.raw(), @intFromEnum(ofs), &kz, &out_ofs)
+                c.shim_lite3_ctx_set_arr(self.raw(), @backingInt(ofs), &kz, &out_ofs)
             else
-                c.shim_lite3_set_arr(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, &out_ofs);
+                c.shim_lite3_set_arr(self.buf, &self.len, @backingInt(ofs), self.capacity, &kz, &out_ofs);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
             }
-            return @enumFromInt(out_ofs);
+            return @fromBackingInt(@intCast(out_ofs));
         }
 
         // --- Get operations ---
@@ -371,12 +369,12 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             var kz = try toKeyZ(key);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_type(self.raw(), @intFromEnum(ofs), &kz)
+                c.shim_lite3_ctx_get_type(self.raw(), @backingInt(ofs), &kz)
             else
-                c.shim_lite3_get_type(self.buf, self.len, @intFromEnum(ofs), &kz);
+                c.shim_lite3_get_type(self.buf, self.len, @backingInt(ofs), &kz);
             if (ret < 0) return translateError(ret);
             if (ret > Type.max_valid) return Error.CorruptData;
-            const t: Type = @enumFromInt(@as(u8, @intCast(ret)));
+            const t: Type = @fromBackingInt(@intCast(@as(u8, @intCast(ret))));
             if (t == .invalid) return Error.NotFound;
             return t;
         }
@@ -386,9 +384,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             var kz = try toKeyZ(key);
             return if (is_ctx)
-                c.shim_lite3_ctx_exists(self.raw(), @intFromEnum(ofs), &kz) != 0
+                c.shim_lite3_ctx_exists(self.raw(), @backingInt(ofs), &kz) != 0
             else
-                c.shim_lite3_exists(self.buf, self.len, @intFromEnum(ofs), &kz) != 0;
+                c.shim_lite3_exists(self.buf, self.len, @backingInt(ofs), &kz) != 0;
         }
 
         /// Get a boolean value by key.
@@ -397,9 +395,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             var out: bool = false;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_bool(self.raw(), @intFromEnum(ofs), &kz, &out)
+                c.shim_lite3_ctx_get_bool(self.raw(), @backingInt(ofs), &kz, &out)
             else
-                c.shim_lite3_get_bool(self.buf, self.len, @intFromEnum(ofs), &kz, &out);
+                c.shim_lite3_get_bool(self.buf, self.len, @backingInt(ofs), &kz, &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
@@ -410,9 +408,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             var out: i64 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_i64(self.raw(), @intFromEnum(ofs), &kz, &out)
+                c.shim_lite3_ctx_get_i64(self.raw(), @backingInt(ofs), &kz, &out)
             else
-                c.shim_lite3_get_i64(self.buf, self.len, @intFromEnum(ofs), &kz, &out);
+                c.shim_lite3_get_i64(self.buf, self.len, @backingInt(ofs), &kz, &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
@@ -423,9 +421,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             var out: f64 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_f64(self.raw(), @intFromEnum(ofs), &kz, &out)
+                c.shim_lite3_ctx_get_f64(self.raw(), @backingInt(ofs), &kz, &out)
             else
-                c.shim_lite3_get_f64(self.buf, self.len, @intFromEnum(ofs), &kz, &out);
+                c.shim_lite3_get_f64(self.buf, self.len, @backingInt(ofs), &kz, &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
@@ -440,9 +438,9 @@ fn SharedMethods(comptime Self: type) type {
             var out_ptr: ?[*]const u8 = null;
             var out_len: u32 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_str(self.raw(), @intFromEnum(ofs), &kz, @ptrCast(&out_ptr), &out_len)
+                c.shim_lite3_ctx_get_str(self.raw(), @backingInt(ofs), &kz, @ptrCast(&out_ptr), &out_len)
             else
-                c.shim_lite3_get_str(self.buf, self.len, @intFromEnum(ofs), &kz, @ptrCast(&out_ptr), &out_len);
+                c.shim_lite3_get_str(self.buf, self.len, @backingInt(ofs), &kz, @ptrCast(&out_ptr), &out_len);
             if (ret < 0) return translateError(ret);
             if (out_ptr) |p| return p[0..out_len];
             return Error.StaleReference;
@@ -458,9 +456,9 @@ fn SharedMethods(comptime Self: type) type {
             var out_ptr: ?[*]const u8 = null;
             var out_len: u32 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_bytes(self.raw(), @intFromEnum(ofs), &kz, &out_ptr, &out_len)
+                c.shim_lite3_ctx_get_bytes(self.raw(), @backingInt(ofs), &kz, &out_ptr, &out_len)
             else
-                c.shim_lite3_get_bytes(self.buf, self.len, @intFromEnum(ofs), &kz, &out_ptr, &out_len);
+                c.shim_lite3_get_bytes(self.buf, self.len, @backingInt(ofs), &kz, &out_ptr, &out_len);
             if (ret < 0) return translateError(ret);
             if (out_ptr) |p| return p[0..out_len];
             return Error.StaleReference;
@@ -472,11 +470,11 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_obj(self.raw(), @intFromEnum(ofs), &kz, &out_ofs)
+                c.shim_lite3_ctx_get_obj(self.raw(), @backingInt(ofs), &kz, &out_ofs)
             else
-                c.shim_lite3_get_obj(self.buf, self.len, @intFromEnum(ofs), &kz, &out_ofs);
+                c.shim_lite3_get_obj(self.buf, self.len, @backingInt(ofs), &kz, &out_ofs);
             if (ret < 0) return translateError(ret);
-            return @enumFromInt(out_ofs);
+            return @fromBackingInt(@intCast(out_ofs));
         }
 
         /// Get a nested array offset by key.
@@ -485,11 +483,11 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_arr(self.raw(), @intFromEnum(ofs), &kz, &out_ofs)
+                c.shim_lite3_ctx_get_arr(self.raw(), @backingInt(ofs), &kz, &out_ofs)
             else
-                c.shim_lite3_get_arr(self.buf, self.len, @intFromEnum(ofs), &kz, &out_ofs);
+                c.shim_lite3_get_arr(self.buf, self.len, @backingInt(ofs), &kz, &out_ofs);
             if (ret < 0) return translateError(ret);
-            return @enumFromInt(out_ofs);
+            return @fromBackingInt(@intCast(out_ofs));
         }
 
         /// Get a string value by key, copying into a caller-supplied buffer.
@@ -519,9 +517,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_null(self.raw(), @intFromEnum(ofs))
+                c.shim_lite3_ctx_arr_append_null(self.raw(), @backingInt(ofs))
             else
-                c.shim_lite3_arr_append_null(self.buf, &self.len, @intFromEnum(ofs), self.capacity);
+                c.shim_lite3_arr_append_null(self.buf, &self.len, @backingInt(ofs), self.capacity);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -533,9 +531,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_bool(self.raw(), @intFromEnum(ofs), value)
+                c.shim_lite3_ctx_arr_append_bool(self.raw(), @backingInt(ofs), value)
             else
-                c.shim_lite3_arr_append_bool(self.buf, &self.len, @intFromEnum(ofs), self.capacity, value);
+                c.shim_lite3_arr_append_bool(self.buf, &self.len, @backingInt(ofs), self.capacity, value);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -547,9 +545,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_i64(self.raw(), @intFromEnum(ofs), value)
+                c.shim_lite3_ctx_arr_append_i64(self.raw(), @backingInt(ofs), value)
             else
-                c.shim_lite3_arr_append_i64(self.buf, &self.len, @intFromEnum(ofs), self.capacity, value);
+                c.shim_lite3_arr_append_i64(self.buf, &self.len, @backingInt(ofs), self.capacity, value);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -561,9 +559,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_f64(self.raw(), @intFromEnum(ofs), value)
+                c.shim_lite3_ctx_arr_append_f64(self.raw(), @backingInt(ofs), value)
             else
-                c.shim_lite3_arr_append_f64(self.buf, &self.len, @intFromEnum(ofs), self.capacity, value);
+                c.shim_lite3_arr_append_f64(self.buf, &self.len, @backingInt(ofs), self.capacity, value);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -575,9 +573,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_str(self.raw(), @intFromEnum(ofs), value.ptr, value.len)
+                c.shim_lite3_ctx_arr_append_str(self.raw(), @backingInt(ofs), value.ptr, value.len)
             else
-                c.shim_lite3_arr_append_str(self.buf, &self.len, @intFromEnum(ofs), self.capacity, value.ptr, value.len);
+                c.shim_lite3_arr_append_str(self.buf, &self.len, @backingInt(ofs), self.capacity, value.ptr, value.len);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -589,9 +587,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_bytes(self.raw(), @intFromEnum(ofs), value.ptr, value.len)
+                c.shim_lite3_ctx_arr_append_bytes(self.raw(), @backingInt(ofs), value.ptr, value.len)
             else
-                c.shim_lite3_arr_append_bytes(self.buf, &self.len, @intFromEnum(ofs), self.capacity, value.ptr, value.len);
+                c.shim_lite3_arr_append_bytes(self.buf, &self.len, @backingInt(ofs), self.capacity, value.ptr, value.len);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -604,14 +602,14 @@ fn SharedMethods(comptime Self: type) type {
             const saved = saveLen(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_obj(self.raw(), @intFromEnum(ofs), &out_ofs)
+                c.shim_lite3_ctx_arr_append_obj(self.raw(), @backingInt(ofs), &out_ofs)
             else
-                c.shim_lite3_arr_append_obj(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &out_ofs);
+                c.shim_lite3_arr_append_obj(self.buf, &self.len, @backingInt(ofs), self.capacity, &out_ofs);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
             }
-            return @enumFromInt(out_ofs);
+            return @fromBackingInt(@intCast(out_ofs));
         }
 
         /// Append a nested array to an array. Returns the offset of the new array.
@@ -620,14 +618,14 @@ fn SharedMethods(comptime Self: type) type {
             const saved = saveLen(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_arr(self.raw(), @intFromEnum(ofs), &out_ofs)
+                c.shim_lite3_ctx_arr_append_arr(self.raw(), @backingInt(ofs), &out_ofs)
             else
-                c.shim_lite3_arr_append_arr(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &out_ofs);
+                c.shim_lite3_arr_append_arr(self.buf, &self.len, @backingInt(ofs), self.capacity, &out_ofs);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
             }
-            return @enumFromInt(out_ofs);
+            return @fromBackingInt(@intCast(out_ofs));
         }
 
         // --- Array get operations ---
@@ -637,9 +635,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             var out: bool = false;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_bool(self.raw(), @intFromEnum(ofs), index, &out)
+                c.shim_lite3_ctx_arr_get_bool(self.raw(), @backingInt(ofs), index, &out)
             else
-                c.shim_lite3_arr_get_bool(self.buf, self.len, @intFromEnum(ofs), index, &out);
+                c.shim_lite3_arr_get_bool(self.buf, self.len, @backingInt(ofs), index, &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
@@ -649,9 +647,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             var out: i64 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_i64(self.raw(), @intFromEnum(ofs), index, &out)
+                c.shim_lite3_ctx_arr_get_i64(self.raw(), @backingInt(ofs), index, &out)
             else
-                c.shim_lite3_arr_get_i64(self.buf, self.len, @intFromEnum(ofs), index, &out);
+                c.shim_lite3_arr_get_i64(self.buf, self.len, @backingInt(ofs), index, &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
@@ -661,9 +659,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             var out: f64 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_f64(self.raw(), @intFromEnum(ofs), index, &out)
+                c.shim_lite3_ctx_arr_get_f64(self.raw(), @backingInt(ofs), index, &out)
             else
-                c.shim_lite3_arr_get_f64(self.buf, self.len, @intFromEnum(ofs), index, &out);
+                c.shim_lite3_arr_get_f64(self.buf, self.len, @backingInt(ofs), index, &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
@@ -677,9 +675,9 @@ fn SharedMethods(comptime Self: type) type {
             var out_ptr: ?[*]const u8 = null;
             var out_len: u32 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_str(self.raw(), @intFromEnum(ofs), index, @ptrCast(&out_ptr), &out_len)
+                c.shim_lite3_ctx_arr_get_str(self.raw(), @backingInt(ofs), index, @ptrCast(&out_ptr), &out_len)
             else
-                c.shim_lite3_arr_get_str(self.buf, self.len, @intFromEnum(ofs), index, @ptrCast(&out_ptr), &out_len);
+                c.shim_lite3_arr_get_str(self.buf, self.len, @backingInt(ofs), index, @ptrCast(&out_ptr), &out_len);
             if (ret < 0) return translateError(ret);
             if (out_ptr) |p| return p[0..out_len];
             return Error.StaleReference;
@@ -694,9 +692,9 @@ fn SharedMethods(comptime Self: type) type {
             var out_ptr: ?[*]const u8 = null;
             var out_len: u32 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_bytes(self.raw(), @intFromEnum(ofs), index, &out_ptr, &out_len)
+                c.shim_lite3_ctx_arr_get_bytes(self.raw(), @backingInt(ofs), index, &out_ptr, &out_len)
             else
-                c.shim_lite3_arr_get_bytes(self.buf, self.len, @intFromEnum(ofs), index, &out_ptr, &out_len);
+                c.shim_lite3_arr_get_bytes(self.buf, self.len, @backingInt(ofs), index, &out_ptr, &out_len);
             if (ret < 0) return translateError(ret);
             if (out_ptr) |p| return p[0..out_len];
             return Error.StaleReference;
@@ -707,11 +705,11 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_obj(self.raw(), @intFromEnum(ofs), index, &out_ofs)
+                c.shim_lite3_ctx_arr_get_obj(self.raw(), @backingInt(ofs), index, &out_ofs)
             else
-                c.shim_lite3_arr_get_obj(self.buf, self.len, @intFromEnum(ofs), index, &out_ofs);
+                c.shim_lite3_arr_get_obj(self.buf, self.len, @backingInt(ofs), index, &out_ofs);
             if (ret < 0) return translateError(ret);
-            return @enumFromInt(out_ofs);
+            return @fromBackingInt(@intCast(out_ofs));
         }
 
         /// Get a nested array offset from an array by index.
@@ -719,23 +717,23 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_arr(self.raw(), @intFromEnum(ofs), index, &out_ofs)
+                c.shim_lite3_ctx_arr_get_arr(self.raw(), @backingInt(ofs), index, &out_ofs)
             else
-                c.shim_lite3_arr_get_arr(self.buf, self.len, @intFromEnum(ofs), index, &out_ofs);
+                c.shim_lite3_arr_get_arr(self.buf, self.len, @backingInt(ofs), index, &out_ofs);
             if (ret < 0) return translateError(ret);
-            return @enumFromInt(out_ofs);
+            return @fromBackingInt(@intCast(out_ofs));
         }
 
         /// Get the type of an array element by index.
         pub fn arrGetType(self: *const Self, ofs: Offset, index: u32) Error!Type {
             try ensureUsable(self);
             const t = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_type(self.raw(), @intFromEnum(ofs), index)
+                c.shim_lite3_ctx_arr_get_type(self.raw(), @backingInt(ofs), index)
             else
-                c.shim_lite3_arr_get_type(self.buf, self.len, @intFromEnum(ofs), index);
+                c.shim_lite3_arr_get_type(self.buf, self.len, @backingInt(ofs), index);
             if (t < 0) return translateError(t);
             if (t > Type.max_valid) return Error.CorruptData;
-            const ret: Type = @enumFromInt(@as(u8, @intCast(t)));
+            const ret: Type = @fromBackingInt(@intCast(@as(u8, @intCast(t))));
             if (ret == .invalid) return Error.NotFound;
             return ret;
         }
@@ -767,9 +765,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             var out: u32 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_count(self.raw(), @intFromEnum(ofs), &out)
+                c.shim_lite3_ctx_count(self.raw(), @backingInt(ofs), &out)
             else
-                c.shim_lite3_count(self.buf, self.len, @intFromEnum(ofs), &out);
+                c.shim_lite3_count(self.buf, self.len, @backingInt(ofs), &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
@@ -783,7 +781,7 @@ fn SharedMethods(comptime Self: type) type {
             const buf_ptr: [*]const u8 = if (is_ctx) c.shim_lite3_ctx_buf(self.raw()) else self.buf;
             const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.raw()) else self.len;
             var iter: c.shim_lite3_iter = undefined;
-            const ret = c.shim_lite3_iter_create(buf_ptr, buf_len, @intFromEnum(ofs), &iter);
+            const ret = c.shim_lite3_iter_create(buf_ptr, buf_len, @backingInt(ofs), &iter);
             if (ret < 0) return translateError(ret);
             return Iterator{
                 .raw = iter,
@@ -803,7 +801,7 @@ fn SharedMethods(comptime Self: type) type {
             const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.raw()) else self.len;
             var out_len: usize = 0;
             std.c._errno().* = 0;
-            const ptr: ?[*]u8 = @ptrCast(c.shim_lite3_json_enc(buf_ptr, buf_len, @intFromEnum(ofs), &out_len));
+            const ptr: ?[*]u8 = @ptrCast(c.shim_lite3_json_enc(buf_ptr, buf_len, @backingInt(ofs), &out_len));
             if (ptr) |p| return JsonString{ .ptr = p, .len = out_len };
             return translateErrno();
         }
@@ -817,7 +815,7 @@ fn SharedMethods(comptime Self: type) type {
             const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.raw()) else self.len;
             var out_len: usize = 0;
             std.c._errno().* = 0;
-            const ptr: ?[*]u8 = @ptrCast(c.shim_lite3_json_enc_pretty(buf_ptr, buf_len, @intFromEnum(ofs), &out_len));
+            const ptr: ?[*]u8 = @ptrCast(c.shim_lite3_json_enc_pretty(buf_ptr, buf_len, @backingInt(ofs), &out_len));
             if (ptr) |p| return JsonString{ .ptr = p, .len = out_len };
             return translateErrno();
         }
@@ -959,7 +957,7 @@ pub const Buffer = struct {
     /// Returns the number of bytes written.
     pub fn jsonEncodeBuf(self: *const Buffer, ofs: Offset, out: []u8) Error!usize {
         if (!json_enabled) return Error.InvalidArgument;
-        const ret = c.shim_lite3_json_enc_buf(self.buf, self.len, @intFromEnum(ofs), out.ptr, out.len);
+        const ret = c.shim_lite3_json_enc_buf(self.buf, self.len, @backingInt(ofs), out.ptr, out.len);
         if (ret < 0) return translateError(@intCast(ret));
         return @intCast(ret);
     }

@@ -8,9 +8,9 @@
 const std = @import("std");
 const lite3 = @import("lite3");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var write_buf: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&write_buf);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &write_buf);
     defer stdout.interface.flush() catch {};
 
     if (!lite3.json_enabled) {

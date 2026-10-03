@@ -15,6 +15,15 @@ const std = @import("std");
 const testing = std.testing;
 const lite3 = @import("lite3");
 
+/// String repetition (replacement for the `**` operator removed in Zig 0.17).
+/// Call it as `&comptime repeat(...)`.
+fn repeat(comptime s: []const u8, comptime n: usize) [s.len * n]u8 {
+    @setEvalBranchQuota(n * s.len + 1000);
+    var buf: [s.len * n]u8 = undefined;
+    for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
+    return buf;
+}
+
 // =========================================================================
 // Buffer API tests
 // =========================================================================
@@ -695,7 +704,7 @@ test "ManagedContext: grows on NoBufferSpace" {
 
     const initial_capacity = mctx.capacity();
     try mctx.resetObj();
-    try mctx.setStr(lite3.root, "blob", "x" ** 6000);
+    try mctx.setStr(lite3.root, "blob", &comptime repeat("x", 6000));
 
     try testing.expect(mctx.capacity() > initial_capacity);
     const s = try mctx.getStr(lite3.root, "blob");
@@ -750,7 +759,7 @@ test "ExternalContext: grows on NoBufferSpace with provided allocator" {
 
     const initial_capacity = ectx.capacity();
     try ectx.resetObj();
-    try ectx.setStr(testing.allocator, lite3.root, "blob", "x" ** 6000);
+    try ectx.setStr(testing.allocator, lite3.root, "blob", &comptime repeat("x", 6000));
 
     try testing.expect(ectx.capacity() > initial_capacity);
     const s = try ectx.getStr(lite3.root, "blob");
@@ -762,7 +771,7 @@ test "ExternalContext: importFromBuf can grow with provided allocator" {
     var buf = try lite3.Buffer.initObj(&mem);
     try buf.setStr(lite3.root, "name", "alice");
     try buf.setI64(lite3.root, "age", 30);
-    try buf.setStr(lite3.root, "payload", "y" ** 3000);
+    try buf.setStr(lite3.root, "payload", &comptime repeat("y", 3000));
 
     var ectx = try lite3.ExternalContext.initWithCapacity(testing.allocator, 1024);
     defer ectx.deinit(testing.allocator);
@@ -1382,7 +1391,7 @@ test "Buffer: mutation rollback preserves buffer length on NoBufferSpace" {
     const len_before = buf.len;
 
     // Try to write a string that won't fit in the tiny buffer
-    const result = buf.setStr(lite3.root, "big", "a]" ** 100);
+    const result = buf.setStr(lite3.root, "big", &comptime repeat("a]", 100));
     try testing.expectError(error.NoBufferSpace, result);
 
     // Buffer length must be restored to pre-mutation value
@@ -1508,7 +1517,7 @@ test "Context: getStrCopy survives mutation (dangling pointer mitigation)" {
     for (0..100) |i| {
         var key_buf: [32]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "pad_{d}", .{i}) catch unreachable;
-        try ctx.setStr(lite3.root, key, "x" ** 200);
+        try ctx.setStr(lite3.root, key, &comptime repeat("x", 200));
     }
 
     // The copy is still valid
@@ -1626,12 +1635,12 @@ test "Fuzz: oversized key returns InvalidArgument" {
     var buf = try lite3.Buffer.initObj(&mem);
 
     // Key exactly at max (255 bytes) should work
-    const max_key = "k" ** 255;
+    const max_key = &comptime repeat("k", 255);
     try buf.setI64(lite3.root, max_key, 1);
     try testing.expectEqual(@as(i64, 1), try buf.getI64(lite3.root, max_key));
 
     // Key at 256 bytes should fail
-    const too_long = "k" ** 256;
+    const too_long = &comptime repeat("k", 256);
     try testing.expectError(lite3.Error.InvalidArgument, buf.setI64(lite3.root, too_long, 2));
     try testing.expectError(lite3.Error.InvalidArgument, buf.getI64(lite3.root, too_long));
     try testing.expectError(lite3.Error.InvalidArgument, buf.exists(lite3.root, too_long));
@@ -1677,7 +1686,7 @@ test "Fuzz: Context rapid grow/shrink cycle" {
         for (0..50) |i| {
             var key_buf: [16]u8 = undefined;
             const key = std.fmt.bufPrint(&key_buf, "k{d}_{d}", .{ round, i }) catch unreachable;
-            try ctx.setStr(lite3.root, key, "x" ** 200);
+            try ctx.setStr(lite3.root, key, &comptime repeat("x", 200));
         }
     }
 
