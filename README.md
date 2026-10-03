@@ -6,77 +6,56 @@
 
 ## Features
 
-- **Buffer API** — fixed-size, caller-managed memory; ideal for embedded, real-time, or arena-based workflows.
-- **Context API** — heap-allocated, auto-growing buffer via lite3's internal C allocator.
-- **ManagedContext API** — allocator-explicit, auto-growing buffer managed by Zig allocator.
-- **ExternalContext API** — no stored allocator; provide allocator only to growth-capable calls.
-- **Full type support** — null, bool, i64, f64, string, bytes, nested objects, and arrays.
-- **JSON round-trip** — encode to / decode from JSON via the bundled yyjson backend.
-- **Iteration** — iterate over object keys or array elements.
-- **Proper error handling** — all C error codes are translated to Zig error unions.
-- **Flexible keys** — accepts `[]const u8` keys (no sentinel terminator required; embedded `\0` is rejected).
-- **Clean C interop** — a thin C shim wraps the inline functions that translate-c cannot handle (alignment casts, flexible array members, GNU statement expressions); the shim header is translated by the build system (`b.addTranslateC`), as Zig 0.17 requires.
+- **Three document types, one read API.** `Buffer` (caller-owned fixed memory), `Document` (growable; allocator passed per call, like `std.ArrayList`) and `ManagedDocument` (stores its allocator). All reads go through `View`.
+- **Generic values.** `set(at, key, value)` stores null, bool, any integer, float, string or `lite3.bytes(...)`; `get(T, at, key)` reads into `i64`, `u16`, `f32`, `bool`, `[]const u8`, `lite3.Bytes`, `?T` or `lite3.Value`, with range checks.
+- **Compile-time keys.** `lite3.key("name")` hashes at compile time; plain `[]const u8` keys need no NUL terminator.
+- **Reads in Zig.** Lookups, iteration and JSON encoding are implemented in Zig on top of the format, with bounds checks on every access. Writes (B-tree insertion) go through lite3's C code.
+- **Lifetime checks.** A `View` or iterator taken before a write returns `error.StaleView` instead of reading moved or overwritten memory.
+- **Untrusted input.** Serialized bytes are validated before use; JSON input is bounded in depth and size. See [SECURITY.md](SECURITY.md).
+- **JSON.** Encoding to any `std.Io.Writer` is always available and allocation-free; decoding uses the bundled yyjson with a Zig allocator and reports the error position.
+- **Specific errors.** Separate error sets for reads, writes, growth, JSON decoding and encoding.
 
 ## Requirements
 
 - **Zig 0.17.0** (pinned in `.mise.toml`)
 - A C11-capable toolchain (provided by Zig)
+- A little-endian target (the format is little-endian; big-endian builds fail with a clear message)
 
 The C source for lite3 is vendored directly in `vendor/lite3/` — no submodules needed. `vendor/lite3/UPSTREAM` records the upstream commit, and local changes live as patches in `vendor/patches/`. Re-vendor with `scripts/update-vendor.sh` (or `just update-vendor`); never edit `vendor/lite3/` by hand.
 
 ## Quick start
 
 ```zig
-const lite3 = @import("lite3");
-
-// Using the Context API (auto-growing buffer via C malloc/free)
-var ctx = try lite3.Context.init();
-defer ctx.deinit();
-
-try ctx.resetObj();
-try ctx.setStr(lite3.root, "name", "Alice");
-try ctx.setI64(lite3.root, "age", 30);
-
-const name = try ctx.getStr(lite3.root, "name");
-// name == "Alice"
-
-// Encode to JSON
-const json = try ctx.jsonEncode(lite3.root);
-defer json.deinit();
-```
-
-```zig
 const std = @import("std");
 const lite3 = @import("lite3");
+const root = lite3.root;
 
-// Using the ManagedContext API (auto-growing via Zig allocator)
-var mctx = try lite3.ManagedContext.init(std.heap.page_allocator);
-defer mctx.deinit();
-
-try mctx.resetObj();
-try mctx.setStr(lite3.root, "name", "Alice");
-```
-
-```zig
-const std = @import("std");
-const lite3 = @import("lite3");
-
-// Using ExternalContext (no allocator stored in the type)
-var ectx = try lite3.ExternalContext.init(std.heap.page_allocator);
-defer ectx.deinit(std.heap.page_allocator);
-
-try ectx.resetObj();
-try ectx.setStr(std.heap.page_allocator, lite3.root, "name", "Alice");
-```
-
-```zig
-// Using the Buffer API (fixed-size, caller-managed memory)
+// Fixed memory: writes fail with error.NoSpaceLeft when it is full.
 var mem: [4096]u8 align(4) = undefined;
-var buf = try lite3.Buffer.initObj(&mem);
+var buf = try lite3.Buffer.init(&mem, .object);
+try buf.set(root, "name", "Alice");
+try buf.set(root, "age", 30);
+const tags = try buf.setArray(root, "tags");
+try buf.append(tags, "admin");
 
-try buf.setI64(lite3.root, "answer", 42);
-const val = try buf.getI64(lite3.root, "answer");
-// val == 42
+const v = buf.view();
+const name = try v.get([]const u8, root, "name"); // "Alice"
+const age = try v.get(u8, root, lite3.key("age")); // 30
+std.debug.print("{s} {d} {f}\n", .{ name, age, v }); // {f}: compact JSON
+
+// Growable memory.
+const gpa = std.heap.smp_allocator;
+var doc = try lite3.Document.init(gpa, .object);
+defer doc.deinit(gpa);
+try doc.set(gpa, root, "event", "login");
+
+// Received bytes: validated before use.
+const received = try lite3.View.fromBytes(doc.slice());
+_ = try received.get([]const u8, root, "event");
+
+// JSON (decoding needs the default -Djson=true).
+var parsed = try lite3.Document.fromJson(gpa, "{\"a\":[1,2,3]}", .{});
+defer parsed.deinit(gpa);
 ```
 
 ## Building
@@ -96,12 +75,12 @@ zig build -Doptimize=ReleaseFast
 
 | Option             | Default | Description                                  |
 |--------------------|---------|----------------------------------------------|
-| `-Djson=false`     | `true`  | Disable JSON backend; JSON APIs return `error.InvalidArgument` |
+| `-Djson=false`     | `true`  | Leave out yyjson; JSON decoding functions become compile errors (encoding still works) |
 | `-Derror-messages` | `false` | Print lite3 debug error messages to stderr   |
 | `-Dlto=true`       | `false` | Link-time optimization across Zig and C (inlines shim calls; uses the LLVM backend for every artifact) |
 | `-Dc-optimize=…`   | same as `-Doptimize` | Optimize mode for the C library. In Debug/ReleaseSafe the C code runs under UBSan |
 
-Build steps: `test`, `test-upstream` (lite3's own C tests against the vendored sources), `test-valgrind` (needs valgrind; pass `-Dcpu=x86_64_v3`), `examples`, `bench` (always ReleaseFast), `check` (compile everything without running), `lint-c` (project C sources with `-Werror`).
+Build steps: `test`, `test-upstream` (lite3's own C tests against the vendored sources), `test-valgrind` (needs valgrind; pass `-Dcpu=x86_64_v3`), `examples`, `bench` (always ReleaseFast; compares each operation with lite3's C API), `check` (compile everything without running), `lint-c` (project C sources with `-Werror`).
 
 ### Building examples
 
@@ -140,94 +119,85 @@ exe.root_module.addImport("lite3", lite3_dep.module("lite3"));
 
 ## Examples
 
-See the `examples/` directory for standalone example programs:
+See the `examples/` directory:
 
-- **`basic.zig`** --- Creating documents, setting/getting values, nested objects and arrays, iteration
-- **`json_roundtrip.zig`** --- JSON encode/decode round-trips with both Buffer and Context APIs
+- **`basic.zig`** — Buffer and Document, nested containers, typed reads, compile-time keys, iteration, sending bytes
+- **`json_roundtrip.zig`** — JSON encoding (compact and indented), decoding, and error diagnostics
 
 ## API overview
 
+### Concepts
+
+- **`Offset`** names a container (object or array) inside a document; `lite3.root` is the root. `setObject`/`setArray`/`appendObject`/… return the new container's Offset. Offsets stay valid when a `Document` grows, but an Offset whose container was overwritten no longer refers to it.
+- **`View`** is the read side: cheap to copy, obtained with `.view()` or from bytes with `View.fromBytes` (validates) / `View.fromBytesUnchecked`. Slices it returns point into the document and are valid until the next write; after a write the View returns `error.StaleView`, so take a new one.
+- **Keys** are `[]const u8`, string literals, or `lite3.Key` (`lite3.key("k")` at compile time, `Key.init(str)` at run time). Keys must not contain NUL.
+
 ### Types
 
-| Zig type          | Description                                          |
-|-------------------|------------------------------------------------------|
-| `Buffer`          | Fixed-size buffer with caller-managed memory         |
-| `Context`         | Heap-allocated, auto-growing buffer (C allocator)    |
-| `ManagedContext`  | Auto-growing buffer managed by Zig allocator         |
-| `ExternalContext` | Auto-growing buffer; allocator passed per grow-capable call |
-| `Type`            | Enum of value types (null, bool_, i64_, f64_, etc.)  |
-| `Offset`          | Typed offset handle into the buffer (`enum(usize)`)  |
-| `Error`           | Error set (NotFound, InvalidArgument, etc.)          |
-| `Value`           | Tagged union for dynamic access (null, bool_, i64_, etc.) |
-| `JsonString`      | Opaque handle to C-allocated JSON; freed via `.deinit()` |
-| `Buffer.Iterator` | Iterator over object/array entries                   |
+| Type | Description |
+|---|---|
+| `View` | Reads, iteration, JSON encoding |
+| `Buffer` | Document in caller-owned, fixed-size, 4-aligned memory |
+| `Document` | Growable document; takes `gpa` on each call that may allocate |
+| `ManagedDocument` | `Document` that stores its allocator |
+| `Offset`, `root` | Container handle (`enum(u32)`) and the root container |
+| `Container` | `.object` or `.array` |
+| `Type`, `Value` | Value kinds and a decoded value (strings/bytes point into the document) |
+| `Key`, `key()` | Key with precomputed hash |
+| `Bytes`, `bytes()` | Marks a slice as lite3 bytes rather than a string |
+| `ObjectIterator`, `ArrayIterator` | Yield `{ key, value }` / `{ index, value }` in storage order |
+| `ReadError`, `WriteError`, `GrowError`, `DecodeError`, `EncodeError`, `Error` | Error sets |
+| `JsonOptions`, `JsonDiagnostics` | Encoder whitespace; decoder error position and message |
 
-### Buffer API
+### View
 
-| Method                | Description                                |
-|-----------------------|--------------------------------------------|
-| `initObj` / `initArr` | Initialize as object or array              |
-| `fromSerialized`      | Wrap received bytes after `lite3.validate` (`fromSerializedUnchecked` skips it) |
-| `setNull/Bool/I64/F64/Str/Bytes/Obj/Arr` | Set a value by key      |
-| `getBool/I64/F64/Str/Bytes/Obj/Arr`       | Get a value by key      |
-| `getType` / `exists`  | Query type or existence of a key (`Error!`) |
-| `getValue`            | Get value as a `Value` tagged union        |
-| `getStrCopy` / `getBytesCopy` | Copy string/bytes into caller buffer (safe) |
-| `arrAppend*`          | Append values to an array                  |
-| `arrGet*`             | Get values from an array by index          |
-| `arrGetStrCopy` / `arrGetBytesCopy` | Copy array string/bytes into caller buffer |
-| `count`               | Count entries in an object or array        |
-| `iterate`             | Create an iterator                         |
-| `jsonDecode`          | Decode JSON into a buffer (`jsonDecodeDiagnostics` also reports the error position) |
-| `jsonEncode`          | Encode buffer contents to JSON (`JsonString`) |
-| `jsonEncodePretty`    | Encode to pretty-printed JSON (`JsonString`) |
-| `jsonEncodeBuf`       | Encode JSON into a caller-supplied buffer  |
+| Method | Description |
+|---|---|
+| `get(T, at, key)` / `arrGet(T, arr, index)` | Typed read (`error.TypeMismatch`, `error.IntegerOverflow`) |
+| `getValue` / `arrValue` | Read as `Value` |
+| `getObject` / `getArray` / `arrGetObject` / `arrGetArray` | Nested container Offset |
+| `typeOf`, `has`, `count`, `containerType`, `rootType` | Queries |
+| `objectIterator` / `arrayIterator` | Iteration |
+| `writeJson(at, writer, options)` / `jsonAlloc(gpa, at, options)` / `{f}` | JSON encoding |
 
-### Context API
+### Writing (Buffer, Document, ManagedDocument)
 
-The Context API manages memory automatically via lite3's internal C allocator (`malloc/free`) and exposes the same value/query/array methods as `Buffer`.
-Lifecycle methods are context-specific:
+The same methods on all three; `Document`'s take the allocator first.
 
-- `init` / `initWithSize` / `initFromBuf` to construct a context (`initFromBuf` and `importFromBuf` validate; `*Unchecked` variants skip it)
-- `resetObj` / `resetArr` to reset the root container type
-- `deinit` to release resources (idempotent)
+| Method | Description |
+|---|---|
+| `set(at, key, value)` | Insert or replace a scalar |
+| `setObject` / `setArray` | Insert or replace with an empty container; returns its Offset |
+| `append(arr, value)` / `appendObject` / `appendArray` | Append to an array |
+| `arrSet(arr, index, value)` / `arrSetObject` / `arrSetArray` | Replace element `index` (`index == count` appends) |
+| `reset(root_type)` | Make the document an empty object or array |
+| `slice()` / `capacity()` | Serialized bytes; capacity |
 
-### ManagedContext API
+Constructors: `Buffer.init(mem, root_type)`, `Buffer.fromBytes(mem, len)`, `Buffer.fromJson(gpa, mem, json, diag)`; `Document.init(gpa, root_type)`, `initOptions(gpa, .{ .root, .initial_capacity, .max_capacity })`, `fromBytes(gpa, bytes)`, `fromJson(gpa, json, .{ .max_capacity, .diagnostics })`. Every constructor that takes bytes validates them unless its name ends in `Unchecked`.
 
-`ManagedContext` mirrors the operational API of `Context`, but allocation is explicit through a caller-provided Zig allocator:
+`Document` also has `reserve`, `shrinkToFit`, `importBytes`, `decodeJson` (replaces the content; unchanged on error), `clone` and `compact` (rewrites the document without the space left by overwritten values — lite3 never reclaims it in place).
 
-- `init(allocator)` / `initWithCapacity(allocator, n)` / `initWithOptions(allocator, .{ .initial_capacity, .max_capacity })` / `initFromBuf(allocator, buf)`
-- Mutating operations auto-grow on `Error.NoBufferSpace`, up to `max_capacity`
-- `deinit` releases allocator-owned memory (idempotent)
-
-### ExternalContext API
-
-`ExternalContext` also uses Zig allocators, but it does not store one internally:
-
-- `init(allocator)` / `initWithCapacity(allocator, n)` / `initWithOptions(allocator, options)` / `initFromBuf(allocator, buf)`
-- Pass allocator only to grow-capable operations (`set*`, `arrAppend*`, `importFromBuf`, `jsonDecode`)
-- `deinit(allocator)` requires the same allocator used for init/growth
+A write that fails leaves a valid document behind. For a `Document`, a failed allocation leaves the document as it was before the call.
 
 ## Project structure
 
 ```
 lite3-zig/
-├── build.zig           # Zig build system
-├── build.zig.zon       # Package metadata
-├── Justfile            # Task automation
-├── .mise.toml          # Dev environment (Zig 0.17.0)
+├── build.zig, build.zig.zon, Justfile, .mise.toml
 ├── src/
-│   ├── lite3.zig       # Zig wrapper module
-│   ├── lite3_shim.c    # C shim for inline functions
-│   ├── lite3_shim.h    # C shim header
-│   ├── lite3_json_disabled.c # JSON stubs for -Djson=false
-│   ├── bench.zig       # Benchmarks
-│   └── tests.zig       # Comprehensive test suite
+│   ├── lite3.zig           # The module: View, Buffer, Document, JSON encoder
+│   ├── validate.zig        # Document validation (validate, validateStrict)
+│   ├── lite3_shim.{c,h}    # C shim: B-tree inserts, JSON decoding
+│   ├── lite3_json.c        # yyjson + lite3 JSON decoder as one translation unit
+│   ├── lite3_json_disabled.c
+│   ├── *_tests.zig         # API, validation, regression, property and fuzz tests
+│   ├── testdata/           # Golden fixtures
+│   ├── bench.zig, bench_raw.c
 ├── examples/
-│   ├── basic.zig          # Basic usage example
-│   └── json_roundtrip.zig # JSON encode/decode example
+├── scripts/update-vendor.sh
 └── vendor/
-    └── lite3/          # Vendored upstream sources (github.com/fastserial/lite3)
+    ├── lite3/              # Vendored upstream sources (github.com/fastserial/lite3)
+    └── patches/            # Local fixes applied on top
 ```
 
 ## Development
@@ -260,34 +230,27 @@ The local workflow intentionally mirrors the existing CI commands on Linux so it
 
 ### Untrusted input
 
-Serialized documents and JSON from outside your program are supported input. Constructors that take serialized bytes run `lite3.validate` first; `lite3.validateStrict` additionally guarantees a document stays valid under writes. Bound memory with `initWithOptions(.., .{ .max_capacity = n })`. See [SECURITY.md](SECURITY.md) for the exact guarantees and known limitations (hash flooding, key length, lossy JSON round-trips).
+Serialized documents and JSON from outside your program are supported input. Constructors that take serialized bytes run `lite3.validate` first; `lite3.validateStrict` additionally guarantees a document stays valid under writes. Bound memory with `Document.initOptions(gpa, .{ .max_capacity = n })` or `fromJson(.., .{ .max_capacity = n })`. See [SECURITY.md](SECURITY.md) for the exact guarantees and known limitations (hash flooding, lossy JSON round trips).
 
-### Dangling pointers
+### Lifetimes
 
-Methods that return string or byte slices (`getStr`, `getBytes`, `arrGetStr`, `arrGetBytes`) return pointers **directly into the underlying buffer**. These slices are invalidated by:
+Strings, bytes and keys returned by reads point into the document. They are valid until the next write to that document (a write may overwrite them in place, and a `Document` may move its memory). Views and iterators detect this and return `error.StaleView`; slices you already hold cannot, so copy what you need to keep before writing.
 
-- **Any mutation** to the same buffer (Buffer API)
-- **Any mutation** to the context (Context API), since the context may reallocate its internal buffer
+Writing a value or key that was read from the same document is supported: it is copied aside first (for a `Buffer`, up to `Buffer.alias_scratch_len` bytes of value).
 
-To safely retain a value across mutations, use the copy variants:
-
-```zig
-var dest: [256]u8 = undefined;
-const safe = try buf.getStrCopy(lite3.root, "key", &dest);
-// safe remains valid after mutations
-```
-
-The copy variants are: `getStrCopy`, `getBytesCopy`, `arrGetStrCopy`, `arrGetBytesCopy`.
+A `Document` must not be copied by value while both copies are used: they would share memory. Use `clone`.
 
 ### Thread safety
 
-A document may be read from several threads at once; any write needs exclusive access (e.g. a `Mutex` or `RwLock`). Iterators are invalidated by any mutation.
+A document may be read from several threads at once; any write needs exclusive access (e.g. a `Mutex` or `RwLock`).
 
 ## Architecture notes
 
-### C shim layer
+### Reads in Zig, writes in C
 
-Lite³ makes heavy use of GNU C extensions (statement expressions, `__builtin_prefetch`) and C patterns (flexible array members, `volatile` casts) that Zig's `translate-c` cannot handle. Instead of rewriting the upstream API, a thin C shim (`src/lite3_shim.c`) wraps every inline function as a proper `extern` function, giving Zig clean function pointers to call.
+Reads (lookup with lite3's hash probing, iteration, JSON encoding) are written in Zig against the documented format, so they need no C calls and check every offset against the document's bounds. Writes need lite3's B-tree insertion and node splitting, which a small C shim (`src/lite3_shim.c`) exposes as two functions; it maps errors to status codes inside C, so the Zig side never reads `errno`. JSON decoding runs yyjson through the shim with a Zig allocator.
+
+Performance (`zig build bench`): reads are faster than lite3's C getters; writes cost roughly 15–20% more instructions than calling lite3's C macros directly, from the type and lifetime checks.
 
 ### Build optimization
 

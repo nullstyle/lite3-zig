@@ -19,11 +19,11 @@ every supported target and optimize mode.
 
 ### Untrusted lite3 bytes
 
-The constructors that take serialized bytes — `Buffer.fromSerialized`,
-`Context.initFromBuf`/`importFromBuf`, `ManagedContext.initFromBuf`/
-`importFromBuf`, `ExternalContext.initFromBuf`/`importFromBuf` — run
-`lite3.validate` first and return `error.CorruptData` if it fails. A rejected
-import leaves the existing document unchanged.
+The functions that take serialized bytes — `View.fromBytes`,
+`Buffer.fromBytes`, `Document.fromBytes`/`importBytes` and their
+`ManagedDocument` equivalents — run `lite3.validate` first and return
+`error.CorruptData` if it fails. A rejected import leaves the existing
+document unchanged.
 
 For a document that passed `validate`, **reading and writing it through the
 public API**:
@@ -43,12 +43,12 @@ documents from untrusted sources, call `lite3.validateStrict(gpa, bytes)`,
 which also proves no byte is used twice; a document that passes stays valid
 under any sequence of writes. It needs `len / 8` bytes of scratch memory.
 
-The `*Unchecked` constructors (`fromSerializedUnchecked`,
-`initFromBufUnchecked`, `importFromBufUnchecked`) skip validation and are
-**only for bytes your program produced itself**. They are not covered by the
-guarantee above, although the wrapper still bounds-checks offsets, returned
-slices and iteration counts, and the lite3 C library bounds-checks its own
-reads.
+The `*Unchecked` variants skip validation and are **only for bytes your
+program produced itself**. They are not covered by the guarantee above. Reads
+still never leave the document's bytes (the Zig reader bounds-checks every
+offset, slice and iteration count and returns `error.CorruptData`), but
+writes to an unvalidated document go through lite3's C insertion code, which
+trusts the structure it is given.
 
 ### Untrusted JSON
 
@@ -56,16 +56,18 @@ JSON is parsed by the bundled yyjson (strict RFC 8259: UTF-8 validated, no
 comments or trailing commas) and converted by lite3's decoder. Every document
 the decoder produces passes `validate` (this is fuzzed). In addition:
 
-- Nesting deeper than 32 levels is rejected (`error.InvalidArgument`), so
+- Nesting deeper than 32 levels is rejected (`error.NestingTooDeep`), so
   decoding cannot exhaust the stack.
-- Keys containing `\u0000` are rejected rather than silently truncated.
-- A root that is not an object or array is rejected.
+- Keys containing `\u0000` are rejected (`error.InvalidKey`) rather than
+  silently truncated.
+- A root that is not an object or array is rejected (`error.InvalidRoot`).
 - Duplicate keys: the last one wins.
-- Growth is bounded only by `max_capacity`. For untrusted input use
-  `ManagedContext.initWithOptions` / `ExternalContext.initWithOptions` with a
-  `max_capacity`; decoding past it fails with `error.NoBufferSpace`. (The
-  C-heap `Context` has no such limit and grows to 4 GiB.)
-- `jsonDecodeDiagnostics` reports the position of a syntax error.
+- The parse tree is allocated with your allocator, so its memory is yours to
+  bound. The decoded document is bounded by the Buffer's size or by
+  `fromJson(.., .{ .max_capacity = n })`; past it, decoding fails with
+  `error.NoSpaceLeft`.
+- `JsonDiagnostics` reports the position and reason of a syntax error.
+- `Document.decodeJson` leaves the document unchanged if decoding fails.
 
 ### Known limitations
 
@@ -75,22 +77,33 @@ the decoder produces passes `validate` (this is fuzzed). In addition:
   `error.KeyCollision` (lookups of absent keys correctly return `NotFound`).
   Each colliding lookup costs up to 128 probes. A seeded hash would change the
   wire format and has to happen upstream.
-- **Keys longer than `lite3.max_key_len` (255 bytes)** are valid in documents
-  but can only be reached through iteration, not through the get/set methods.
+- **Long keys.** Any key length lite3 supports can be read. A `Buffer`
+  writes keys longer than `lite3.max_stack_key_len` (1023 bytes) only when
+  they are NUL-terminated (`[:0]const u8` or `lite3.Key`) and not inside the
+  document; otherwise it returns `error.KeyTooLong`. `Document` copies such
+  keys to the heap.
 - **JSON round-trips are lossy**: bytes values become base64 strings, integers
   above `maxInt(i64)` become floats, and NaN/±Inf cannot be encoded.
-- **Borrowed data.** Slices returned by getters and iterators, and `Offset`
-  values, point into the document and are invalidated by any write that
-  grows or rearranges it. Using a stale slice is a use-after-free in your
-  program, not something validation can prevent. The upcoming 0.1.0 API
-  redesign addresses this.
+- **Borrowed data.** Slices returned by reads point into the document and
+  are invalid after the next write to it. `View`s and iterators detect this
+  (`error.StaleView`); a slice you kept does not, and using it is a
+  use-after-free in your program. Copying a `Document` struct by value
+  shares its memory between the copies and is not detected either; use
+  `clone`.
+- **Encoding unvalidated content.** `validate` checks structure, not
+  content: a string may hold invalid UTF-8 and a float may be NaN. The JSON
+  encoder reports these as `error.InvalidUtf8` / `error.NonFiniteNumber`.
 - **Thread safety.** A document may be read from several threads at once;
   any write requires exclusive access.
 
 ## How this is tested
 
-- Regression tests for every memory-safety bug found in review, each shown to
-  fail without its fix (`src/regression_tests.zig`).
+- Regression tests for every memory-safety bug found in review
+  (`src/regression_tests.zig`, `src/api_tests.zig`).
+- A model-based test that checks random write sequences against a reference
+  model on every document type, allocation-failure tests for every
+  allocating operation, and a byte-exact golden fixture
+  (`src/property_tests.zig`).
 - `validate` tests including every single-byte corruption of a sample document
   (`src/validate_tests.zig`).
 - Coverage-guided fuzz targets for mutated documents, arbitrary bytes, JSON

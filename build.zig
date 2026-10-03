@@ -119,6 +119,9 @@ pub fn build(b: *std.Build) void {
         const mod = b.createModule(.{ .target = target, .optimize = c_optimize, .link_libc = true });
         mod.addIncludePath(b.path("vendor/lite3/include"));
         mod.addCSourceFile(.{ .file = b.path(t.path), .flags = &vendor_flags });
+        // lite3's C-heap context API is not part of the library (Document
+        // replaces it), but its upstream tests still exercise it.
+        mod.addCSourceFile(.{ .file = b.path("vendor/lite3/src/ctx_api.c"), .flags = &vendor_flags });
         mod.linkLibrary(lite3.lib);
         const exe = b.addExecutable(.{ .name = std.fs.path.stem(t.path), .root_module = mod });
         const run = b.addRunArtifact(exe);
@@ -220,7 +223,6 @@ fn addLite3(b: *std.Build, config: Config, visibility: enum { public, private })
     lite3_mod.addCSourceFiles(.{
         .files = &.{
             "vendor/lite3/src/lite3.c",
-            "vendor/lite3/src/ctx_api.c",
             "vendor/lite3/src/debug.c",
         },
         .flags = &vendor_flags,

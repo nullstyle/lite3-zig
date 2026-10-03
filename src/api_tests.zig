@@ -519,3 +519,85 @@ pub fn buildSample(buf: *lite3.Buffer) !void {
     try buf.set(root, "swap", "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789");
     _ = try buf.setObject(root, "swap");
 }
+
+test "JSON encoding escapes every control character" {
+    var mem: [1024]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.init(&mem, .array);
+    try buf.append(root, "\x01\x0f\x10\x1f\x7f");
+    const json = try buf.view().jsonAlloc(testing.allocator, root, .{});
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings("[\"\\u0001\\u000f\\u0010\\u001f\x7f\"]", json);
+}
+
+test "JSON encoding: nesting limit is exact" {
+    inline for (.{ lite3.Container.object, lite3.Container.array }) |kind| {
+        const mem = try testing.allocator.alignedAlloc(u8, .@"4", 1 << 16);
+        defer testing.allocator.free(mem);
+        var buf = try lite3.Buffer.init(mem, kind);
+        var at = root;
+        var sink: std.Io.Writer.Discarding = .init(&.{});
+        // The root is level 1; max_nesting_depth levels encode, one more does not.
+        for (1..lite3.max_nesting_depth + 1) |level| {
+            if (level == lite3.max_nesting_depth) {
+                try buf.view().writeJson(root, &sink.writer, .{});
+            }
+            at = switch (kind) {
+                .object => try buf.setObject(at, "n"),
+                .array => try buf.appendArray(at),
+            };
+        }
+        // Built through a Buffer, which does not limit depth; validate does.
+        try testing.expectError(error.CorruptData, lite3.validate(buf.slice()));
+        try testing.expectError(error.NestingTooDeep, buf.view().writeJson(root, &sink.writer, .{}));
+    }
+}
+
+test "a value that partly overlaps the document is copied before writing" {
+    // The value starts before the Buffer's memory and ends inside its root
+    // node, which every write modifies.
+    var backing: [4096]u8 align(4) = undefined;
+    @memset(backing[0..8], 'x');
+    var buf = try lite3.Buffer.init(backing[8..], .object);
+    try buf.set(root, "a", 1);
+    const value = backing[0..40];
+    var expected: [40]u8 = undefined;
+    @memcpy(&expected, value);
+    try buf.set(root, "k", lite3.bytes(value));
+    try testing.expectEqualSlices(u8, &expected, (try buf.view().get(lite3.Bytes, root, "k")).data);
+}
+
+test "a NUL-terminated key that lies inside the document is copied before writing" {
+    inline for (util.backends) |B| {
+        var d = try B.init(.object);
+        defer d.deinit();
+        try d.set(root, "target", 1);
+        // Keys are stored NUL-terminated, so a key slice read back from the
+        // document can be used as a [:0]const u8 that points into it.
+        var it = try d.view().objectIterator(root);
+        const k = (try it.next()).?.key;
+        const z: [:0]const u8 = k.ptr[0..k.len :0];
+        // A longer value does not fit in place, so the entry is rewritten.
+        try d.set(root, z, "a value much longer than the eight bytes of an integer");
+        try lite3.validate(d.slice());
+        try testing.expectEqualStrings("a value much longer than the eight bytes of an integer", try d.view().get([]const u8, root, "target"));
+        try testing.expectEqual(@as(u32, 1), try d.view().count(root));
+    }
+}
+
+test "a container type byte at a misaligned offset is corrupt" {
+    // Unvalidated bytes: a string value whose type byte is changed to
+    // "object" must not be read as a container unless it is 4-aligned.
+    for (1..5) |key_len| {
+        var mem: [1024]u8 align(4) = @splat(0);
+        var buf = try lite3.Buffer.init(&mem, .object);
+        const k = util.repeat("k", 4)[0..key_len];
+        try buf.set(root, k, &util.repeat("s", 120));
+        const at = std.mem.indexOf(u8, buf.slice(), "ssss").? - 5; // type byte
+        if (at % 4 == 0) continue;
+        mem[at] = 6;
+        const v = lite3.View.fromBytesUnchecked(buf.slice());
+        try testing.expectError(error.CorruptData, v.getValue(root, k));
+        return;
+    }
+    return error.TestNoMisalignedValue;
+}

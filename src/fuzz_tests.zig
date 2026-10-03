@@ -202,8 +202,8 @@ fn fuzzOperations(_: void, s: *Smith) !void {
         };
         result catch |err| switch (err) {
             // Wrong container kind for the operation, index past the end,
-            // or full.
-            error.TypeMismatch, error.IndexOutOfBounds, error.NoSpaceLeft => {},
+            // full, or an Offset whose container was overwritten.
+            error.TypeMismatch, error.IndexOutOfBounds, error.NoSpaceLeft, error.InvalidOffset => {},
             else => return err,
         };
         // Offsets of containers that were later overwritten stay in the
