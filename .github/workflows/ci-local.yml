@@ -47,7 +47,7 @@ jobs:
           mise exec -- ./zig-out/bin/basic
           mise exec -- ./zig-out/bin/json_roundtrip
 
-  unsupported-options:
+  lto:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,17 +58,8 @@ jobs:
       - name: Install tools with mise
         run: mise install
 
-      - name: Verify -Dlto=true fails with clear message
-        run: |
-          set +e
-          output=$(mise exec -- zig build test -Dlto=true 2>&1)
-          status=$?
-          echo "$output"
-          if [ "$status" -eq 0 ]; then
-            echo "Expected -Dlto=true to fail."
-            exit 1
-          fi
-          echo "$output" | grep -q "currently unsupported in lite3-zig"
+      - name: Test with LTO (ReleaseFast)
+        run: mise exec -- zig build test -Dlto=true -Doptimize=ReleaseFast
 
   cross-compile:
     runs-on: ubuntu-latest

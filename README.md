@@ -97,8 +97,11 @@ zig build -Doptimize=ReleaseFast
 | Option             | Default | Description                                  |
 |--------------------|---------|----------------------------------------------|
 | `-Djson=false`     | `true`  | Disable JSON backend; JSON APIs return `error.InvalidArgument` |
-| `-Derror-messages` | `false` | Enable lite3 debug error messages to stdout  |
-| `-Dlto=true`       | `false` | Currently unsupported (build fails fast with a clear message) |
+| `-Derror-messages` | `false` | Print lite3 debug error messages to stderr   |
+| `-Dlto=true`       | `false` | Link-time optimization across Zig and C (inlines shim calls; uses the LLVM backend for every artifact) |
+| `-Dc-optimize=…`   | same as `-Doptimize` | Optimize mode for the C library. In Debug/ReleaseSafe the C code runs under UBSan |
+
+Build steps: `test`, `examples`, `bench` (always ReleaseFast), `check` (compile everything without running), `lint-c` (project C sources with `-Werror`).
 
 ### Building examples
 
