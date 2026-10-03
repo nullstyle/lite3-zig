@@ -291,3 +291,56 @@ test "SEC-7: {\"\":null} decodes, reads back and re-encodes" {
     defer json.deinit();
     try testing.expectEqualStrings("{\"\":null}", json.slice());
 }
+
+/// The `i`-th of 256 distinct 16-byte keys that all share one DJB2 hash:
+/// "Aa" and "B@" collide (65*33+97 == 66*33+64), and so does any
+/// concatenation of equally long colliding blocks.
+fn collidingKey(buf: *[16]u8, i: usize) []const u8 {
+    for (0..8) |bit| @memcpy(buf[2 * bit ..][0..2], if ((i >> @intCast(bit)) & 1 == 0) "Aa" else "B@");
+    return buf;
+}
+
+test "SEC-12/CSH-17: hash-probe exhaustion is KeyCollision, lookups stay NotFound" {
+    const mem = try testing.allocator.alignedAlloc(u8, .@"4", 1 << 16);
+    defer testing.allocator.free(mem);
+    var buf = try lite3.Buffer.initObj(mem);
+    var kb: [16]u8 = undefined;
+    // 128 probe slots: attempts 0..127.
+    for (0..128) |i| try buf.setI64(lite3.root, collidingKey(&kb, i), @intCast(i));
+    try testing.expectError(lite3.Error.KeyCollision, buf.setI64(lite3.root, collidingKey(&kb, 128), 0));
+    try testing.expectError(lite3.Error.NotFound, buf.getI64(lite3.root, collidingKey(&kb, 200)));
+    try testing.expectEqual(false, try buf.exists(lite3.root, collidingKey(&kb, 200)));
+    for (0..128) |i| try testing.expectEqual(@as(i64, @intCast(i)), try buf.getI64(lite3.root, collidingKey(&kb, i)));
+    try lite3.validate(buf.data());
+}
+
+test "ALC-5: max_capacity bounds growth" {
+    const a = testing.allocator;
+    try testing.expectError(lite3.Error.InvalidArgument, lite3.ManagedContext.initWithOptions(a, .{ .max_capacity = 64 }));
+    try testing.expectError(lite3.Error.InvalidArgument, lite3.ManagedContext.initWithOptions(a, .{ .initial_capacity = 8192, .max_capacity = 4096 }));
+
+    var m = try lite3.ManagedContext.initWithOptions(a, .{ .max_capacity = 4096 });
+    defer m.deinit();
+    try testing.expectError(lite3.Error.NoBufferSpace, m.setStr(lite3.root, "big", &(@as([5000]u8, @splat('x')))));
+    try testing.expect(m.capacity() <= 4096);
+    try m.setStr(lite3.root, "small", "fits");
+    try testing.expectEqualStrings("fits", try m.getStr(lite3.root, "small"));
+
+    var e = try lite3.ExternalContext.initWithOptions(a, .{ .initial_capacity = 1024, .max_capacity = 2048 });
+    defer e.deinit(a);
+    try testing.expectError(lite3.Error.NoBufferSpace, e.setBytes(a, lite3.root, "big", &(@as([3000]u8, @splat(1)))));
+    try testing.expect(e.capacity() <= 2048);
+
+    if (lite3.json_enabled) {
+        // Untrusted JSON cannot make the document grow past the limit.
+        var j = try lite3.ManagedContext.initWithOptions(a, .{ .max_capacity = 4096 });
+        defer j.deinit();
+        var json: std.ArrayList(u8) = .empty;
+        defer json.deinit(a);
+        try json.append(a, '[');
+        for (0..2000) |_| try json.appendSlice(a, "1,");
+        try json.appendSlice(a, "1]");
+        try testing.expectError(lite3.Error.NoBufferSpace, j.jsonDecode(json.items));
+        try testing.expect(j.capacity() <= 4096);
+    }
+}

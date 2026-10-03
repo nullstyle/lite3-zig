@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: lite3-zig <noreply@anthropic.com>
 Date: Sat, 3 Oct 2026 07:20:56 +0000
-Subject: [PATCH 6/8] Keep iterator prefetch indexes inside kv_ofs[]
+Subject: [PATCH] Keep iterator prefetch indexes inside kv_ofs[]
 
 kv_ofs[] has LITE3_NODE_KEY_COUNT_MAX (7) elements, but the prefetch
 hints masked the index with LITE3_NODE_KEY_COUNT_MASK (7), allowing

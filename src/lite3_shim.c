@@ -22,6 +22,7 @@ static int status_from_errno(int e)
     case ENOMEM: return LITE3ZIG_E_NO_MEMORY;
     case EOVERFLOW: return LITE3ZIG_E_OVERFLOW;
     case EIO: return LITE3ZIG_E_JSON_WRITE;
+    case ENOSPC: return LITE3ZIG_E_KEY_COLLISION;
     default: return LITE3ZIG_E_UNKNOWN;
     }
 }

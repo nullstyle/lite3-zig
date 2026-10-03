@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: lite3-zig <noreply@anthropic.com>
 Date: Sat, 3 Oct 2026 07:21:20 +0000
-Subject: [PATCH 7/8] Guard base64 conversion against int overflow; drop puts()
+Subject: [PATCH] Guard base64 conversion against int overflow; drop puts()
 
 nibble_base64() takes an int length and computes 4 * (len + pad) in an
 int, which overflows for bytes values above ~512 MiB and under-allocates

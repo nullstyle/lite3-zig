@@ -33,6 +33,7 @@ enum {
     LITE3ZIG_E_OVERFLOW = 7,      /* EOVERFLOW: size arithmetic overflow */
     LITE3ZIG_E_JSON_SYNTAX = 8,   /* JSON input could not be parsed */
     LITE3ZIG_E_JSON_WRITE = 9,    /* JSON output could not be produced (e.g. NaN/Inf, invalid UTF-8) */
+    LITE3ZIG_E_KEY_COLLISION = 11,/* ENOSPC: every hash probe slot for the key holds another key */
     LITE3ZIG_E_UNKNOWN = 10,      /* any other errno, or errno not set */
 };
 

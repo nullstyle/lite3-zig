@@ -12,3 +12,4 @@ patches:
   - 0006-Keep-iterator-prefetch-indexes-inside-kv_ofs.patch
   - 0007-Guard-base64-conversion-against-int-overflow-drop-pu.patch
   - 0008-Print-error-messages-to-stderr-fix-size_t-format-spe.patch
+  - 0009-Report-hash-probe-exhaustion-distinctly.patch

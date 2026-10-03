@@ -88,6 +88,11 @@ pub const Error = error{
     OutOfMemory,
     /// The value was used after deinit or before proper initialization.
     InvalidState,
+    /// The key cannot be inserted: every slot in its hash probe sequence
+    /// (128) already holds a different key. lite3's key hash is unseeded, so
+    /// an attacker who controls key names can cause this deliberately; see
+    /// SECURITY.md.
+    KeyCollision,
 };
 
 /// Translate a negative shim return value (`-LITE3ZIG_E_*`) into a Zig error.
@@ -103,6 +108,7 @@ fn translateError(ret: c_int) Error {
         // data or an Offset that does not belong to this document.
         c.LITE3ZIG_E_CORRUPT, c.LITE3ZIG_E_OUT_OF_BOUNDS => Error.CorruptData,
         c.LITE3ZIG_E_NO_MEMORY => Error.OutOfMemory,
+        c.LITE3ZIG_E_KEY_COLLISION => Error.KeyCollision,
         else => Error.Unexpected,
     };
 }
@@ -1236,10 +1242,22 @@ pub const ManagedContext = struct {
     allocator: std.mem.Allocator,
     storage: ?[]align(4) u8,
     inner: Buffer,
+    /// Growth beyond this many bytes fails with `error.NoBufferSpace`.
+    /// Set it through `initWithOptions` to bound memory use, e.g. when
+    /// decoding untrusted JSON.
+    max_capacity: usize = capacity_limit,
 
     /// Matches lite3_context_api.h default minimum context size.
     pub const default_capacity: usize = 1024;
-    const max_capacity: usize = std.math.maxInt(u32);
+    /// Largest capacity lite3 supports (its offsets are 32-bit).
+    pub const capacity_limit: usize = std.math.maxInt(u32);
+
+    pub const Options = struct {
+        /// Initial allocation (at least `default_capacity`, at most `max_capacity`).
+        initial_capacity: usize = default_capacity,
+        /// Upper bound for growth; at most `capacity_limit`.
+        max_capacity: usize = capacity_limit,
+    };
 
     const dead_storage: [4]u8 align(4) = .{ 0, 0, 0, 0 };
 
@@ -1259,23 +1277,18 @@ pub const ManagedContext = struct {
         if (self.storage == null) return Error.InvalidState;
     }
 
-    fn clampCapacity(requested_capacity: usize) Error!usize {
-        if (requested_capacity > max_capacity) return Error.InvalidArgument;
-        return @max(requested_capacity, default_capacity);
-    }
-
-    fn nextCapacity(current: usize) Error!usize {
-        if (current >= max_capacity) return Error.NoBufferSpace;
-        if (current > max_capacity / 4) return max_capacity;
-        const grown = std.math.mul(usize, current, 4) catch max_capacity;
+    fn nextCapacity(current: usize, limit: usize) Error!usize {
+        if (current >= limit) return Error.NoBufferSpace;
+        if (current > limit / 4) return limit;
+        const grown = std.math.mul(usize, current, 4) catch limit;
         if (grown <= current) return Error.NoBufferSpace;
-        return @min(grown, max_capacity);
+        return @min(grown, limit);
     }
 
     fn grow(self: *ManagedContext) Error!void {
         try self.ensureAlive();
         const old_mem = self.storageSlice();
-        const new_cap = try nextCapacity(old_mem.len);
+        const new_cap = try nextCapacity(old_mem.len, self.max_capacity);
         const new_mem = self.allocator.realloc(old_mem, new_cap) catch return Error.OutOfMemory;
         self.storage = new_mem;
         self.inner.buf = new_mem.ptr;
@@ -1284,7 +1297,7 @@ pub const ManagedContext = struct {
 
     fn ensureCapacity(self: *ManagedContext, required: usize) Error!void {
         try self.ensureAlive();
-        if (required > max_capacity) return Error.InvalidArgument;
+        if (required > self.max_capacity) return Error.NoBufferSpace;
         while (self.storageSlice().len < required) {
             try self.grow();
         }
@@ -1310,7 +1323,14 @@ pub const ManagedContext = struct {
 
     /// Initialize a new managed context with explicit initial capacity.
     pub fn initWithCapacity(allocator: std.mem.Allocator, requested_capacity: usize) Error!ManagedContext {
-        const cap = try clampCapacity(requested_capacity);
+        return initWithOptions(allocator, .{ .initial_capacity = requested_capacity });
+    }
+
+    /// Initialize with explicit initial capacity and growth limit.
+    pub fn initWithOptions(allocator: std.mem.Allocator, options: Options) Error!ManagedContext {
+        if (options.max_capacity > capacity_limit or options.max_capacity < node_size) return Error.InvalidArgument;
+        if (options.initial_capacity > options.max_capacity) return Error.InvalidArgument;
+        const cap = @min(@max(options.initial_capacity, default_capacity), options.max_capacity);
         const mem = allocator.alignedAlloc(u8, .@"4", cap) catch return Error.OutOfMemory;
         errdefer allocator.free(mem);
         const inner = try Buffer.initObj(mem);
@@ -1318,6 +1338,7 @@ pub const ManagedContext = struct {
             .allocator = allocator,
             .storage = mem,
             .inner = inner,
+            .max_capacity = options.max_capacity,
         };
     }
 
@@ -1609,10 +1630,22 @@ pub const ManagedContext = struct {
 pub const ExternalContext = struct {
     storage: ?[]align(4) u8,
     inner: Buffer,
+    /// Growth beyond this many bytes fails with `error.NoBufferSpace`.
+    /// Set it through `initWithOptions` to bound memory use, e.g. when
+    /// decoding untrusted JSON.
+    max_capacity: usize = capacity_limit,
 
     /// Matches lite3_context_api.h default minimum context size.
     pub const default_capacity: usize = 1024;
-    const max_capacity: usize = std.math.maxInt(u32);
+    /// Largest capacity lite3 supports (its offsets are 32-bit).
+    pub const capacity_limit: usize = std.math.maxInt(u32);
+
+    pub const Options = struct {
+        /// Initial allocation (at least `default_capacity`, at most `max_capacity`).
+        initial_capacity: usize = default_capacity,
+        /// Upper bound for growth; at most `capacity_limit`.
+        max_capacity: usize = capacity_limit,
+    };
 
     const dead_storage: [4]u8 align(4) = .{ 0, 0, 0, 0 };
 
@@ -1632,23 +1665,18 @@ pub const ExternalContext = struct {
         if (self.storage == null) return Error.InvalidState;
     }
 
-    fn clampCapacity(requested_capacity: usize) Error!usize {
-        if (requested_capacity > max_capacity) return Error.InvalidArgument;
-        return @max(requested_capacity, default_capacity);
-    }
-
-    fn nextCapacity(current: usize) Error!usize {
-        if (current >= max_capacity) return Error.NoBufferSpace;
-        if (current > max_capacity / 4) return max_capacity;
-        const grown = std.math.mul(usize, current, 4) catch max_capacity;
+    fn nextCapacity(current: usize, limit: usize) Error!usize {
+        if (current >= limit) return Error.NoBufferSpace;
+        if (current > limit / 4) return limit;
+        const grown = std.math.mul(usize, current, 4) catch limit;
         if (grown <= current) return Error.NoBufferSpace;
-        return @min(grown, max_capacity);
+        return @min(grown, limit);
     }
 
     fn grow(self: *ExternalContext, allocator: std.mem.Allocator) Error!void {
         try self.ensureAlive();
         const old_mem = self.storageSlice();
-        const new_cap = try nextCapacity(old_mem.len);
+        const new_cap = try nextCapacity(old_mem.len, self.max_capacity);
         const new_mem = allocator.realloc(old_mem, new_cap) catch return Error.OutOfMemory;
         self.storage = new_mem;
         self.inner.buf = new_mem.ptr;
@@ -1657,7 +1685,7 @@ pub const ExternalContext = struct {
 
     fn ensureCapacity(self: *ExternalContext, allocator: std.mem.Allocator, required: usize) Error!void {
         try self.ensureAlive();
-        if (required > max_capacity) return Error.InvalidArgument;
+        if (required > self.max_capacity) return Error.NoBufferSpace;
         while (self.storageSlice().len < required) {
             try self.grow(allocator);
         }
@@ -1688,13 +1716,21 @@ pub const ExternalContext = struct {
 
     /// Initialize a new external context with explicit initial capacity.
     pub fn initWithCapacity(allocator: std.mem.Allocator, requested_capacity: usize) Error!ExternalContext {
-        const cap = try clampCapacity(requested_capacity);
+        return initWithOptions(allocator, .{ .initial_capacity = requested_capacity });
+    }
+
+    /// Initialize with explicit initial capacity and growth limit.
+    pub fn initWithOptions(allocator: std.mem.Allocator, options: Options) Error!ExternalContext {
+        if (options.max_capacity > capacity_limit or options.max_capacity < node_size) return Error.InvalidArgument;
+        if (options.initial_capacity > options.max_capacity) return Error.InvalidArgument;
+        const cap = @min(@max(options.initial_capacity, default_capacity), options.max_capacity);
         const mem = allocator.alignedAlloc(u8, .@"4", cap) catch return Error.OutOfMemory;
         errdefer allocator.free(mem);
         const inner = try Buffer.initObj(mem);
         return ExternalContext{
             .storage = mem,
             .inner = inner,
+            .max_capacity = options.max_capacity,
         };
     }
 

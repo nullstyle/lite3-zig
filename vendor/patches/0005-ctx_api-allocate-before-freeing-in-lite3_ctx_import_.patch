@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: lite3-zig <noreply@anthropic.com>
 Date: Sat, 3 Oct 2026 07:20:43 +0000
-Subject: [PATCH 5/8] ctx_api: allocate before freeing in
+Subject: [PATCH] ctx_api: allocate before freeing in
  lite3_ctx_import_from_buf()
 
 The old buffer was freed before malloc(); on allocation failure the

@@ -327,8 +327,9 @@ int lite3_get_impl(
 			}
 		}
 	}
-	LITE3_PRINT_ERROR("LITE3_HASH_PROBE_MAX LIMIT REACHED\n");
-	errno = EINVAL;
+	// Every probe slot held a different key, so this key is not present.
+	LITE3_PRINT_ERROR("KEY NOT FOUND (LITE3_HASH_PROBE_MAX SLOTS PROBED)\n");
+	errno = ENOENT;
 	return -1;
 }
 
@@ -819,8 +820,11 @@ insert_append:
 		LITE3_PRINT_DEBUG("OK\n");
 		return 0;
 	}
+	// Every probe slot holds a different key: no slot left for this one.
+	// Distinct from EINVAL so callers can tell (possibly adversarial) hash
+	// collisions from invalid arguments.
 	LITE3_PRINT_ERROR("LITE3_HASH_PROBE_MAX LIMIT REACHED\n");
-	errno = EINVAL;
+	errno = ENOSPC;
 	return -1;
 }
 

@@ -7,7 +7,9 @@
 # The vendored tree is always the pristine upstream allow-list below plus
 # every patch in vendor/patches/ (applied in lexical order). To change
 # vendored code, add or edit a patch and re-run this script; never edit
-# vendor/lite3/ by hand.
+# vendor/lite3/ by hand. Patches are kept as `git format-patch -N
+# --zero-commit --no-signature` output against the upstream commit; note
+# that several upstream files use CRLF line endings.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

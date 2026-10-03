@@ -1,8 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: lite3-zig <noreply@anthropic.com>
 Date: Sat, 3 Oct 2026 07:21:39 +0000
-Subject: [PATCH 8/8] Print error messages to stderr; fix size_t format
- specifier
+Subject: [PATCH] Print error messages to stderr; fix size_t format specifier
 
 With LITE3_ERROR_MESSAGES defined the library printed diagnostics to
 stdout, which corrupts the output of programs that use stdout for data.
