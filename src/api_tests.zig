@@ -601,3 +601,16 @@ test "a container type byte at a misaligned offset is corrupt" {
     }
     return error.TestNoMisalignedValue;
 }
+
+test "reserve and shrinkToFit make earlier views stale" {
+    var doc = try lite3.Document.init(testing.allocator, .object);
+    defer doc.deinit(testing.allocator);
+    try doc.set(testing.allocator, root, "a", "value");
+    var v = doc.view();
+    try doc.reserve(testing.allocator, 1 << 16);
+    try testing.expectError(error.StaleView, v.get([]const u8, root, "a"));
+    v = doc.view();
+    try doc.shrinkToFit(testing.allocator);
+    try testing.expectError(error.StaleView, v.get([]const u8, root, "a"));
+    try testing.expectEqualStrings("value", try doc.view().get([]const u8, root, "a"));
+}
