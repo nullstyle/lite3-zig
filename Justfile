@@ -35,9 +35,9 @@ examples:
 clean:
     rm -rf .zig-cache zig-out
 
-# Update vendored lite3 sources from upstream
-update-vendor:
-    @echo "Vendored sources are in vendor/lite3/. Update manually from upstream."
+# Re-vendor lite3 (pinned commit in vendor/lite3/UPSTREAM, or pass one) and apply vendor/patches
+update-vendor commit="":
+    scripts/update-vendor.sh {{commit}}
 
 # Run benchmarks
 bench:

@@ -22,7 +22,7 @@
 - **Zig 0.17.0** (pinned in `.mise.toml`)
 - A C11-capable toolchain (provided by Zig)
 
-The C source for lite3 is vendored directly in `vendor/lite3/` — no submodules needed.
+The C source for lite3 is vendored directly in `vendor/lite3/` — no submodules needed. `vendor/lite3/UPSTREAM` records the upstream commit, and local changes live as patches in `vendor/patches/`. Re-vendor with `scripts/update-vendor.sh` (or `just update-vendor`); never edit `vendor/lite3/` by hand.
 
 ## Quick start
 
@@ -235,7 +235,7 @@ just test             # Run tests
 just test-release     # Run tests with ReleaseSafe
 just test-no-json     # Run tests with JSON backend disabled
 just clean            # Remove build artifacts
-just update-vendor    # Update vendored lite3 sources
+just update-vendor    # Re-vendor lite3 and apply vendor/patches
 just act-local        # Run local CI in act
 
 ```
@@ -279,7 +279,7 @@ Buffer and Context are **not thread-safe**. Concurrent reads and writes require 
 
 ### C shim layer
 
-Lite³ makes heavy use of GNU C extensions (statement expressions, `__builtin_prefetch`) and C patterns (flexible array members, `volatile` casts) that Zig's `translate-c` cannot handle. Rather than patching the upstream library, a thin C shim (`src/lite3_shim.c`) wraps every inline function as a proper `extern` function, giving Zig clean function pointers to call.
+Lite³ makes heavy use of GNU C extensions (statement expressions, `__builtin_prefetch`) and C patterns (flexible array members, `volatile` casts) that Zig's `translate-c` cannot handle. Instead of rewriting the upstream API, a thin C shim (`src/lite3_shim.c`) wraps every inline function as a proper `extern` function, giving Zig clean function pointers to call.
 
 ### Build optimization
 

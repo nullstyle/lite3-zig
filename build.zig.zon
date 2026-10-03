@@ -14,5 +14,6 @@
         "vendor/lite3/src",
         "vendor/lite3/lib",
         "vendor/lite3/LICENSE",
+        "vendor/lite3/UPSTREAM",
     },
 }

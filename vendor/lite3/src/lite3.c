@@ -131,12 +131,18 @@ static inline int _verify_key(
 	size_t *restrict inout_ofs,     	// key entry offset (relative to *buf)
 	size_t *restrict out_key_tag_size)	// key tag size (optionally call with NULL)
 {
-	if (LITE3_UNLIKELY(LITE3_KEY_TAG_SIZE_MAX > buflen || *inout_ofs > buflen - LITE3_KEY_TAG_SIZE_MAX)) {
+	if (LITE3_UNLIKELY(LITE3_KEY_TAG_SIZE_MIN > buflen || *inout_ofs > buflen - LITE3_KEY_TAG_SIZE_MIN)) {
 		LITE3_PRINT_ERROR("KEY ENTRY OUT OF BOUNDS\n");
 		errno = EFAULT;
 		return -1;
 	}
 	size_t _key_tag_size = (size_t)((*((u8 *)(buf + *inout_ofs)) & LITE3_KEY_TAG_SIZE_MASK) + 1);
+	
+	if (LITE3_UNLIKELY(_key_tag_size > buflen || *inout_ofs > buflen - _key_tag_size)) {
+		LITE3_PRINT_ERROR("KEY ENTRY OUT OF BOUNDS\n");
+		errno = EFAULT;
+		return -1;
+	}
 	if (key_tag_size) {
 		if (key_tag_size != _key_tag_size) {
 			LITE3_PRINT_ERROR("KEY TAG SIZE DOES NOT MATCH\n");
@@ -243,9 +249,7 @@ int lite3_get_impl(
 		
 		lite3_key_data attempt_key = key_data;
 		attempt_key.hash = key_data.hash + attempt * attempt;
-		#ifdef LITE3_DEBUG
-			LITE3_PRINT_DEBUG("probe attempt: %u\thash: %u\n", attempt, attempt_key.hash);
-		#endif
+		// LITE3_PRINT_DEBUG("probe attempt: %u\thash: %u\n", attempt, attempt_key.hash);
 
 		struct node *restrict node = __builtin_assume_aligned((struct node *)(buf + ofs), LITE3_NODE_ALIGNMENT);
 
@@ -394,16 +398,18 @@ int lite3_iter_next(const unsigned char *buf, size_t buflen, lite3_iter *iter, l
 	size_t target_ofs = node->kv_ofs[iter->node_i[iter->depth]];
 
 	int ret;
-	if (type == LITE3_TYPE_OBJECT && out_key) {					// write back key if not NULL
+	if (type == LITE3_TYPE_OBJECT) {						// write back key if not NULL
 		size_t key_tag_size;
 		size_t key_start_ofs = target_ofs;
 		if ((ret = _verify_key(buf, buflen, NULL, 0, 0, &target_ofs, &key_tag_size)) < 0)
 			return ret;
-		out_key->gen = iter->gen;
-		out_key->len = 0;
-		memcpy(&out_key->len, buf + key_start_ofs, key_tag_size);
-		--out_key->len; // Lite³ stores string size including NULL-terminator. Correction required for public API.
-		out_key->ptr = (const char *)(buf + key_start_ofs + key_tag_size);
+		if (out_key) {
+			out_key->gen = iter->gen;
+			out_key->len = 0;
+			memcpy(&out_key->len, buf + key_start_ofs, key_tag_size);
+			--out_key->len; // Lite³ stores string size including NULL-terminator. Correction required for public API.
+			out_key->ptr = (const char *)(buf + key_start_ofs + key_tag_size);
+		}
 	}
 	if (out_val_ofs) {								// write back val if not NULL
 		size_t val_start_ofs = target_ofs;
@@ -447,19 +453,19 @@ int lite3_iter_next(const unsigned char *buf, size_t buflen, lite3_iter *iter, l
 			return -1;
 		}
 		#ifdef LITE3_PREFETCHING
-		__builtin_prefetch(buf + node->child_ofs[(iter->node_i[iter->depth] + 1) & LITE3_NODE_KEY_COUNT_MASK],      0, 2); // prefetch next nodes
-		__builtin_prefetch(buf + node->child_ofs[(iter->node_i[iter->depth] + 1) & LITE3_NODE_KEY_COUNT_MASK] + 64, 0, 2);
-		__builtin_prefetch(buf + node->child_ofs[(iter->node_i[iter->depth] + 2) & LITE3_NODE_KEY_COUNT_MASK],      0, 2);
-		__builtin_prefetch(buf + node->child_ofs[(iter->node_i[iter->depth] + 2) & LITE3_NODE_KEY_COUNT_MASK] + 64, 0, 2);
+		__builtin_prefetch(buf + node->child_ofs[(u32)(iter->node_i[iter->depth] + 1) & LITE3_NODE_KEY_COUNT_MASK],      0, 2); // prefetch next nodes
+		__builtin_prefetch(buf + node->child_ofs[(u32)(iter->node_i[iter->depth] + 1) & LITE3_NODE_KEY_COUNT_MASK] + 64, 0, 2);
+		__builtin_prefetch(buf + node->child_ofs[(u32)(iter->node_i[iter->depth] + 2) & LITE3_NODE_KEY_COUNT_MASK],      0, 2);
+		__builtin_prefetch(buf + node->child_ofs[(u32)(iter->node_i[iter->depth] + 2) & LITE3_NODE_KEY_COUNT_MASK] + 64, 0, 2);
 		#endif
 	}
 	#ifdef LITE3_PREFETCHING
-	__builtin_prefetch(buf + node->kv_ofs[(iter->node_i[iter->depth] + 0) & LITE3_NODE_KEY_COUNT_MASK],      0, 0); // prefetch next items
-	__builtin_prefetch(buf + node->kv_ofs[(iter->node_i[iter->depth] + 0) & LITE3_NODE_KEY_COUNT_MASK] + 64, 0, 0);
-	__builtin_prefetch(buf + node->kv_ofs[(iter->node_i[iter->depth] + 1) & LITE3_NODE_KEY_COUNT_MASK],      0, 0);
-	__builtin_prefetch(buf + node->kv_ofs[(iter->node_i[iter->depth] + 1) & LITE3_NODE_KEY_COUNT_MASK] + 64, 0, 0);
-	__builtin_prefetch(buf + node->kv_ofs[(iter->node_i[iter->depth] + 2) & LITE3_NODE_KEY_COUNT_MASK],      0, 0);
-	__builtin_prefetch(buf + node->kv_ofs[(iter->node_i[iter->depth] + 2) & LITE3_NODE_KEY_COUNT_MASK] + 64, 0, 0);
+	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 0) & LITE3_NODE_KEY_COUNT_MASK],      0, 0); // prefetch next items
+	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 0) & LITE3_NODE_KEY_COUNT_MASK] + 64, 0, 0);
+	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 1) & LITE3_NODE_KEY_COUNT_MASK],      0, 0);
+	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 1) & LITE3_NODE_KEY_COUNT_MASK] + 64, 0, 0);
+	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 2) & LITE3_NODE_KEY_COUNT_MASK],      0, 0);
+	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 2) & LITE3_NODE_KEY_COUNT_MASK] + 64, 0, 0);
 	#endif
 	return LITE3_ITER_ITEM;
 }
@@ -547,18 +553,20 @@ int lite3_set_impl(
 		return -1;
 	}
 
-	u32 gen = root->gen_type >> LITE3_NODE_GEN_SHIFT;
+	struct node *generation_root = root;
+	if (ofs)
+		generation_root = __builtin_assume_aligned((struct node *)buf, LITE3_NODE_ALIGNMENT);
+	u32 gen = generation_root->gen_type >> LITE3_NODE_GEN_SHIFT;
 	++gen;
-	root->gen_type = (root->gen_type & ~LITE3_NODE_GEN_MASK) | (gen << LITE3_NODE_GEN_SHIFT);
+	generation_root->gen_type = (generation_root->gen_type & ~LITE3_NODE_GEN_MASK) | (gen << LITE3_NODE_GEN_SHIFT);
 	
 	uint32_t probe_attempts = key ? LITE3_HASH_PROBE_MAX : 1U;
 	for (uint32_t attempt = 0; attempt < probe_attempts; attempt++) {
 		
 		lite3_key_data attempt_key = key_data;
 		attempt_key.hash = key_data.hash + attempt * attempt;
-		#ifdef LITE3_DEBUG
-			LITE3_PRINT_DEBUG("probe attempt: %u\thash: %u\n", attempt, attempt_key.hash);
-		#endif
+		// LITE3_PRINT_DEBUG("probe attempt: %u\thash: %u\n", attempt, attempt_key.hash);
+
 
 		size_t entry_size = base_entry_size;
 		struct node *restrict parent = NULL;
@@ -672,10 +680,11 @@ int lite3_set_impl(
 			while (i < key_count && node->hashes[i] < attempt_key.hash)
 				i++;
 			
-			LITE3_PRINT_DEBUG("i: %i\tkc: %i\tnode->hashes[i]: %u\n", i, key_count, node->hashes[i]);
+			// LITE3_PRINT_DEBUG("i: %i\tkc: %i\tnode->hashes[i]: %u\n", i, key_count, node->hashes[i]);
 
 			if (i < key_count && node->hashes[i] == attempt_key.hash) {			// matching key found, already exists?
 key_match_skip:
+				;
 				size_t target_ofs = node->kv_ofs[i];
 				size_t key_start_ofs = target_ofs;
 				if (key) {
@@ -688,10 +697,12 @@ key_match_skip:
 				size_t val_start_ofs = target_ofs;
 				if (_verify_val(buf, *inout_buflen, &target_ofs) < 0)
 					return -1;
-				if (val_len >= target_ofs - val_start_ofs) {				// value is too large, we must append
-					size_t alignment_mask = val_len == lite3_type_sizes[LITE3_TYPE_OBJECT] ? (size_t)LITE3_NODE_ALIGNMENT_MASK : 0;
+				size_t alignment_mask = val_len == lite3_type_sizes[LITE3_TYPE_OBJECT] ? (size_t)LITE3_NODE_ALIGNMENT_MASK : 0;
+				size_t alignment_padding = ((val_start_ofs + alignment_mask) & ~alignment_mask) - val_start_ofs;
+				if (alignment_padding > target_ofs - val_start_ofs
+				    || val_len >= target_ofs - val_start_ofs - alignment_padding) {	// value is too large, we must append
 					size_t unaligned_val_ofs = *inout_buflen + key_tag_size + (size_t)attempt_key.size;
-					size_t alignment_padding = ((unaligned_val_ofs + alignment_mask) & ~alignment_mask) - unaligned_val_ofs;
+					alignment_padding = ((unaligned_val_ofs + alignment_mask) & ~alignment_mask) - unaligned_val_ofs;
 					entry_size += alignment_padding;
 					if (LITE3_UNLIKELY(entry_size > bufsz || *inout_buflen > bufsz - entry_size)) {
 						LITE3_PRINT_ERROR("NO BUFFER SPACE FOR ENTRY INSERTION\n");
@@ -709,6 +720,11 @@ key_match_skip:
 					node->kv_ofs[i] = (u32)*inout_buflen;
 					goto insert_append;
 					// TODO: add lost bytes to GC index
+				}
+				if (alignment_padding) {
+					memmove(buf + key_start_ofs + alignment_padding, buf + key_start_ofs, val_start_ofs - key_start_ofs);
+					node->kv_ofs[i] += (u32)alignment_padding;
+					val_start_ofs += alignment_padding;
 				}
 				#ifdef LITE3_ZERO_MEM_DELETED
 					memset(buf + val_start_ofs, LITE3_ZERO_MEM_8, target_ofs - val_start_ofs); // zero out value
@@ -752,7 +768,7 @@ key_match_skip:
 					node->hashes[j] = node->hashes[j - 1];
 					node->kv_ofs[j] = node->kv_ofs[j - 1];
 				}
-				LITE3_PRINT_DEBUG("INSERTING HASH: %u\ti: %i\n", attempt_key.hash, i);
+				// LITE3_PRINT_DEBUG("INSERTING HASH: %u\ti: %i\n", attempt_key.hash, i);
 				node->hashes[i] = attempt_key.hash;
 				node->size_kc = (node->size_kc & ~LITE3_NODE_KEY_COUNT_MASK)
 				                  | ((node->size_kc + 1) & LITE3_NODE_KEY_COUNT_MASK);	// key_count++
