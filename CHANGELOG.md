@@ -5,7 +5,7 @@ All notable changes to this project are documented here. The project follows
 break the API. A change to the bytes the library writes (see "Wire format" in
 the README) is always called out.
 
-## 0.1.0 — unreleased
+## 0.1.0 — 2026-10-03
 
 First release. Tested with Zig 0.17.0.
 
