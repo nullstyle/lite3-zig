@@ -28,6 +28,10 @@ test-upstream:
 test-valgrind:
     zig build test-valgrind -Dcpu=x86_64_v3
 
+# Coverage-guided fuzzing (LLVM backend needed, hence ReleaseSafe). Example: just fuzz 5M "fuzz: JSON"
+fuzz limit="1M" filter="fuzz:":
+    zig build test -Doptimize=ReleaseSafe "-Dtest-filter={{filter}}" --fuzz={{limit}}
+
 # Compile the project's own C sources with -Werror
 lint-c:
     zig build lint-c

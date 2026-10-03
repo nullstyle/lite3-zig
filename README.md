@@ -167,6 +167,7 @@ See the `examples/` directory for standalone example programs:
 | Method                | Description                                |
 |-----------------------|--------------------------------------------|
 | `initObj` / `initArr` | Initialize as object or array              |
+| `fromSerialized`      | Wrap received bytes after `lite3.validate` (`fromSerializedUnchecked` skips it) |
 | `setNull/Bool/I64/F64/Str/Bytes/Obj/Arr` | Set a value by key      |
 | `getBool/I64/F64/Str/Bytes/Obj/Arr`       | Get a value by key      |
 | `getType` / `exists`  | Query type or existence of a key (`Error!`) |
@@ -177,7 +178,7 @@ See the `examples/` directory for standalone example programs:
 | `arrGetStrCopy` / `arrGetBytesCopy` | Copy array string/bytes into caller buffer |
 | `count`               | Count entries in an object or array        |
 | `iterate`             | Create an iterator                         |
-| `jsonDecode`          | Decode JSON into a buffer                  |
+| `jsonDecode`          | Decode JSON into a buffer (`jsonDecodeDiagnostics` also reports the error position) |
 | `jsonEncode`          | Encode buffer contents to JSON (`JsonString`) |
 | `jsonEncodePretty`    | Encode to pretty-printed JSON (`JsonString`) |
 | `jsonEncodeBuf`       | Encode JSON into a caller-supplied buffer  |
@@ -187,7 +188,7 @@ See the `examples/` directory for standalone example programs:
 The Context API manages memory automatically via lite3's internal C allocator (`malloc/free`) and exposes the same value/query/array methods as `Buffer`.
 Lifecycle methods are context-specific:
 
-- `init` / `initWithSize` / `initFromBuf` to construct a context
+- `init` / `initWithSize` / `initFromBuf` to construct a context (`initFromBuf` and `importFromBuf` validate; `*Unchecked` variants skip it)
 - `resetObj` / `resetArr` to reset the root container type
 - `deinit` to release resources (idempotent)
 
@@ -195,15 +196,15 @@ Lifecycle methods are context-specific:
 
 `ManagedContext` mirrors the operational API of `Context`, but allocation is explicit through a caller-provided Zig allocator:
 
-- `init(allocator)` / `initWithCapacity(allocator, n)` / `initFromBuf(allocator, buf)`
-- Mutating operations auto-grow on `Error.NoBufferSpace`
+- `init(allocator)` / `initWithCapacity(allocator, n)` / `initWithOptions(allocator, .{ .initial_capacity, .max_capacity })` / `initFromBuf(allocator, buf)`
+- Mutating operations auto-grow on `Error.NoBufferSpace`, up to `max_capacity`
 - `deinit` releases allocator-owned memory (idempotent)
 
 ### ExternalContext API
 
 `ExternalContext` also uses Zig allocators, but it does not store one internally:
 
-- `init(allocator)` / `initWithCapacity(allocator, n)` / `initFromBuf(allocator, buf)`
+- `init(allocator)` / `initWithCapacity(allocator, n)` / `initWithOptions(allocator, options)` / `initFromBuf(allocator, buf)`
 - Pass allocator only to grow-capable operations (`set*`, `arrAppend*`, `importFromBuf`, `jsonDecode`)
 - `deinit(allocator)` requires the same allocator used for init/growth
 
@@ -257,6 +258,10 @@ The local workflow intentionally mirrors the existing CI commands on Linux so it
 
 ## Safety notes
 
+### Untrusted input
+
+Serialized documents and JSON from outside your program are supported input. Constructors that take serialized bytes run `lite3.validate` first; `lite3.validateStrict` additionally guarantees a document stays valid under writes. Bound memory with `initWithOptions(.., .{ .max_capacity = n })`. See [SECURITY.md](SECURITY.md) for the exact guarantees and known limitations (hash flooding, key length, lossy JSON round-trips).
+
 ### Dangling pointers
 
 Methods that return string or byte slices (`getStr`, `getBytes`, `arrGetStr`, `arrGetBytes`) return pointers **directly into the underlying buffer**. These slices are invalidated by:
@@ -276,7 +281,7 @@ The copy variants are: `getStrCopy`, `getBytesCopy`, `arrGetStrCopy`, `arrGetByt
 
 ### Thread safety
 
-Buffer and Context are **not thread-safe**. Concurrent reads and writes require external synchronization (e.g. a `Mutex`). Iterators are also invalidated by any mutation.
+A document may be read from several threads at once; any write needs exclusive access (e.g. a `Mutex` or `RwLock`). Iterators are invalidated by any mutation.
 
 ## Architecture notes
 
@@ -286,7 +291,7 @@ Lite³ makes heavy use of GNU C extensions (statement expressions, `__builtin_pr
 
 ### Build optimization
 
-The C library is always compiled with `-OReleaseFast` regardless of the Zig optimization level. This is because lite3 uses intentional out-of-bounds `__builtin_prefetch` hints for performance that would trigger false positives under Zig's Debug-mode bounds checking. The Zig wrapper code itself respects the user's chosen optimization level.
+The C library follows `-Doptimize`, so Debug and ReleaseSafe builds run the vendored C code under UBSan; `-Dc-optimize` sets it separately (for example a ReleaseFast C library under a Debug build). The benchmark step always builds both in ReleaseFast.
 
 ## License
 

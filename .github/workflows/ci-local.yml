@@ -78,6 +78,34 @@ jobs:
       - name: Test under valgrind (json=${{ matrix.json }})
         run: mise exec -- zig build test-valgrind -Dcpu=x86_64_v3 -Djson=${{ matrix.json }}
 
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - "fuzz: mutated documents"
+          - "fuzz: arbitrary bytes"
+          - "fuzz: JSON decoding"
+          - "fuzz: any sequence of writes"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup mise
+        uses: jdx/mise-action@v3
+
+      - name: Install tools with mise
+        run: mise install
+
+      # Coverage instrumentation needs the LLVM backend, hence ReleaseSafe
+      # (which also runs the C library under UBSan). Short on pushes and
+      # pull requests, long nightly.
+      - name: Fuzz (${{ matrix.target }})
+        run: >-
+          mise exec -- zig build test -Doptimize=ReleaseSafe
+          "-Dtest-filter=${{ matrix.target }}"
+          --fuzz=${{ github.event_name == 'schedule' && '20M' || '200K' }}
+
   lto:
     runs-on: ubuntu-latest
     steps:

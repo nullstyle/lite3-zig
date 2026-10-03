@@ -49,6 +49,30 @@ static inline void out_bytes(const unsigned char *buf, lite3_bytes b, const unsi
     *out_len = p ? b.len : 0;
 }
 
+/* lite3_set_obj/lite3_set_arr and their ctx variants are statement-expression
+   macros that contain `return` on validation failure, which would leave the
+   calling function directly with a raw -1 and skip st(). Call them from these
+   helpers so that `return` lands here instead. */
+static int raw_set_obj(unsigned char *buf, size_t *inout_buflen, size_t ofs, size_t bufsz, const char *key, size_t *out_ofs)
+{
+    return lite3_set_obj(buf, inout_buflen, ofs, bufsz, key, out_ofs);
+}
+
+static int raw_set_arr(unsigned char *buf, size_t *inout_buflen, size_t ofs, size_t bufsz, const char *key, size_t *out_ofs)
+{
+    return lite3_set_arr(buf, inout_buflen, ofs, bufsz, key, out_ofs);
+}
+
+static int raw_ctx_set_obj(lite3_ctx *ctx, size_t ofs, const char *key, size_t *out_ofs)
+{
+    return lite3_ctx_set_obj(ctx, ofs, key, out_ofs);
+}
+
+static int raw_ctx_set_arr(lite3_ctx *ctx, size_t ofs, const char *key, size_t *out_ofs)
+{
+    return lite3_ctx_set_arr(ctx, ofs, key, out_ofs);
+}
+
 /* ---- Buffer API: Object get ---- */
 
 int shim_lite3_get_bool(const unsigned char *buf, size_t buflen, size_t ofs, const char *key, bool *out)
@@ -150,12 +174,12 @@ int shim_lite3_set_bytes(unsigned char *buf, size_t *inout_buflen, size_t ofs,
 
 int shim_lite3_set_obj(unsigned char *buf, size_t *inout_buflen, size_t ofs, size_t bufsz, const char *key, size_t *out_ofs)
 {
-    return st(lite3_set_obj(buf, inout_buflen, ofs, bufsz, key, out_ofs));
+    return st(raw_set_obj(buf, inout_buflen, ofs, bufsz, key, out_ofs));
 }
 
 int shim_lite3_set_arr(unsigned char *buf, size_t *inout_buflen, size_t ofs, size_t bufsz, const char *key, size_t *out_ofs)
 {
-    return st(lite3_set_arr(buf, inout_buflen, ofs, bufsz, key, out_ofs));
+    return st(raw_set_arr(buf, inout_buflen, ofs, bufsz, key, out_ofs));
 }
 
 /* ---- Buffer API: Array append ---- */
@@ -387,8 +411,8 @@ int shim_lite3_ctx_set_i64(lite3_ctx *ctx, size_t ofs, const char *key, int64_t 
 int shim_lite3_ctx_set_f64(lite3_ctx *ctx, size_t ofs, const char *key, double value) { return st(lite3_ctx_set_f64(ctx, ofs, key, value)); }
 int shim_lite3_ctx_set_str(lite3_ctx *ctx, size_t ofs, const char *key, const char *str, size_t str_len) { return st(lite3_ctx_set_str_n(ctx, ofs, key, str, str_len)); }
 int shim_lite3_ctx_set_bytes(lite3_ctx *ctx, size_t ofs, const char *key, const unsigned char *data, size_t data_len) { return st(lite3_ctx_set_bytes(ctx, ofs, key, data, data_len)); }
-int shim_lite3_ctx_set_obj(lite3_ctx *ctx, size_t ofs, const char *key, size_t *out_ofs) { return st(lite3_ctx_set_obj(ctx, ofs, key, out_ofs)); }
-int shim_lite3_ctx_set_arr(lite3_ctx *ctx, size_t ofs, const char *key, size_t *out_ofs) { return st(lite3_ctx_set_arr(ctx, ofs, key, out_ofs)); }
+int shim_lite3_ctx_set_obj(lite3_ctx *ctx, size_t ofs, const char *key, size_t *out_ofs) { return st(raw_ctx_set_obj(ctx, ofs, key, out_ofs)); }
+int shim_lite3_ctx_set_arr(lite3_ctx *ctx, size_t ofs, const char *key, size_t *out_ofs) { return st(raw_ctx_set_arr(ctx, ofs, key, out_ofs)); }
 
 int shim_lite3_ctx_get_type(lite3_ctx *ctx, size_t ofs, const char *key) { return shim_lite3_get_type(ctx->buf, ctx->buflen, ofs, key); }
 int shim_lite3_ctx_exists(lite3_ctx *ctx, size_t ofs, const char *key) { return shim_lite3_exists(ctx->buf, ctx->buflen, ofs, key); }

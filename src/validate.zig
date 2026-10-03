@@ -73,17 +73,29 @@ const Walker = struct {
     /// never visits a byte twice, so this cannot exceed `bytes.len`;
     /// exceeding it means shared or cyclic structure.
     budget: u64 = 0,
+    /// One bit per document byte, set when a node or entry claims it
+    /// (`validateStrict` only).
+    claimed: ?[]u8 = null,
     stack: [max_nesting_depth]Container = undefined,
     stack_len: usize = 0,
 
-    fn charge(w: *Walker, n: u64) Error!void {
+    /// Account for the `n` bytes at `ofs` being part of a node or entry.
+    fn charge(w: *Walker, ofs: u64, n: u64) Error!void {
         w.budget += n;
         if (w.budget > w.bytes.len) return error.CorruptData;
+        const claimed = w.claimed orelse return;
+        for (ofs..ofs + n) |i| {
+            const mask = @as(u8, 1) << @intCast(i % 8);
+            if (claimed[i / 8] & mask != 0) return error.CorruptData;
+            claimed[i / 8] |= mask;
+        }
     }
 
     fn inBounds(w: *const Walker, ofs: u64, len: u64) bool {
         return ofs <= w.bytes.len and len <= w.bytes.len - ofs;
     }
+
+    const run = runWalker;
 
     fn u32At(w: *const Walker, ofs: u64) u32 {
         return std.mem.readInt(u32, w.bytes[@intCast(ofs)..][0..4], .little);
@@ -92,15 +104,20 @@ const Walker = struct {
     /// Check a node's header and return a cursor positioned at its start.
     fn openNode(w: *Walker, ofs: u64, container_type: u8) Error!Cursor {
         if (ofs % node_alignment != 0 or !w.inBounds(ofs, node_size)) return error.CorruptData;
-        try w.charge(node_size);
+        try w.charge(ofs, node_size);
         if (w.bytes[@intCast(ofs)] != container_type) return error.CorruptData;
 
         const kc: u8 = @intCast(w.u32At(ofs + ofs_size_kc) & 0x7);
         const internal = w.u32At(ofs + ofs_child) != 0;
-        // Internal nodes have a child on both sides of every key; leaves have
-        // none. lite3's iterator descends wherever child_ofs[i] != 0, so a
-        // stray child pointer in a leaf would be walked.
-        for (0..@as(usize, kc) + 1) |i| {
+        // Internal nodes have a child on both sides of every key. Leaves have
+        // none at all: lite3 creates every node with all 8 child slots zero,
+        // and its iterator descends wherever child_ofs[i] != 0. A stray
+        // pointer past the key count would become live once an insert raises
+        // the count, so it is rejected too. (Internal nodes may legitimately
+        // keep stale pointers past their key count; lite3 overwrites those
+        // before it reads them.)
+        const checked: usize = if (internal) @as(usize, kc) + 1 else key_count_max + 1;
+        for (0..checked) |i| {
             if ((w.u32At(ofs + ofs_child + 4 * i) != 0) != internal) return error.CorruptData;
         }
         if (internal and kc == 0) return error.CorruptData;
@@ -231,7 +248,7 @@ const Walker = struct {
             if (std.mem.eql(u8, other.bytes, key_bytes)) return error.CorruptData;
         }
 
-        try w.charge(tag_len + key_size);
+        try w.charge(kv, tag_len + key_size);
         return key_ofs + key_size;
     }
 
@@ -239,21 +256,21 @@ const Walker = struct {
         if (!w.inBounds(ofs, 1)) return error.CorruptData;
         const t = w.bytes[@intCast(ofs)];
         switch (t) {
-            0 => try w.charge(1), // null
+            0 => try w.charge(ofs, 1), // null
             1 => { // bool, loaded as C _Bool
                 if (!w.inBounds(ofs, 2) or w.bytes[@intCast(ofs + 1)] > 1) return error.CorruptData;
-                try w.charge(2);
+                try w.charge(ofs, 2);
             },
             2, 3 => { // i64, f64
                 if (!w.inBounds(ofs, 9)) return error.CorruptData;
-                try w.charge(9);
+                try w.charge(ofs, 9);
             },
             4, 5 => { // bytes, string
                 if (!w.inBounds(ofs, 5)) return error.CorruptData;
                 const n: u64 = w.u32At(ofs + 1);
                 if (!w.inBounds(ofs + 5, n)) return error.CorruptData;
                 if (t == 5 and (n == 0 or w.bytes[@intCast(ofs + 5 + n - 1)] != 0)) return error.CorruptData;
-                try w.charge(5 + n);
+                try w.charge(ofs, 5 + n);
             },
             type_object, type_array => try w.openContainer(ofs, t),
             else => return error.CorruptData,
@@ -262,10 +279,31 @@ const Walker = struct {
 };
 
 /// Check that `bytes` is a well-formed lite3 document (root container at
-/// offset 0, `bytes.len` = used length). Runs in time linear in `bytes.len`
-/// and uses about 6 KiB of stack.
+/// offset 0, `bytes.len` = used length). Runs in time linear in `bytes.len`,
+/// allocates nothing and uses about 6 KiB of stack.
+///
+/// Guarantees reading and writing the document through the lite3 API stays
+/// in bounds and does bounded work, and that every entry is well-formed and
+/// reachable. Structure sharing that fits inside the document's dead space
+/// (bytes left behind by overwrites) is not detected; see `validateStrict`.
 pub fn validate(bytes: []const u8) Error!void {
     var w: Walker = .{ .bytes = bytes };
+    return w.run();
+}
+
+/// Like `validate`, and additionally proves that no byte belongs to more
+/// than one node or entry. A document that passes stays valid under any
+/// sequence of lite3 writes. Needs `bytes.len / 8` bytes of scratch memory.
+pub fn validateStrict(gpa: std.mem.Allocator, bytes: []const u8) (Error || std.mem.Allocator.Error)!void {
+    const claimed = try gpa.alloc(u8, std.math.divCeil(usize, bytes.len, 8) catch unreachable);
+    defer gpa.free(claimed);
+    @memset(claimed, 0);
+    var w: Walker = .{ .bytes = bytes, .claimed = claimed };
+    return w.run();
+}
+
+fn runWalker(w: *Walker) Error!void {
+    const bytes = w.bytes;
     if (!w.inBounds(0, node_size)) return error.CorruptData;
     const t = bytes[0];
     if (t != type_object and t != type_array) return error.CorruptData;

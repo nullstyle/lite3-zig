@@ -1698,4 +1698,5 @@ test "Fuzz: Context rapid grow/shrink cycle" {
 test {
     _ = @import("regression_tests.zig");
     _ = @import("validate_tests.zig");
+    _ = @import("fuzz_tests.zig");
 }

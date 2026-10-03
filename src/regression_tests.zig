@@ -344,3 +344,18 @@ test "ALC-5: max_capacity bounds growth" {
         try testing.expect(j.capacity() <= 4096);
     }
 }
+
+test "shim: setObj/setArr on an array report InvalidArgument (macro early return)" {
+    // lite3_set_obj/arr are macros with an early `return`; it used to bypass
+    // the shim's status translation and surface as NotFound.
+    var mem: [1024]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initArr(&mem);
+    try testing.expectError(lite3.Error.InvalidArgument, buf.setObj(lite3.root, "k"));
+    try testing.expectError(lite3.Error.InvalidArgument, buf.setArr(lite3.root, "k"));
+
+    var ctx = try lite3.Context.init();
+    defer ctx.deinit();
+    try ctx.resetArr();
+    try testing.expectError(lite3.Error.InvalidArgument, ctx.setObj(lite3.root, "k"));
+    try testing.expectError(lite3.Error.InvalidArgument, ctx.setArr(lite3.root, "k"));
+}

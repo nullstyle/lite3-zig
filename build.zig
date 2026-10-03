@@ -31,7 +31,9 @@ pub fn build(b: *std.Build) void {
     const check_step = b.step("check", "Compile tests, examples and benchmarks without running them");
 
     // --- Tests ---
+    const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose name contains this (repeatable)") orelse &.{};
     const tests = b.addTest(.{
+        .filters = test_filters,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/tests.zig"),
             .target = target,

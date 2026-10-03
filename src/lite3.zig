@@ -31,8 +31,24 @@ pub const max_nesting_depth = validation.max_nesting_depth;
 /// The constructors that take serialized bytes (`Buffer.fromSerialized`,
 /// `Context.initFromBuf`, `importFromBuf`, ...) call this automatically;
 /// their `*Unchecked` variants skip it for data this program produced.
+///
+/// `validate` allocates nothing. It does not detect structure sharing that
+/// fits inside dead space (bytes left behind by overwrites): such a document
+/// is still safe to use, but a later write may turn it into one that reads
+/// as `CorruptData`. `validateStrict` rules that out too.
 pub fn validate(bytes: []const u8) Error!void {
     validation.validate(bytes) catch return Error.CorruptData;
+}
+
+/// Like `validate`, and additionally proves that no byte belongs to two
+/// nodes or entries, so the document stays valid under any sequence of
+/// writes. Use it before modifying documents from untrusted sources. Needs
+/// `bytes.len / 8` bytes of scratch memory from `gpa`.
+pub fn validateStrict(gpa: std.mem.Allocator, bytes: []const u8) (Error || std.mem.Allocator.Error)!void {
+    validation.validateStrict(gpa, bytes) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.CorruptData => Error.CorruptData,
+    };
 }
 
 /// lite3 node size and alignment (LITE3_NODE_SIZE, LITE3_NODE_ALIGNMENT).
@@ -54,6 +70,11 @@ fn aliases(outer: []const u8, inner: []const u8) bool {
     const i = @intFromPtr(inner.ptr);
     return i < o + outer.len and o < i + inner.len;
 }
+
+/// Longest key, in bytes, that the get/set methods accept. Documents
+/// decoded from JSON or received from elsewhere can hold longer keys; those
+/// entries are still visible through iteration.
+pub const max_key_len: usize = 255;
 
 /// True when JSON conversion support is compiled in.
 pub const json_enabled: bool = build_options.json_enabled;
@@ -250,8 +271,6 @@ fn SharedMethods(comptime Self: type) type {
     const is_ctx = (Self == Context);
     return struct {
         /// Maximum key length in bytes. Keys longer than this return InvalidArgument.
-        const max_key_len: usize = 255;
-
         /// Convert a key slice to a null-terminated stack buffer for passing to C.
         /// Returns a fixed-size array that can be passed to C via `&kz`.
         inline fn toKeyZ(key: []const u8) Error![max_key_len + 1]u8 {
@@ -264,7 +283,6 @@ fn SharedMethods(comptime Self: type) type {
             return buf;
         }
 
-        /// Validate lifecycle/invariants before dispatching to C.
         /// The document's used bytes.
         inline fn docBytes(self: *const Self) []const u8 {
             if (is_ctx) return c.shim_lite3_ctx_buf(self.raw())[0..c.shim_lite3_ctx_buflen(self.raw())];
@@ -285,6 +303,7 @@ fn SharedMethods(comptime Self: type) type {
             return sliceWithin(docBytes(self), ptr, len);
         }
 
+        /// Validate lifecycle/invariants before dispatching to C.
         inline fn ensureUsable(self: *const Self) Error!void {
             if (is_ctx) {
                 if (self.ctx == null) return Error.InvalidState;
