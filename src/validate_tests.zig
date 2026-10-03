@@ -236,3 +236,89 @@ test "validate: accepts genuine hash collisions resolved by probing" {
     @memcpy(mem[second..][0..2], "B@");
     try lite3.validate(buf.data());
 }
+
+/// A small valid document and a corrupted copy of it (bad element count).
+fn sampleDocs(good: []align(4) u8, bad: []align(4) u8) !usize {
+    var buf = try lite3.Buffer.initObj(good);
+    try buf.setStr(lite3.root, "name", "Alice");
+    try buf.setI64(lite3.root, "age", 30);
+    @memcpy(bad[0..buf.len], good[0..buf.len]);
+    writeU32(bad, ofs_size_kc, readU32(bad, ofs_size_kc) + (1 << 6));
+    return buf.len;
+}
+
+test "SEC-16: constructors validate foreign bytes; Unchecked variants do not" {
+    var good: [1024]u8 align(4) = undefined;
+    var bad: [1024]u8 align(4) = undefined;
+    const len = try sampleDocs(&good, &bad);
+
+    try testing.expectError(lite3.Error.CorruptData, lite3.Buffer.fromSerialized(&bad, len));
+    _ = try lite3.Buffer.fromSerializedUnchecked(&bad, len);
+    _ = try lite3.Buffer.fromSerialized(&good, len);
+
+    try testing.expectError(lite3.Error.CorruptData, lite3.Context.initFromBuf(bad[0..len]));
+    var ctx = try lite3.Context.initFromBuf(good[0..len]);
+    defer ctx.deinit();
+    try testing.expectError(lite3.Error.CorruptData, ctx.importFromBuf(bad[0..len]));
+    try testing.expectEqualStrings("Alice", try ctx.getStr(lite3.root, "name")); // untouched
+
+    const a = testing.allocator;
+    try testing.expectError(lite3.Error.CorruptData, lite3.ManagedContext.initFromBuf(a, bad[0..len]));
+    var m = try lite3.ManagedContext.initFromBuf(a, good[0..len]);
+    defer m.deinit();
+    try testing.expectError(lite3.Error.CorruptData, m.importFromBuf(bad[0..len]));
+    try testing.expectEqualStrings("Alice", try m.getStr(lite3.root, "name"));
+
+    try testing.expectError(lite3.Error.CorruptData, lite3.ExternalContext.initFromBuf(a, bad[0..len]));
+    var e = try lite3.ExternalContext.initFromBuf(a, good[0..len]);
+    defer e.deinit(a);
+    try testing.expectError(lite3.Error.CorruptData, e.importFromBuf(a, bad[0..len]));
+    try testing.expectEqualStrings("Alice", try e.getStr(lite3.root, "name"));
+}
+
+test "TST-7: importFromBuf with the context's own data" {
+    const a = testing.allocator;
+    var m = try lite3.ManagedContext.init(a);
+    defer m.deinit();
+    try m.setStr(lite3.root, "name", "Alice");
+    try m.importFromBuf(m.data());
+    try testing.expectEqualStrings("Alice", try m.getStr(lite3.root, "name"));
+
+    var e = try lite3.ExternalContext.init(a);
+    defer e.deinit(a);
+    try e.setStr(a, lite3.root, "name", "Bob");
+    try e.importFromBuf(a, e.data());
+    try testing.expectEqualStrings("Bob", try e.getStr(lite3.root, "name"));
+}
+
+test "CSH-12/CRT-8: misaligned or out-of-range Offsets are rejected before C" {
+    var mem: [1024]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    try buf.setI64(lite3.root, "a", 1);
+    const obj = try buf.setObj(lite3.root, "o");
+    const bad_offsets = [_]usize{ 1, 2, 4, 8, @backingInt(obj) + 1, buf.len, buf.len - node_size + 4, std.math.maxInt(usize) - 3 };
+    for (bad_offsets) |o| {
+        const ofs: lite3.Offset = @fromBackingInt(o);
+        if (o == 4 or o == 8) {
+            // Aligned and in range, but not a node: C rejects it.
+            try testing.expect(std.meta.isError(buf.getI64(ofs, "a")));
+            continue;
+        }
+        try testing.expectError(lite3.Error.InvalidArgument, buf.getI64(ofs, "a"));
+        try testing.expectError(lite3.Error.InvalidArgument, buf.setI64(ofs, "a", 2));
+        try testing.expectError(lite3.Error.InvalidArgument, buf.count(ofs));
+        try testing.expectError(lite3.Error.InvalidArgument, buf.iterate(ofs));
+    }
+    try testing.expectEqual(@as(i64, 1), try buf.getI64(lite3.root, "a"));
+}
+
+test "SEC-4: iteration over an unvalidated document is capped by its element count" {
+    var mem: [8192]u8 align(4) = undefined;
+    const valid = try splitDoc(&mem);
+    // Claim 3 elements while the tree holds 40.
+    writeU32(&mem, ofs_size_kc, (readU32(&mem, ofs_size_kc) & 0x3f) | (3 << 6));
+    var buf = try lite3.Buffer.fromSerializedUnchecked(&mem, valid.len);
+    var it = try buf.iterate(lite3.root);
+    for (0..3) |_| _ = (try it.next()).?;
+    try testing.expectError(lite3.Error.CorruptData, it.next());
+}

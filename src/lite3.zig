@@ -35,6 +35,26 @@ pub fn validate(bytes: []const u8) Error!void {
     validation.validate(bytes) catch return Error.CorruptData;
 }
 
+/// lite3 node size and alignment (LITE3_NODE_SIZE, LITE3_NODE_ALIGNMENT).
+const node_size = 96;
+const node_alignment = 4;
+
+/// Return `ptr[0..len]` if it lies entirely inside `doc`, else CorruptData.
+/// Defence in depth for slices the C library hands back.
+fn sliceWithin(doc: []const u8, ptr: [*]const u8, len: usize) Error![]const u8 {
+    const start = @intFromPtr(ptr);
+    const base = @intFromPtr(doc.ptr);
+    if (start < base or start - base > doc.len or len > doc.len - (start - base)) return Error.CorruptData;
+    return ptr[0..len];
+}
+
+/// True if `inner` overlaps `outer`'s memory.
+fn aliases(outer: []const u8, inner: []const u8) bool {
+    const o = @intFromPtr(outer.ptr);
+    const i = @intFromPtr(inner.ptr);
+    return i < o + outer.len and o < i + inner.len;
+}
+
 /// True when JSON conversion support is compiled in.
 pub const json_enabled: bool = build_options.json_enabled;
 
@@ -181,6 +201,11 @@ pub const Iterator = struct {
     raw: c.shim_lite3_iter,
     buf: [*]const u8,
     buflen: usize,
+    /// Entries left to yield: the container's element count, which can never
+    /// exceed the document length. Bounds iteration even over documents that
+    /// were not validated (shared subtrees could otherwise be revisited
+    /// exponentially often).
+    remaining: usize,
 
     pub const Entry = struct {
         /// The key string (null for array iterators).
@@ -198,7 +223,9 @@ pub const Iterator = struct {
         const ret = c.shim_lite3_iter_next(self.buf, self.buflen, &self.raw, @ptrCast(&key_ptr), &key_len, &val_ofs);
         if (ret == 1) return null; // DONE
         if (ret < 0) return translateError(ret);
-        const entry_key: ?[]const u8 = if (key_ptr) |p| p[0..key_len] else null;
+        if (self.remaining == 0) return Error.CorruptData;
+        self.remaining -= 1;
+        const entry_key: ?[]const u8 = if (key_ptr) |p| try sliceWithin(self.buf[0..self.buflen], p, key_len) else null;
         return Entry{
             .key = entry_key,
             .val_offset = @fromBackingInt(@intCast(val_ofs)),
@@ -232,6 +259,26 @@ fn SharedMethods(comptime Self: type) type {
         }
 
         /// Validate lifecycle/invariants before dispatching to C.
+        /// The document's used bytes.
+        inline fn docBytes(self: *const Self) []const u8 {
+            if (is_ctx) return c.shim_lite3_ctx_buf(self.raw())[0..c.shim_lite3_ctx_buflen(self.raw())];
+            return self.buf[0..self.len];
+        }
+
+        /// Check a container Offset argument before it reaches C: container
+        /// nodes are 4-aligned and lie inside the document.
+        inline fn ofsArg(self: *const Self, ofs: Offset) Error!usize {
+            const o = @backingInt(ofs);
+            const len = docBytes(self).len;
+            if (o % node_alignment != 0 or o > len or len - o < node_size) return Error.InvalidArgument;
+            return o;
+        }
+
+        /// Return `ptr[0..len]` only if it lies inside the document.
+        inline fn checkedSlice(self: *const Self, ptr: [*]const u8, len: usize) Error![]const u8 {
+            return sliceWithin(docBytes(self), ptr, len);
+        }
+
         inline fn ensureUsable(self: *const Self) Error!void {
             if (is_ctx) {
                 if (self.ctx == null) return Error.InvalidState;
@@ -262,9 +309,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_null(self.raw(), @backingInt(ofs), &kz)
+                c.shim_lite3_ctx_set_null(self.raw(), try ofsArg(self, ofs), &kz)
             else
-                c.shim_lite3_set_null(self.buf, &self.len, @backingInt(ofs), self.capacity, &kz);
+                c.shim_lite3_set_null(self.buf, &self.len, try ofsArg(self, ofs), self.capacity, &kz);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -277,9 +324,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_bool(self.raw(), @backingInt(ofs), &kz, value)
+                c.shim_lite3_ctx_set_bool(self.raw(), try ofsArg(self, ofs), &kz, value)
             else
-                c.shim_lite3_set_bool(self.buf, &self.len, @backingInt(ofs), self.capacity, &kz, value);
+                c.shim_lite3_set_bool(self.buf, &self.len, try ofsArg(self, ofs), self.capacity, &kz, value);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -292,9 +339,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_i64(self.raw(), @backingInt(ofs), &kz, value)
+                c.shim_lite3_ctx_set_i64(self.raw(), try ofsArg(self, ofs), &kz, value)
             else
-                c.shim_lite3_set_i64(self.buf, &self.len, @backingInt(ofs), self.capacity, &kz, value);
+                c.shim_lite3_set_i64(self.buf, &self.len, try ofsArg(self, ofs), self.capacity, &kz, value);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -307,9 +354,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_f64(self.raw(), @backingInt(ofs), &kz, value)
+                c.shim_lite3_ctx_set_f64(self.raw(), try ofsArg(self, ofs), &kz, value)
             else
-                c.shim_lite3_set_f64(self.buf, &self.len, @backingInt(ofs), self.capacity, &kz, value);
+                c.shim_lite3_set_f64(self.buf, &self.len, try ofsArg(self, ofs), self.capacity, &kz, value);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -322,9 +369,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_str(self.raw(), @backingInt(ofs), &kz, value.ptr, value.len)
+                c.shim_lite3_ctx_set_str(self.raw(), try ofsArg(self, ofs), &kz, value.ptr, value.len)
             else
-                c.shim_lite3_set_str(self.buf, &self.len, @backingInt(ofs), self.capacity, &kz, value.ptr, value.len);
+                c.shim_lite3_set_str(self.buf, &self.len, try ofsArg(self, ofs), self.capacity, &kz, value.ptr, value.len);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -337,9 +384,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_bytes(self.raw(), @backingInt(ofs), &kz, value.ptr, value.len)
+                c.shim_lite3_ctx_set_bytes(self.raw(), try ofsArg(self, ofs), &kz, value.ptr, value.len)
             else
-                c.shim_lite3_set_bytes(self.buf, &self.len, @backingInt(ofs), self.capacity, &kz, value.ptr, value.len);
+                c.shim_lite3_set_bytes(self.buf, &self.len, try ofsArg(self, ofs), self.capacity, &kz, value.ptr, value.len);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -353,9 +400,9 @@ fn SharedMethods(comptime Self: type) type {
             const saved = saveLen(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_obj(self.raw(), @backingInt(ofs), &kz, &out_ofs)
+                c.shim_lite3_ctx_set_obj(self.raw(), try ofsArg(self, ofs), &kz, &out_ofs)
             else
-                c.shim_lite3_set_obj(self.buf, &self.len, @backingInt(ofs), self.capacity, &kz, &out_ofs);
+                c.shim_lite3_set_obj(self.buf, &self.len, try ofsArg(self, ofs), self.capacity, &kz, &out_ofs);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -370,9 +417,9 @@ fn SharedMethods(comptime Self: type) type {
             const saved = saveLen(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_arr(self.raw(), @backingInt(ofs), &kz, &out_ofs)
+                c.shim_lite3_ctx_set_arr(self.raw(), try ofsArg(self, ofs), &kz, &out_ofs)
             else
-                c.shim_lite3_set_arr(self.buf, &self.len, @backingInt(ofs), self.capacity, &kz, &out_ofs);
+                c.shim_lite3_set_arr(self.buf, &self.len, try ofsArg(self, ofs), self.capacity, &kz, &out_ofs);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -387,9 +434,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             var kz = try toKeyZ(key);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_type(self.raw(), @backingInt(ofs), &kz)
+                c.shim_lite3_ctx_get_type(self.raw(), try ofsArg(self, ofs), &kz)
             else
-                c.shim_lite3_get_type(self.buf, self.len, @backingInt(ofs), &kz);
+                c.shim_lite3_get_type(self.buf, self.len, try ofsArg(self, ofs), &kz);
             if (ret < 0) return translateError(ret);
             if (ret >= @backingInt(Type.invalid)) return Error.CorruptData;
             return @fromBackingInt(@intCast(ret));
@@ -401,9 +448,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             var kz = try toKeyZ(key);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_exists(self.raw(), @backingInt(ofs), &kz)
+                c.shim_lite3_ctx_exists(self.raw(), try ofsArg(self, ofs), &kz)
             else
-                c.shim_lite3_exists(self.buf, self.len, @backingInt(ofs), &kz);
+                c.shim_lite3_exists(self.buf, self.len, try ofsArg(self, ofs), &kz);
             if (ret < 0) return translateError(ret);
             return ret != 0;
         }
@@ -414,9 +461,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             var out: bool = false;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_bool(self.raw(), @backingInt(ofs), &kz, &out)
+                c.shim_lite3_ctx_get_bool(self.raw(), try ofsArg(self, ofs), &kz, &out)
             else
-                c.shim_lite3_get_bool(self.buf, self.len, @backingInt(ofs), &kz, &out);
+                c.shim_lite3_get_bool(self.buf, self.len, try ofsArg(self, ofs), &kz, &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
@@ -427,9 +474,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             var out: i64 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_i64(self.raw(), @backingInt(ofs), &kz, &out)
+                c.shim_lite3_ctx_get_i64(self.raw(), try ofsArg(self, ofs), &kz, &out)
             else
-                c.shim_lite3_get_i64(self.buf, self.len, @backingInt(ofs), &kz, &out);
+                c.shim_lite3_get_i64(self.buf, self.len, try ofsArg(self, ofs), &kz, &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
@@ -440,9 +487,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             var out: f64 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_f64(self.raw(), @backingInt(ofs), &kz, &out)
+                c.shim_lite3_ctx_get_f64(self.raw(), try ofsArg(self, ofs), &kz, &out)
             else
-                c.shim_lite3_get_f64(self.buf, self.len, @backingInt(ofs), &kz, &out);
+                c.shim_lite3_get_f64(self.buf, self.len, try ofsArg(self, ofs), &kz, &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
@@ -457,11 +504,11 @@ fn SharedMethods(comptime Self: type) type {
             var out_ptr: ?[*]const u8 = null;
             var out_len: u32 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_str(self.raw(), @backingInt(ofs), &kz, @ptrCast(&out_ptr), &out_len)
+                c.shim_lite3_ctx_get_str(self.raw(), try ofsArg(self, ofs), &kz, @ptrCast(&out_ptr), &out_len)
             else
-                c.shim_lite3_get_str(self.buf, self.len, @backingInt(ofs), &kz, @ptrCast(&out_ptr), &out_len);
+                c.shim_lite3_get_str(self.buf, self.len, try ofsArg(self, ofs), &kz, @ptrCast(&out_ptr), &out_len);
             if (ret < 0) return translateError(ret);
-            if (out_ptr) |p| return p[0..out_len];
+            if (out_ptr) |p| return checkedSlice(self, p, out_len);
             return Error.StaleReference;
         }
 
@@ -475,11 +522,11 @@ fn SharedMethods(comptime Self: type) type {
             var out_ptr: ?[*]const u8 = null;
             var out_len: u32 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_bytes(self.raw(), @backingInt(ofs), &kz, &out_ptr, &out_len)
+                c.shim_lite3_ctx_get_bytes(self.raw(), try ofsArg(self, ofs), &kz, &out_ptr, &out_len)
             else
-                c.shim_lite3_get_bytes(self.buf, self.len, @backingInt(ofs), &kz, &out_ptr, &out_len);
+                c.shim_lite3_get_bytes(self.buf, self.len, try ofsArg(self, ofs), &kz, &out_ptr, &out_len);
             if (ret < 0) return translateError(ret);
-            if (out_ptr) |p| return p[0..out_len];
+            if (out_ptr) |p| return checkedSlice(self, p, out_len);
             return Error.StaleReference;
         }
 
@@ -489,9 +536,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_obj(self.raw(), @backingInt(ofs), &kz, &out_ofs)
+                c.shim_lite3_ctx_get_obj(self.raw(), try ofsArg(self, ofs), &kz, &out_ofs)
             else
-                c.shim_lite3_get_obj(self.buf, self.len, @backingInt(ofs), &kz, &out_ofs);
+                c.shim_lite3_get_obj(self.buf, self.len, try ofsArg(self, ofs), &kz, &out_ofs);
             if (ret < 0) return translateError(ret);
             return @fromBackingInt(@intCast(out_ofs));
         }
@@ -502,9 +549,9 @@ fn SharedMethods(comptime Self: type) type {
             var kz = try toKeyZ(key);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_arr(self.raw(), @backingInt(ofs), &kz, &out_ofs)
+                c.shim_lite3_ctx_get_arr(self.raw(), try ofsArg(self, ofs), &kz, &out_ofs)
             else
-                c.shim_lite3_get_arr(self.buf, self.len, @backingInt(ofs), &kz, &out_ofs);
+                c.shim_lite3_get_arr(self.buf, self.len, try ofsArg(self, ofs), &kz, &out_ofs);
             if (ret < 0) return translateError(ret);
             return @fromBackingInt(@intCast(out_ofs));
         }
@@ -536,9 +583,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_null(self.raw(), @backingInt(ofs))
+                c.shim_lite3_ctx_arr_append_null(self.raw(), try ofsArg(self, ofs))
             else
-                c.shim_lite3_arr_append_null(self.buf, &self.len, @backingInt(ofs), self.capacity);
+                c.shim_lite3_arr_append_null(self.buf, &self.len, try ofsArg(self, ofs), self.capacity);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -550,9 +597,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_bool(self.raw(), @backingInt(ofs), value)
+                c.shim_lite3_ctx_arr_append_bool(self.raw(), try ofsArg(self, ofs), value)
             else
-                c.shim_lite3_arr_append_bool(self.buf, &self.len, @backingInt(ofs), self.capacity, value);
+                c.shim_lite3_arr_append_bool(self.buf, &self.len, try ofsArg(self, ofs), self.capacity, value);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -564,9 +611,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_i64(self.raw(), @backingInt(ofs), value)
+                c.shim_lite3_ctx_arr_append_i64(self.raw(), try ofsArg(self, ofs), value)
             else
-                c.shim_lite3_arr_append_i64(self.buf, &self.len, @backingInt(ofs), self.capacity, value);
+                c.shim_lite3_arr_append_i64(self.buf, &self.len, try ofsArg(self, ofs), self.capacity, value);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -578,9 +625,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_f64(self.raw(), @backingInt(ofs), value)
+                c.shim_lite3_ctx_arr_append_f64(self.raw(), try ofsArg(self, ofs), value)
             else
-                c.shim_lite3_arr_append_f64(self.buf, &self.len, @backingInt(ofs), self.capacity, value);
+                c.shim_lite3_arr_append_f64(self.buf, &self.len, try ofsArg(self, ofs), self.capacity, value);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -592,9 +639,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_str(self.raw(), @backingInt(ofs), value.ptr, value.len)
+                c.shim_lite3_ctx_arr_append_str(self.raw(), try ofsArg(self, ofs), value.ptr, value.len)
             else
-                c.shim_lite3_arr_append_str(self.buf, &self.len, @backingInt(ofs), self.capacity, value.ptr, value.len);
+                c.shim_lite3_arr_append_str(self.buf, &self.len, try ofsArg(self, ofs), self.capacity, value.ptr, value.len);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -606,9 +653,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             const saved = saveLen(self);
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_bytes(self.raw(), @backingInt(ofs), value.ptr, value.len)
+                c.shim_lite3_ctx_arr_append_bytes(self.raw(), try ofsArg(self, ofs), value.ptr, value.len)
             else
-                c.shim_lite3_arr_append_bytes(self.buf, &self.len, @backingInt(ofs), self.capacity, value.ptr, value.len);
+                c.shim_lite3_arr_append_bytes(self.buf, &self.len, try ofsArg(self, ofs), self.capacity, value.ptr, value.len);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -621,9 +668,9 @@ fn SharedMethods(comptime Self: type) type {
             const saved = saveLen(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_obj(self.raw(), @backingInt(ofs), &out_ofs)
+                c.shim_lite3_ctx_arr_append_obj(self.raw(), try ofsArg(self, ofs), &out_ofs)
             else
-                c.shim_lite3_arr_append_obj(self.buf, &self.len, @backingInt(ofs), self.capacity, &out_ofs);
+                c.shim_lite3_arr_append_obj(self.buf, &self.len, try ofsArg(self, ofs), self.capacity, &out_ofs);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -637,9 +684,9 @@ fn SharedMethods(comptime Self: type) type {
             const saved = saveLen(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_arr(self.raw(), @backingInt(ofs), &out_ofs)
+                c.shim_lite3_ctx_arr_append_arr(self.raw(), try ofsArg(self, ofs), &out_ofs)
             else
-                c.shim_lite3_arr_append_arr(self.buf, &self.len, @backingInt(ofs), self.capacity, &out_ofs);
+                c.shim_lite3_arr_append_arr(self.buf, &self.len, try ofsArg(self, ofs), self.capacity, &out_ofs);
             if (ret < 0) {
                 restoreLen(self, saved);
                 return translateError(ret);
@@ -654,9 +701,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             var out: bool = false;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_bool(self.raw(), @backingInt(ofs), index, &out)
+                c.shim_lite3_ctx_arr_get_bool(self.raw(), try ofsArg(self, ofs), index, &out)
             else
-                c.shim_lite3_arr_get_bool(self.buf, self.len, @backingInt(ofs), index, &out);
+                c.shim_lite3_arr_get_bool(self.buf, self.len, try ofsArg(self, ofs), index, &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
@@ -666,9 +713,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             var out: i64 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_i64(self.raw(), @backingInt(ofs), index, &out)
+                c.shim_lite3_ctx_arr_get_i64(self.raw(), try ofsArg(self, ofs), index, &out)
             else
-                c.shim_lite3_arr_get_i64(self.buf, self.len, @backingInt(ofs), index, &out);
+                c.shim_lite3_arr_get_i64(self.buf, self.len, try ofsArg(self, ofs), index, &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
@@ -678,9 +725,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             var out: f64 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_f64(self.raw(), @backingInt(ofs), index, &out)
+                c.shim_lite3_ctx_arr_get_f64(self.raw(), try ofsArg(self, ofs), index, &out)
             else
-                c.shim_lite3_arr_get_f64(self.buf, self.len, @backingInt(ofs), index, &out);
+                c.shim_lite3_arr_get_f64(self.buf, self.len, try ofsArg(self, ofs), index, &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
@@ -694,11 +741,11 @@ fn SharedMethods(comptime Self: type) type {
             var out_ptr: ?[*]const u8 = null;
             var out_len: u32 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_str(self.raw(), @backingInt(ofs), index, @ptrCast(&out_ptr), &out_len)
+                c.shim_lite3_ctx_arr_get_str(self.raw(), try ofsArg(self, ofs), index, @ptrCast(&out_ptr), &out_len)
             else
-                c.shim_lite3_arr_get_str(self.buf, self.len, @backingInt(ofs), index, @ptrCast(&out_ptr), &out_len);
+                c.shim_lite3_arr_get_str(self.buf, self.len, try ofsArg(self, ofs), index, @ptrCast(&out_ptr), &out_len);
             if (ret < 0) return translateError(ret);
-            if (out_ptr) |p| return p[0..out_len];
+            if (out_ptr) |p| return checkedSlice(self, p, out_len);
             return Error.StaleReference;
         }
 
@@ -711,11 +758,11 @@ fn SharedMethods(comptime Self: type) type {
             var out_ptr: ?[*]const u8 = null;
             var out_len: u32 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_bytes(self.raw(), @backingInt(ofs), index, &out_ptr, &out_len)
+                c.shim_lite3_ctx_arr_get_bytes(self.raw(), try ofsArg(self, ofs), index, &out_ptr, &out_len)
             else
-                c.shim_lite3_arr_get_bytes(self.buf, self.len, @backingInt(ofs), index, &out_ptr, &out_len);
+                c.shim_lite3_arr_get_bytes(self.buf, self.len, try ofsArg(self, ofs), index, &out_ptr, &out_len);
             if (ret < 0) return translateError(ret);
-            if (out_ptr) |p| return p[0..out_len];
+            if (out_ptr) |p| return checkedSlice(self, p, out_len);
             return Error.StaleReference;
         }
 
@@ -724,9 +771,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_obj(self.raw(), @backingInt(ofs), index, &out_ofs)
+                c.shim_lite3_ctx_arr_get_obj(self.raw(), try ofsArg(self, ofs), index, &out_ofs)
             else
-                c.shim_lite3_arr_get_obj(self.buf, self.len, @backingInt(ofs), index, &out_ofs);
+                c.shim_lite3_arr_get_obj(self.buf, self.len, try ofsArg(self, ofs), index, &out_ofs);
             if (ret < 0) return translateError(ret);
             return @fromBackingInt(@intCast(out_ofs));
         }
@@ -736,9 +783,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             var out_ofs: usize = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_arr(self.raw(), @backingInt(ofs), index, &out_ofs)
+                c.shim_lite3_ctx_arr_get_arr(self.raw(), try ofsArg(self, ofs), index, &out_ofs)
             else
-                c.shim_lite3_arr_get_arr(self.buf, self.len, @backingInt(ofs), index, &out_ofs);
+                c.shim_lite3_arr_get_arr(self.buf, self.len, try ofsArg(self, ofs), index, &out_ofs);
             if (ret < 0) return translateError(ret);
             return @fromBackingInt(@intCast(out_ofs));
         }
@@ -747,9 +794,9 @@ fn SharedMethods(comptime Self: type) type {
         pub fn arrGetType(self: *const Self, ofs: Offset, index: u32) Error!Type {
             try ensureUsable(self);
             const t = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_type(self.raw(), @backingInt(ofs), index)
+                c.shim_lite3_ctx_arr_get_type(self.raw(), try ofsArg(self, ofs), index)
             else
-                c.shim_lite3_arr_get_type(self.buf, self.len, @backingInt(ofs), index);
+                c.shim_lite3_arr_get_type(self.buf, self.len, try ofsArg(self, ofs), index);
             if (t < 0) return translateError(t);
             if (t >= @backingInt(Type.invalid)) return Error.CorruptData;
             const ret: Type = @fromBackingInt(@intCast(t));
@@ -783,9 +830,9 @@ fn SharedMethods(comptime Self: type) type {
             try ensureUsable(self);
             var out: u32 = 0;
             const ret = if (is_ctx)
-                c.shim_lite3_ctx_count(self.raw(), @backingInt(ofs), &out)
+                c.shim_lite3_ctx_count(self.raw(), try ofsArg(self, ofs), &out)
             else
-                c.shim_lite3_count(self.buf, self.len, @backingInt(ofs), &out);
+                c.shim_lite3_count(self.buf, self.len, try ofsArg(self, ofs), &out);
             if (ret < 0) return translateError(ret);
             return out;
         }
@@ -799,12 +846,17 @@ fn SharedMethods(comptime Self: type) type {
             const buf_ptr: [*]const u8 = if (is_ctx) c.shim_lite3_ctx_buf(self.raw()) else self.buf;
             const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.raw()) else self.len;
             var iter: c.shim_lite3_iter = undefined;
-            const ret = c.shim_lite3_iter_create(buf_ptr, buf_len, @backingInt(ofs), &iter);
+            const o = try ofsArg(self, ofs);
+            const ret = c.shim_lite3_iter_create(buf_ptr, buf_len, o, &iter);
             if (ret < 0) return translateError(ret);
+            var n: u32 = 0;
+            const count_ret = c.shim_lite3_count(buf_ptr, buf_len, o, &n);
+            if (count_ret < 0) return translateError(count_ret);
             return Iterator{
                 .raw = iter,
                 .buf = buf_ptr,
                 .buflen = buf_len,
+                .remaining = @min(n, buf_len),
             };
         }
 
@@ -819,7 +871,7 @@ fn SharedMethods(comptime Self: type) type {
             const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.raw()) else self.len;
             var out_len: usize = 0;
             var out: [*c]u8 = null;
-            const ret = c.shim_lite3_json_enc(buf_ptr, buf_len, @backingInt(ofs), &out, &out_len);
+            const ret = c.shim_lite3_json_enc(buf_ptr, buf_len, try ofsArg(self, ofs), &out, &out_len);
             if (ret < 0) return translateError(ret);
             return JsonString{ .ptr = out, .len = out_len };
         }
@@ -833,7 +885,7 @@ fn SharedMethods(comptime Self: type) type {
             const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.raw()) else self.len;
             var out_len: usize = 0;
             var out: [*c]u8 = null;
-            const ret = c.shim_lite3_json_enc_pretty(buf_ptr, buf_len, @backingInt(ofs), &out, &out_len);
+            const ret = c.shim_lite3_json_enc_pretty(buf_ptr, buf_len, try ofsArg(self, ofs), &out, &out_len);
             if (ret < 0) return translateError(ret);
             return JsonString{ .ptr = out, .len = out_len };
         }
@@ -995,7 +1047,7 @@ pub const Buffer = struct {
         try SharedMethods(Buffer).ensureUsable(self);
         if (!json_enabled) return Error.InvalidArgument;
         var len: usize = 0;
-        const ret = c.shim_lite3_json_enc_buf(self.buf, self.len, @backingInt(ofs), out.ptr, out.len, &len);
+        const ret = c.shim_lite3_json_enc_buf(self.buf, self.len, try SharedMethods(Buffer).ofsArg(self, ofs), out.ptr, out.len, &len);
         if (ret < 0) return translateError(ret);
         return len;
     }
@@ -1089,6 +1141,14 @@ pub const Context = struct {
 
     /// Initialize a context by copying from an existing buffer.
     pub fn initFromBuf(buf: []const u8) Error!Context {
+        if (buf.len == 0) return Error.InvalidArgument;
+        try validate(buf);
+        return initFromBufUnchecked(buf);
+    }
+
+    /// Like `initFromBuf`, but skips `validate`. Only for bytes this program
+    /// produced itself.
+    pub fn initFromBufUnchecked(buf: []const u8) Error!Context {
         var ctx: ?*c.lite3_ctx = null;
         const ret = c.shim_lite3_ctx_create_from_buf(buf.ptr, buf.len, &ctx);
         if (ret < 0) return translateError(ret);
@@ -1149,6 +1209,14 @@ pub const Context = struct {
 
     /// Import data from an existing buffer into this context.
     pub fn importFromBuf(self: *Context, buf: []const u8) Error!void {
+        if (buf.len == 0) return Error.InvalidArgument;
+        try validate(buf);
+        return self.importFromBufUnchecked(buf);
+    }
+
+    /// Like `importFromBuf`, but skips `validate`. Only for bytes this
+    /// program produced itself.
+    pub fn importFromBufUnchecked(self: *Context, buf: []const u8) Error!void {
         try self.ensureAlive();
         const ret = c.shim_lite3_ctx_import_from_buf(self.raw(), buf.ptr, buf.len);
         if (ret < 0) return translateError(ret);
@@ -1256,9 +1324,17 @@ pub const ManagedContext = struct {
     /// Initialize a managed context from an existing Lite3 buffer.
     pub fn initFromBuf(allocator: std.mem.Allocator, src: []const u8) Error!ManagedContext {
         if (src.len == 0) return Error.InvalidArgument;
+        try validate(src);
+        return initFromBufUnchecked(allocator, src);
+    }
+
+    /// Like `initFromBuf`, but skips `validate`. Only for bytes this program
+    /// produced itself.
+    pub fn initFromBufUnchecked(allocator: std.mem.Allocator, src: []const u8) Error!ManagedContext {
+        if (src.len == 0) return Error.InvalidArgument;
         var self = try initWithCapacity(allocator, src.len);
         errdefer self.deinit();
-        try self.importFromBuf(src);
+        try self.importFromBufUnchecked(src);
         return self;
     }
 
@@ -1302,9 +1378,20 @@ pub const ManagedContext = struct {
     /// Replace contents with an existing Lite3 buffer.
     pub fn importFromBuf(self: *ManagedContext, src: []const u8) Error!void {
         if (src.len == 0) return Error.InvalidArgument;
-        try self.ensureCapacity(src.len);
+        try validate(src);
+        return self.importFromBufUnchecked(src);
+    }
+
+    /// Like `importFromBuf`, but skips `validate`. Only for bytes this
+    /// program produced itself.
+    pub fn importFromBufUnchecked(self: *ManagedContext, src: []const u8) Error!void {
+        if (src.len == 0) return Error.InvalidArgument;
+        try self.ensureAlive();
+        // `src` may be (part of) this context's own storage: it then already
+        // fits, and must be moved before anything could reallocate it.
+        if (!aliases(self.storageSlice(), src)) try self.ensureCapacity(src.len);
         const mem = self.storageSlice();
-        @memcpy(mem[0..src.len], src);
+        @memmove(mem[0..src.len], src);
         self.inner.buf = mem.ptr;
         self.inner.len = src.len;
         self.inner.capacity = mem.len;
@@ -1614,9 +1701,17 @@ pub const ExternalContext = struct {
     /// Initialize an external context from an existing Lite3 buffer.
     pub fn initFromBuf(allocator: std.mem.Allocator, src: []const u8) Error!ExternalContext {
         if (src.len == 0) return Error.InvalidArgument;
+        try validate(src);
+        return initFromBufUnchecked(allocator, src);
+    }
+
+    /// Like `initFromBuf`, but skips `validate`. Only for bytes this program
+    /// produced itself.
+    pub fn initFromBufUnchecked(allocator: std.mem.Allocator, src: []const u8) Error!ExternalContext {
+        if (src.len == 0) return Error.InvalidArgument;
         var self = try initWithCapacity(allocator, src.len);
         errdefer self.deinit(allocator);
-        try self.importFromBuf(allocator, src);
+        try self.importFromBufUnchecked(allocator, src);
         return self;
     }
 
@@ -1662,9 +1757,19 @@ pub const ExternalContext = struct {
     /// Replace contents with an existing Lite3 buffer.
     pub fn importFromBuf(self: *ExternalContext, allocator: std.mem.Allocator, src: []const u8) Error!void {
         if (src.len == 0) return Error.InvalidArgument;
-        try self.ensureCapacity(allocator, src.len);
+        try validate(src);
+        return self.importFromBufUnchecked(allocator, src);
+    }
+
+    /// Like `importFromBuf`, but skips `validate`. Only for bytes this
+    /// program produced itself.
+    pub fn importFromBufUnchecked(self: *ExternalContext, allocator: std.mem.Allocator, src: []const u8) Error!void {
+        if (src.len == 0) return Error.InvalidArgument;
+        try self.ensureAlive();
+        // See ManagedContext.importFromBufUnchecked.
+        if (!aliases(self.storageSlice(), src)) try self.ensureCapacity(allocator, src.len);
         const mem = self.storageSlice();
-        @memcpy(mem[0..src.len], src);
+        @memmove(mem[0..src.len], src);
         self.inner.buf = mem.ptr;
         self.inner.len = src.len;
         self.inner.capacity = mem.len;
