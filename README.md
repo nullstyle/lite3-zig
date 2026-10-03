@@ -101,7 +101,7 @@ zig build -Doptimize=ReleaseFast
 | `-Dlto=true`       | `false` | Link-time optimization across Zig and C (inlines shim calls; uses the LLVM backend for every artifact) |
 | `-Dc-optimize=…`   | same as `-Doptimize` | Optimize mode for the C library. In Debug/ReleaseSafe the C code runs under UBSan |
 
-Build steps: `test`, `examples`, `bench` (always ReleaseFast), `check` (compile everything without running), `lint-c` (project C sources with `-Werror`).
+Build steps: `test`, `test-upstream` (lite3's own C tests against the vendored sources), `test-valgrind` (needs valgrind; pass `-Dcpu=x86_64_v3`), `examples`, `bench` (always ReleaseFast), `check` (compile everything without running), `lint-c` (project C sources with `-Werror`).
 
 ### Building examples
 

@@ -20,8 +20,20 @@ test-fast:
 test-no-json:
     zig build test -Djson=false
 
+# Run lite3's upstream C tests against the vendored sources
+test-upstream:
+    zig build test-upstream
+
+# Run the tests under valgrind (valgrind cannot decode AVX-512, hence the CPU pin)
+test-valgrind:
+    zig build test-valgrind -Dcpu=x86_64_v3
+
+# Compile the project's own C sources with -Werror
+lint-c:
+    zig build lint-c
+
 # Run all test variants
-test-all: test test-release test-fast test-no-json
+test-all: test test-release test-fast test-no-json test-upstream
 
 # Run the local GitHub Actions CI workflow with act
 act-local:
@@ -45,8 +57,8 @@ bench:
 
 # Check source formatting
 fmt-check:
-    zig fmt --check src/lite3.zig src/tests.zig src/bench.zig
+    zig fmt --check build.zig build.zig.zon src examples
 
 # Format source files
 fmt:
-    zig fmt src/lite3.zig src/tests.zig src/bench.zig
+    zig fmt build.zig build.zig.zon src examples

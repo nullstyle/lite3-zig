@@ -46,6 +46,19 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run lite3-zig tests");
     test_step.dependOn(&run_tests.step);
 
+    // Same tests under valgrind memcheck (needs valgrind on PATH; on x86_64
+    // build with e.g. -Dcpu=x86_64_v3, as valgrind cannot decode AVX-512).
+    const valgrind = b.addSystemCommand(&.{
+        "valgrind",
+        "--quiet",
+        "--error-exitcode=1",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
+    });
+    valgrind.addArtifactArg(tests);
+    const valgrind_step = b.step("test-valgrind", "Run lite3-zig tests under valgrind");
+    valgrind_step.dependOn(&valgrind.step);
+
     // --- Benchmarks ---
     // Benchmarks always measure optimized code, so they get their own
     // ReleaseFast build of the library regardless of -Doptimize.
@@ -91,6 +104,24 @@ pub fn build(b: *std.Build) void {
         examples_step.dependOn(&b.addInstallArtifact(ex_exe, .{}).step);
     }
 
+    // --- Upstream C tests ---
+    // lite3's own test programs, built against the vendored (patched) sources
+    // with the same configuration as the library. They expect to run from
+    // the lite3 source root.
+    const upstream_step = b.step("test-upstream", "Build and run lite3's upstream C tests");
+    for (upstream_tests) |t| {
+        if (t.needs_json and !enable_json) continue;
+        const mod = b.createModule(.{ .target = target, .optimize = c_optimize, .link_libc = true });
+        mod.addIncludePath(b.path("vendor/lite3/include"));
+        mod.addCSourceFile(.{ .file = b.path(t.path), .flags = &vendor_flags });
+        mod.linkLibrary(lite3.lib);
+        const exe = b.addExecutable(.{ .name = std.fs.path.stem(t.path), .root_module = mod });
+        const run = b.addRunArtifact(exe);
+        run.setCwd(b.path("vendor/lite3"));
+        run.expectExitCode(0);
+        upstream_step.dependOn(&run.step);
+    }
+
     // --- C lint ---
     // The project's own C files must compile without warnings. (Zig only
     // shows C warnings when a compile fails, so they are promoted to errors
@@ -106,6 +137,28 @@ pub fn build(b: *std.Build) void {
     const lint_step = b.step("lint-c", "Compile the project's own C sources with -Werror");
     lint_step.dependOn(&lint_lib.step);
 }
+
+const upstream_tests = [_]struct { path: []const u8, needs_json: bool }{
+    .{ .path = "vendor/lite3/tests/alignment_zeroing.c", .needs_json = false },
+    .{ .path = "vendor/lite3/tests/collisions.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/john_doe.c", .needs_json = false },
+    .{ .path = "vendor/lite3/tests/nested_generations.c", .needs_json = false },
+    .{ .path = "vendor/lite3/tests/type_queries.c", .needs_json = false },
+    .{ .path = "vendor/lite3/tests/examples/buffer_api_01_building_messages.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/buffer_api_02_reading_messages.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/buffer_api_03_strings.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/buffer_api_04_nesting.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/buffer_api_05_arrays.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/buffer_api_06_iterators.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/buffer_api_07_json_conversion.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/context_api_01_building_messages.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/context_api_02_reading_messages.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/context_api_03_strings.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/context_api_04_nesting.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/context_api_05_arrays.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/context_api_06_iterators.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/context_api_07_json_conversion.c", .needs_json = true },
+};
 
 const Config = struct {
     target: std.Build.ResolvedTarget,

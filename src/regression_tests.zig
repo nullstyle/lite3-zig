@@ -258,3 +258,36 @@ test "CRT-5: jsonDecode reports where invalid JSON fails" {
     try testing.expectError(lite3.Error.InvalidArgument, ctx.jsonDecodeDiagnostics("[1, 2", &diag3));
     try testing.expectEqual(@as(usize, 5), diag3.position);
 }
+
+test "CSH-7/SEC-6: setObj/setArr over a long string place the node 4-aligned" {
+    var mem: [4096]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.initObj(&mem);
+    // Key and value lengths chosen so the reused slot starts off a 4-byte boundary.
+    for ([_]usize{ 95, 96, 97, 98, 120 }) |len| {
+        try buf.setStr(lite3.root, "k", repeatByte('s', len));
+        const obj = try buf.setObj(lite3.root, "k");
+        try testing.expectEqual(@as(usize, 0), @backingInt(obj) % 4);
+        try buf.setI64(obj, "inner", 1);
+        try testing.expectEqual(@as(i64, 1), try buf.getI64(obj, "inner"));
+
+        try buf.setStr(lite3.root, "k", repeatByte('s', len));
+        const arr = try buf.setArr(lite3.root, "k");
+        try testing.expectEqual(@as(usize, 0), @backingInt(arr) % 4);
+    }
+}
+
+fn repeatByte(comptime byte: u8, len: usize) []const u8 {
+    const max = 128;
+    const all: [max]u8 = @splat(byte);
+    return all[0..len];
+}
+
+test "SEC-7: {\"\":null} decodes, reads back and re-encodes" {
+    if (!lite3.json_enabled) return error.SkipZigTest;
+    var mem: [1024]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.jsonDecode(&mem, "{\"\":null}");
+    try testing.expectEqual(lite3.Type.null, try buf.getType(lite3.root, ""));
+    const json = try buf.jsonEncode(lite3.root);
+    defer json.deinit();
+    try testing.expectEqualStrings("{\"\":null}", json.slice());
+}

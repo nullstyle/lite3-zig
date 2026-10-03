@@ -151,9 +151,24 @@ Zig 0.17.0 was released after the decision to track master, so the project pins 
 - Verified: 117/117 tests pass in Debug, ReleaseSafe and ReleaseFast with JSON on and off. The examples run. The bench runs. Cross-compiling to aarch64/x86_64 Linux and macOS works. `zig fmt --check` is clean.
 - Optional follow-up: a non-blocking nightly job against Zig master, as an early warning for 0.18.
 
-### Phase 1 — C layer: re-vendor, patches, safety net · ~2–3 days
+### Phase 1 — C layer: re-vendor, patches, safety net · ✅ done (2026-10-03)
 
 All of this is independent of the Zig API, so it lands first.
+
+**Status.** Implemented as planned, with these specifics and deviations:
+
+- **Vendoring:** re-vendored at `48ab0e9` with 8 patches in `vendor/patches/`. The vendored tree keeps upstream's CRLF line endings; `.gitattributes` marks `vendor/**` as binary-safe.
+- **Prefetching:** stays enabled in sanitized builds. Patch 0006 fixes the out-of-bounds index, and the suite is clean under UBSan with prefetching on; without the patch, UBSan traps at `lite3.c:487`.
+- **Sanitizer mismatch:** a sanitized C library inside a ReleaseFast/ReleaseSmall program uses trap-mode UBSan, because those programs have no UBSan runtime.
+- **Benchmarks:** the bench builds its own ReleaseFast library.
+- **Out-of-range array index:** reports `InvalidArgument`, matching upstream's `EINVAL` and the typed getters. A dedicated error is part of Phase 2.4.
+- **JSON syntax errors:** still map to `InvalidArgument`. The new `jsonDecodeDiagnostics` variants carry the yyjson position and message.
+- **Not unit-tested:** patch 0005's OOM path and patch 0007's limit, which would need fault injection or a value over 512 MiB.
+- **Verified:**
+  - 137 tests pass in Debug, ReleaseSafe and ReleaseFast, with JSON on and off, and with LTO.
+  - The 19 upstream C programs pass.
+  - Valgrind reports zero errors.
+  - Each regression test fails, or traps, when its patch is removed.
 
 1. **Re-vendor upstream `48ab0e9`.**
    - Put local changes in `vendor/patches/*.patch`: the prefetch guard, plus the fixes below.
