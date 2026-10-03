@@ -80,9 +80,26 @@ int64_t lite3_json_enc_pretty_buf(const unsigned char *buf, size_t buflen, size_
 
 #include "lite3_shim.h"
 
-int lite3zig_json_syntax_error(const char *json_str, size_t json_len, shim_json_diag *diag) {
-    (void)json_str;
+/* JSON decoding is compiled out; the Zig API rejects it at compile time, so
+   these only satisfy references. */
+int shim_json_parse(const char *json, size_t json_len, const shim_alc *alc,
+                    shim_json_diag *diag, void **out_doc) {
+    (void)json;
     (void)json_len;
+    (void)alc;
     (void)diag;
-    return 0;
+    (void)out_doc;
+    return -LITE3ZIG_E_UNKNOWN;
+}
+
+int shim_json_convert(void *doc, unsigned char *buf, size_t *out_buflen, size_t bufsz) {
+    (void)doc;
+    (void)buf;
+    (void)out_buflen;
+    (void)bufsz;
+    return -LITE3ZIG_E_UNKNOWN;
+}
+
+void shim_json_free(void *doc) {
+    (void)doc;
 }

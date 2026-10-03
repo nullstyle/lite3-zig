@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lite3-zig <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 16:03:11 +0000
+Subject: [PATCH] Zero alignment padding before split nodes
+
+With LITE3_ZERO_MEM_EXTRA (on by default, documented as preventing
+uninitialized memory from leaking into messages), entry padding is
+zeroed but the up-to-3 bytes skipped to align a new node during a split
+were not, so serialized documents could carry stale memory.
+---
+ src/lite3.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/lite3.c b/src/lite3.c
+index 4ed062e..532cfca 100644
+--- a/src/lite3.c
++++ b/src/lite3.c
+@@ -608,6 +608,9 @@ int lite3_set_impl(
+ 					errno = ENOBUFS;
+ 					return -1;
+ 				}
++				#ifdef LITE3_ZERO_MEM_EXTRA
++					memset(buf + *inout_buflen, LITE3_ZERO_MEM_8, buflen_aligned - *inout_buflen); // alignment padding
++				#endif
+ 				*inout_buflen = buflen_aligned;
+ 				// TODO: add lost bytes from alignment to GC index
+ 				if (!parent) {								// if root split, create new root

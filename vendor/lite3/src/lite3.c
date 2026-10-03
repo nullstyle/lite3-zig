@@ -608,6 +608,9 @@ int lite3_set_impl(
 					errno = ENOBUFS;
 					return -1;
 				}
+				#ifdef LITE3_ZERO_MEM_EXTRA
+					memset(buf + *inout_buflen, LITE3_ZERO_MEM_8, buflen_aligned - *inout_buflen); // alignment padding
+				#endif
 				*inout_buflen = buflen_aligned;
 				// TODO: add lost bytes from alignment to GC index
 				if (!parent) {								// if root split, create new root
