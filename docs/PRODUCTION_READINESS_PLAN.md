@@ -206,7 +206,35 @@ All of this is independent of the Zig API, so it lands first.
 
 Exit criteria: the C-level reproduction tests (iterator key, size-0 string, unterminated key, NUL key in JSON, misaligned overwrite, `{"":null}`) pass under UBSan and valgrind.
 
-### Phase 2 — Untrusted-input core · ~3–4 days
+### Phase 2 — Untrusted-input core · ✅ done (2026-10-03)
+
+**Status.** Implemented against the current types; the Phase 3 names (`View`, `Document`) don't exist yet. Specifics and deviations:
+
+- **Two validation levels.**
+  - `lite3.validate(bytes)` is allocation-free and uses about 6 KiB of stack. It guarantees in-bounds, bounded work and consistent reads and writes.
+  - `lite3.validateStrict(gpa, bytes)` additionally proves no byte is used twice, so the document stays valid under writes.
+  - Why two: the planned visited bitset needs memory, and the allocation-free byte budget cannot see sharing that fits inside dead space. A fuzzer-found case showed such a document can turn `CorruptData` after a legitimate write, though it stays memory-safe.
+- **What `validate` checks** goes beyond the original list:
+  - Each key's stored hash must be where lite3's probing finds it: every earlier probe slot must hold a different key. This also rules out duplicate keys.
+  - Leaves must have all eight child slots zero. A stray child pointer would become live after an insert.
+  - Nesting is capped at `max_nesting_depth` = 64.
+- **Constructors** (`Buffer.fromSerialized`, `initFromBuf`, `importFromBuf` on all four types) validate first and leave the document untouched on rejection. `*Unchecked` variants skip validation.
+- **Always-on checks:**
+  - container `Offset` alignment and range → `InvalidArgument`
+  - returned slices must lie inside the document → `CorruptData`
+  - iteration is capped at the element count → `CorruptData`
+- **Limits:**
+  - `initWithOptions(.{ .initial_capacity, .max_capacity })` on Managed/External.
+  - Patch 0009 makes probe exhaustion `ENOSPC` on insert, surfaced as the new `error.KeyCollision`, and `ENOENT` on lookup.
+  - `lite3.max_key_len` is public.
+- **Fuzzing:**
+  - Four `std.testing.fuzz` targets (`src/fuzz_tests.zig`) plus a deterministic 3,000-iteration mutation sweep that runs on every `zig build test`.
+  - Coverage instrumentation needs the LLVM backend, so fuzzing runs in ReleaseSafe.
+  - CI fuzzes each target for 200K iterations on every push and 20M nightly.
+  - `-Dtest-filter` was added to select targets.
+- **Bug found by fuzzing:** `lite3_set_obj`/`set_arr` and their ctx variants are macros with an early `return`, which bypassed the Phase 1 status translation, so validation failures surfaced as `NotFound`. Fixed with helper functions and a regression test.
+- **Threat model:** `SECURITY.md`.
+- **Fuzz results:** a one-hour run of each target is in progress; results will be recorded here.
 
 Untrusted buffers are a supported use case. The wrapper's contract becomes: **no API reachable from safe-looking code reads or writes outside the document, loops without bound, or crashes, whatever bytes it is given.**
 
