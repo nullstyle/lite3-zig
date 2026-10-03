@@ -288,9 +288,39 @@ Exit criteria:
 - A one-hour local `--fuzz` run on each target finds nothing.
 - Valgrind and UBSan are clean on the fuzz corpus.
 
-### Phase 3 — New API (single release) · ~1–2 weeks
+### Phase 3 — New API (single release) · ✅ done (2026-10-03)
 
 There are no users, so this replaces the four current types outright: no aliases, no deprecations.
+
+**Status.** Implemented, with these specifics and deviations:
+
+- **Reads are pure Zig.** `View` implements lookup (lite3's hash probing), iteration and JSON encoding directly on the format, bounds-checking every access, so reads make no C calls. They are faster than lite3's own C getters. The C shim shrank to two insert functions plus JSON decoding.
+- **`View` takes `[]const u8`**, not `[]align(4) const u8`: reads don't need alignment, so received bytes can be viewed in place. Writable documents (`Buffer`, `Document`) are 4-aligned.
+- **Lifetimes.** One mutation epoch per document; `View`s and iterators return `error.StaleView` (the plan's `StaleIterator`) after any write, including growth. **By-value copies of a `Document` are not detected**: a self-pointer check would forbid returning a `Document` from `init`. The README and SECURITY.md document this; `clone` is the supported copy.
+- **Keys.** `lite3.key("k")` hashes at compile time; `Key.init` hashes once at run time. Any key length lite3 supports can be read. A `Buffer` copies keys without a NUL terminator into a 1 KiB stack buffer (`max_stack_key_len`); longer ones must be `[:0]const u8`. `Document` copies them to the heap.
+- **Aliasing.** Values and keys that lie in the document are copied aside before a write (for a `Buffer`, values up to `alias_scratch_len` = 4 KiB, else `error.ValueAliasesDocument`). The copy is out of line, so the common write path stays small.
+- **Growth.** `Document` reserves an upper bound for one entry plus two split nodes before writing, and retries with more room if lite3 still runs out (cascading splits). A failed write leaves a valid document; a failed allocation leaves it unchanged (tested with `FailingAllocator`).
+- **JSON.** Encoding is pure Zig and works with `-Djson=false`; floats always carry a `.` or exponent, bytes are base64. Decoding uses yyjson with the caller's allocator. A pre-pass rejects nesting deeper than 32, NUL in keys and scalar roots, each with its own error. With `-Djson=false` the decoding functions are compile errors, not runtime errors.
+- **`ctx_api.c`** is no longer compiled into the library; only the upstream test programs build it.
+- **Upstream bug found:** node splits left alignment padding uninitialised, which leaked caller memory into documents. Fixed in patch 0010, with a test that builds documents in memory pre-filled with 0x00 and with 0xff and requires identical bytes.
+- **Tests:** 60 tests:
+  - API tests, generic over all three document types.
+  - Ported regression tests.
+  - Validation tests.
+  - A model-based property test (seed printed on failure).
+  - `checkAllAllocationFailures` for Document operations and JSON decoding.
+  - A golden fixture (`src/testdata/sample.lite3`, regenerate with `LITE3_UPDATE_GOLDEN=1`).
+  - Four fuzz targets.
+- **Mutation testing:** MUT_RESULT
+- **Performance:** the target was benchmark overhead ≤ 15% against raw lite3. Measured with callgrind, since wall-clock time on the shared machine varied by up to 60% between runs:
+  - Writes run about 17% more instructions than the equivalent lite3 C macros (`set`: 429 vs 366 per op; append: +9%). The extra goes on the container-type check, the stale-view epoch, and the shim call.
+  - Reads and iteration are faster than C.
+  - The write overhead is above the 15% target. Closing it would mean dropping checks, so it is documented instead.
+- **Verified:**
+  - 60/60 tests pass in Debug, ReleaseSafe, ReleaseFast and ReleaseSmall (52 + 8 skipped with `-Djson=false`).
+  - The upstream C tests pass.
+  - Valgrind is clean.
+  - FUZZ_RESULT
 
 1. **Types:**
    - **`View`:** read-only, over `[]align(4) const u8`. It implements every read, iteration, JSON output and `format()` once.
