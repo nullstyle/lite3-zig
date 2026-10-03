@@ -77,6 +77,9 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "lite3", .module = bench_lite3.module }},
         }),
     });
+    // The same loops written against lite3's C API, for comparison.
+    bench_exe.root_module.addCSourceFile(.{ .file = b.path("src/bench_raw.c"), .flags = &vendor_flags });
+    bench_exe.root_module.addIncludePath(b.path("vendor/lite3/include"));
     if (enable_lto) enableLto(bench_exe);
     check_step.dependOn(&bench_exe.step);
 

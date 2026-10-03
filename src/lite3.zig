@@ -910,7 +910,7 @@ const Raw = struct {
         };
     }
 
-    fn insertScalar(r: Raw, at: Offset, slot: Slot, z: ?[*:0]const u8, value: Scalar) WriteError!void {
+    inline fn insertScalar(r: Raw, at: Offset, slot: Slot, z: ?[*:0]const u8, value: Scalar) WriteError!void {
         const payload_len = try value.payloadLen();
         const k = keyParts(slot, z);
         var payload_ofs: u32 = 0;
@@ -929,7 +929,7 @@ const Raw = struct {
 };
 
 /// Check the target of a write and resolve the slot.
-fn writeSlot(v: View, at: Offset, target: anytype) WriteError!Slot {
+inline fn writeSlot(v: View, at: Offset, target: anytype) WriteError!Slot {
     const T = @TypeOf(target);
     if (T == Append) {
         try expectWritable(v, at, .array);
@@ -1055,10 +1055,19 @@ pub const Buffer = struct {
         const scalar = try Scalar.of(value);
         const slot = try writeSlot(self.raw().view(), at, target);
         self.epoch +%= 1;
+        // A value inside this Buffer could be clobbered (lite3 zeroes the old
+        // value on overwrite) before it is copied in, and so could a key.
+        if (directKey(slot, self.mem)) |z| {
+            if (!overlaps(self.mem, scalar.data())) return self.raw().insertScalar(at, slot, z, scalar);
+        }
+        return self.writeCopied(at, slot, scalar);
+    }
+
+    /// `write` with the key and value copied out of the document first.
+    /// Kept out of line so the common path has a small stack frame.
+    noinline fn writeCopied(self: *Buffer, at: Offset, slot: Slot, scalar: Scalar) WriteError!void {
         var key_buf: [max_stack_key_len + 1]u8 = undefined;
         const z = try stackKey(slot, &key_buf, self.mem);
-        // A value inside this Buffer could be clobbered (lite3 zeroes the old
-        // value on overwrite) before it is copied in.
         var scratch: [alias_scratch_len]u8 = undefined;
         const data = scalar.data();
         var stored = scalar;
@@ -1073,6 +1082,7 @@ pub const Buffer = struct {
     fn writeContainer(self: *Buffer, at: Offset, target: anytype, kind: Container) WriteError!Offset {
         const slot = try writeSlot(self.raw().view(), at, target);
         self.epoch +%= 1;
+        if (directKey(slot, self.mem)) |z| return self.raw().insertContainer(at, slot, z, kind);
         var key_buf: [max_stack_key_len + 1]u8 = undefined;
         const z = try stackKey(slot, &key_buf, self.mem);
         return self.raw().insertContainer(at, slot, z, kind);
@@ -1122,6 +1132,18 @@ pub const Buffer = struct {
         return self.writeContainer(arr, ArrayIndex{ .index = index }, .array);
     }
 };
+
+/// The key's own NUL-terminated pointer (null for array slots), or null if
+/// it has to be copied first (see `stackKey`).
+inline fn directKey(slot: Slot, doc: []const u8) ??[*:0]const u8 {
+    const k = switch (slot) {
+        .key => |k| k,
+        .index => return @as(?[*:0]const u8, null),
+    };
+    const z = k.z orelse return null;
+    if (overlaps(doc, k.bytes)) return null;
+    return z;
+}
 
 /// NUL-terminated pointer for a key, copying into `buf` when the key has no
 /// terminator or lies inside the document (lite3 may zero the old entry
