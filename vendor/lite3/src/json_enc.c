@@ -152,7 +152,7 @@ int _lite3_json_enc_obj(const unsigned char *buf, size_t buflen, size_t ofs, siz
         	val = (lite3_val *)(buf + val_ofs);
         	if ((ret = _lite3_json_enc_switch(buf, buflen, nesting_depth, doc, &yy_val, val)) < 0)
         		return ret;
-                if (!yyjson_mut_obj_add(coll, yyjson_mut_str(doc, LITE3_STR(buf, key)), yy_val)) {
+                if (!yyjson_mut_obj_add(coll, yyjson_mut_strn(doc, LITE3_STR(buf, key), key.len), yy_val)) {
 			LITE3_PRINT_ERROR("FAILED TO BUILD JSON DOCUMENT: ADDING KEY-VALUE PAIR FAILED\n");
 			errno = EINVAL;
 			return -1;

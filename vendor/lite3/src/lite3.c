@@ -160,6 +160,13 @@ static inline int _verify_key(
 		errno = EFAULT;
 		return -1;
 	}
+	// Stored key size includes the NULL-terminator, so it is at least 1 and the last byte must be 0.
+	// Readers (iterator, JSON encoder, LITE3_STR() users) rely on this termination.
+	if (LITE3_UNLIKELY(_key_size == 0 || buf[*inout_ofs + _key_size - 1] != 0)) {
+		LITE3_PRINT_ERROR("KEY ENTRY NOT NULL-TERMINATED\n");
+		errno = EBADMSG;
+		return -1;
+	}
 	if (key_size) {
 		int cmp = memcmp(
 			(const char *)(buf + *inout_ofs),
@@ -404,10 +411,11 @@ int lite3_iter_next(const unsigned char *buf, size_t buflen, lite3_iter *iter, l
 		if ((ret = _verify_key(buf, buflen, NULL, 0, 0, &target_ofs, &key_tag_size)) < 0)
 			return ret;
 		if (out_key) {
+			// _verify_key() advanced target_ofs past the tag and the key, so the stored key size
+			// (including NULL-terminator, at least 1) is what lies between them.
+			size_t key_size = target_ofs - key_start_ofs - key_tag_size;
 			out_key->gen = iter->gen;
-			out_key->len = 0;
-			memcpy(&out_key->len, buf + key_start_ofs, key_tag_size);
-			--out_key->len; // Lite³ stores string size including NULL-terminator. Correction required for public API.
+			out_key->len = (uint32_t)(key_size - 1); // exclusive of NULL-terminator
 			out_key->ptr = (const char *)(buf + key_start_ofs + key_tag_size);
 		}
 	}

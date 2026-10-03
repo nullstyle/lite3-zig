@@ -1694,3 +1694,7 @@ test "Fuzz: Context rapid grow/shrink cycle" {
     try ctx.setI64(lite3.root, "final", 999);
     try testing.expectEqual(@as(i64, 999), try ctx.getI64(lite3.root, "final"));
 }
+
+test {
+    _ = @import("regression_tests.zig");
+}
