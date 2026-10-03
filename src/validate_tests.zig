@@ -227,3 +227,59 @@ test "SEC-4: iteration over an unvalidated document is capped by its element cou
     for (0..3) |_| _ = (try it.next()).?;
     try testing.expectError(error.CorruptData, it.next());
 }
+
+const ofs_hashes = 4;
+const ofs_kv = 36;
+
+test "validate: rejects keys stored out of hash order" {
+    var mem: [4096]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.init(&mem, .object);
+    try buf.set(lite3.root, "a", 1);
+    try buf.set(lite3.root, "b", 2);
+    try lite3.validate(buf.slice());
+    // Swap both entries (hash and kv offset) so the node is unsorted.
+    const h0 = readU32(&mem, ofs_hashes);
+    const k0 = readU32(&mem, ofs_kv);
+    writeU32(&mem, ofs_hashes, readU32(&mem, ofs_hashes + 4));
+    writeU32(&mem, ofs_kv, readU32(&mem, ofs_kv + 4));
+    writeU32(&mem, ofs_hashes + 4, h0);
+    writeU32(&mem, ofs_kv + 4, k0);
+    try testing.expectError(error.CorruptData, lite3.validate(buf.slice()));
+}
+
+test "validate: a probed key's hash must be its hash plus a square" {
+    // "Aa" and "B@" share a DJB2 hash h; "B@" is stored at h + 1 (attempt 1).
+    var mem: [4096]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.init(&mem, .object);
+    try buf.set(lite3.root, "Aa", 0);
+    try buf.set(lite3.root, "B@", 1);
+    try lite3.validate(buf.slice());
+    const h0 = readU32(&mem, ofs_hashes);
+    try testing.expectEqual(h0 + 1, readU32(&mem, ofs_hashes + 4));
+    // h + 2 is in order and h is occupied, but 2 is not a square.
+    writeU32(&mem, ofs_hashes + 4, h0 + 2);
+    try testing.expectError(error.CorruptData, lite3.validate(buf.slice()));
+}
+
+test "validateStrict: rejects two entries sharing one value" {
+    var mem: [4096]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.init(&mem, .array);
+    try buf.append(lite3.root, 1);
+    try buf.append(lite3.root, 2);
+    writeU32(&mem, ofs_kv + 4, readU32(&mem, ofs_kv));
+    // Readable and in bounds (validate), but writes could corrupt it.
+    try lite3.validate(buf.slice());
+    try testing.expectError(error.CorruptData, lite3.validateStrict(testing.allocator, buf.slice()));
+}
+
+test "validate: rejects a leaf with a stray child offset" {
+    var mem: [4096]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.init(&mem, .object);
+    try buf.set(lite3.root, "a", 1);
+    try buf.set(lite3.root, "b", 2);
+    try testing.expectEqual(@as(u32, 0), readU32(&mem, ofs_child));
+    // child_ofs[0] == 0 makes this a leaf; lite3 would still copy the
+    // unused slots on a split.
+    writeU32(&mem, ofs_child + 4 * 5, node_size);
+    try testing.expectError(error.CorruptData, lite3.validate(buf.slice()));
+}

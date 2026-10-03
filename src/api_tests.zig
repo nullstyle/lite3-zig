@@ -614,3 +614,22 @@ test "reserve and shrinkToFit make earlier views stale" {
     try testing.expectError(error.StaleView, v.get([]const u8, root, "a"));
     try testing.expectEqualStrings("value", try doc.view().get([]const u8, root, "a"));
 }
+
+test "compact makes earlier views stale" {
+    var doc = try lite3.Document.init(testing.allocator, .object);
+    defer doc.deinit(testing.allocator);
+    try doc.set(testing.allocator, root, "a", "value");
+    const v = doc.view();
+    try doc.compact(testing.allocator);
+    try testing.expectError(error.StaleView, v.get([]const u8, root, "a"));
+}
+
+test "JSON decoding: nesting limit is exact" {
+    if (!lite3.json_enabled) return error.SkipZigTest;
+    const depth = 32;
+    const ok = util.repeat("[", depth) ++ util.repeat("]", depth);
+    const deep = util.repeat("[", depth + 1) ++ util.repeat("]", depth + 1);
+    var doc = try lite3.Document.fromJson(testing.allocator, &ok, .{});
+    defer doc.deinit(testing.allocator);
+    try testing.expectError(error.NestingTooDeep, lite3.Document.fromJson(testing.allocator, &deep, .{}));
+}

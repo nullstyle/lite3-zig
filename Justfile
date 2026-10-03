@@ -32,6 +32,10 @@ test-valgrind:
 fuzz limit="1M" filter="fuzz:":
     zig build test -Doptimize=ReleaseSafe "-Dtest-filter={{filter}}" --fuzz={{limit}}
 
+# Mutation test: apply each mutant in scripts/mutate.py and check the suite catches it
+mutate *ids:
+    scripts/mutate.py {{ids}}
+
 # Compile the project's own C sources with -Werror
 lint-c:
     zig build lint-c
