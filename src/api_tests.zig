@@ -297,8 +297,14 @@ test "JSON encoding: exact output, escapes, floats, bytes, pretty" {
         defer testing.allocator.free(json);
         // Key order is lite3's (hash) order; check each member.
         for ([_][]const u8{
-            "\"s\":\"a\\\"b\\\\c\\n\\u0001é\"", "\"i\":-42", "\"f\":1.0",     "\"g\":0.1",
-            "\"z\":-0.0",                       "\"e\":1e300", "\"b\":\"YWJj\"", "\"n\":null",
+            "\"s\":\"a\\\"b\\\\c\\n\\u0001é\"",
+            "\"i\":-42",
+            "\"f\":1.0",
+            "\"g\":0.1",
+            "\"z\":-0.0",
+            "\"e\":1e300",
+            "\"b\":\"YWJj\"",
+            "\"n\":null",
             "\"a\":[true,{},[]]",
         }) |member| {
             if (std.mem.indexOf(u8, json, member) == null) {

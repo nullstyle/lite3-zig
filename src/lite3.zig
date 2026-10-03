@@ -922,7 +922,7 @@ const Raw = struct {
     fn insertContainer(r: Raw, at: Offset, slot: Slot, z: ?[*:0]const u8, kind: Container) WriteError!Offset {
         const k = keyParts(slot, z);
         var out: u32 = 0;
-        const ret = c.shim_insert_container(r.mem.ptr, r.len, @backingInt(at), r.mem.len, k.ptr, k.hash, k.size, @intFromEnum(kind), &out);
+        const ret = c.shim_insert_container(r.mem.ptr, r.len, @backingInt(at), r.mem.len, k.ptr, k.hash, k.size, @backingInt(kind), &out);
         if (ret < 0) return mapStatus(ret);
         return @fromBackingInt(out);
     }
@@ -1042,7 +1042,7 @@ pub const Buffer = struct {
     pub fn reset(self: *Buffer, root_type: Container) WriteError!void {
         self.epoch +%= 1;
         var len: usize = 0;
-        const ret = c.shim_init(self.mem.ptr, &len, self.mem.len, @intFromEnum(root_type));
+        const ret = c.shim_init(self.mem.ptr, &len, self.mem.len, @backingInt(root_type));
         if (ret < 0) return error.NoSpaceLeft;
         self.len = len;
     }
@@ -1235,7 +1235,6 @@ fn jsonConvert(doc: ParsedJson, mem: []align(4) u8, len: *usize) DecodeError!voi
     if (ret < 0) return mapDecodeStatus(ret);
 }
 
-
 // ---------------------------------------------------------------------------
 // Document
 // ---------------------------------------------------------------------------
@@ -1364,7 +1363,7 @@ pub const Document = struct {
     pub fn reset(self: *Document, root_type: Container) void {
         self.epoch +%= 1;
         var len: usize = 0;
-        const ret = c.shim_init(self.storage.ptr, &len, self.storage.len, @intFromEnum(root_type));
+        const ret = c.shim_init(self.storage.ptr, &len, self.storage.len, @backingInt(root_type));
         std.debug.assert(ret == 0); // storage always holds at least one node
         self.len = len;
     }
