@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lite3-zig <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 07:20:26 +0000
+Subject: [PATCH] json_dec: reject NULL characters in keys and fail on scalar
+ roots
+
+A JSON key such as "a\u0000b" was passed to the setters as a C string,
+silently truncated to "a" and could overwrite an existing key. Reject
+keys containing NULL with EINVAL.
+
+A scalar JSON root set errno = EINVAL but returned 0 because ret was
+never assigned on that path, so callers saw success with an
+uninitialised buffer. Return -1.
+---
+ src/json_dec.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/json_dec.c b/src/json_dec.c
+index 4bd3b3a..d8b4b4f 100644
+--- a/src/json_dec.c
++++ b/src/json_dec.c
+@@ -34,6 +34,7 @@
+ #ifdef LITE3_JSON
+ #include <stdint.h>
+ #include <errno.h>
++#include <string.h>
+ 
+ #include "yyjson/yyjson.h"
+ 
+@@ -46,6 +47,13 @@ int _lite3_json_dec_arr(unsigned char *buf, size_t *restrict inout_buflen, size_
+ int _lite3_json_dec_obj_switch(unsigned char *buf, size_t *restrict inout_buflen, size_t ofs, size_t bufsz, size_t nesting_depth, yyjson_doc *doc, yyjson_val *yy_key, yyjson_val *yy_val)
+ {
+         const char *key = yyjson_get_str(yy_key);
++        // Lite³ keys are NULL-terminated strings; a JSON key containing \u0000 would be
++        // silently truncated and could overwrite a different key.
++        if (memchr(key, 0, yyjson_get_len(yy_key)) != NULL) {
++                LITE3_PRINT_ERROR("FAILED TO READ JSON: KEY CONTAINS NULL CHARACTER\n");
++                errno = EINVAL;
++                return -1;
++        }
+         yyjson_type type = yyjson_get_type(yy_val);
+         int ret;
+         switch (type) {
+@@ -275,6 +283,7 @@ int _lite3_json_dec_doc(unsigned char *buf, size_t *restrict out_buflen, size_t
+         default:
+                 LITE3_PRINT_ERROR("FAILED TO READ JSON: EXPECTING ARRAY OR OBJECT TYPE\n");
+                 errno = EINVAL;
++                ret = -1;
+                 goto error;
+         }
+         yyjson_doc_free(doc);

@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lite3-zig <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 07:20:10 +0000
+Subject: [PATCH] Reject zero-size strings and non-0/1 booleans in
+ _verify_val()
+
+String values store their size including the NULL-terminator and every
+reader subtracts 1, so a stored size of 0 wrapped the length to
+0xFFFFFFFF (a 4 GiB slice from a 1-byte corruption). Require size >= 1
+and a terminating NULL byte. Booleans are loaded as C _Bool, so any byte
+other than 0 or 1 is undefined behaviour; reject it too. Both return
+EBADMSG.
+---
+ src/lite3.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/lite3.c b/src/lite3.c
+index 3786ee2..3589c0a 100644
+--- a/src/lite3.c
++++ b/src/lite3.c
+@@ -224,6 +224,18 @@ static inline int _verify_val(
+ 			errno = EFAULT;
+ 			return -1;
+ 		}
++		// Strings store their size including the NULL-terminator; readers subtract 1 and rely on the
++		// terminator, so a size of 0 (which would underflow) or a missing terminator is corrupt.
++		if (type == LITE3_TYPE_STRING && LITE3_UNLIKELY(byte_count == 0 || buf[*inout_ofs + _val_entry_size - 1] != 0)) {
++			LITE3_PRINT_ERROR("STRING VALUE NOT NULL-TERMINATED\n");
++			errno = EBADMSG;
++			return -1;
++		}
++	}
++	if (type == LITE3_TYPE_BOOL && LITE3_UNLIKELY(buf[*inout_ofs + LITE3_VAL_SIZE] > 1)) {	// loaded as C _Bool
++		LITE3_PRINT_ERROR("BOOL VALUE NOT 0 OR 1\n");
++		errno = EBADMSG;
++		return -1;
+ 	}
+ 	*inout_ofs += _val_entry_size;
+ 	return 0;

@@ -34,6 +34,7 @@
 #ifdef LITE3_JSON
 #include <stdint.h>
 #include <errno.h>
+#include <string.h>
 
 #include "yyjson/yyjson.h"
 
@@ -46,6 +47,13 @@ int _lite3_json_dec_arr(unsigned char *buf, size_t *restrict inout_buflen, size_
 int _lite3_json_dec_obj_switch(unsigned char *buf, size_t *restrict inout_buflen, size_t ofs, size_t bufsz, size_t nesting_depth, yyjson_doc *doc, yyjson_val *yy_key, yyjson_val *yy_val)
 {
         const char *key = yyjson_get_str(yy_key);
+        // Lite³ keys are NULL-terminated strings; a JSON key containing \u0000 would be
+        // silently truncated and could overwrite a different key.
+        if (memchr(key, 0, yyjson_get_len(yy_key)) != NULL) {
+                LITE3_PRINT_ERROR("FAILED TO READ JSON: KEY CONTAINS NULL CHARACTER\n");
+                errno = EINVAL;
+                return -1;
+        }
         yyjson_type type = yyjson_get_type(yy_val);
         int ret;
         switch (type) {
@@ -72,11 +80,13 @@ int _lite3_json_dec_obj_switch(unsigned char *buf, size_t *restrict inout_buflen
         case YYJSON_TYPE_NUM:
                 switch (yyjson_get_subtype(yy_val)) {
                 case YYJSON_SUBTYPE_SINT:
+                        ;
                         int64_t num_i64 = yyjson_get_sint(yy_val);
                         if ((ret = lite3_set_i64(buf, inout_buflen, ofs, bufsz, key, num_i64)) < 0)
                                 return ret;
                         break;
                 case YYJSON_SUBTYPE_UINT:
+                        ;
                         uint64_t num_u64 = yyjson_get_uint(yy_val);
                         if (num_u64 <= INT64_MAX) {
                                 if ((ret = lite3_set_i64(buf, inout_buflen, ofs, bufsz, key, (int64_t)num_u64)) < 0)
@@ -88,6 +98,7 @@ int _lite3_json_dec_obj_switch(unsigned char *buf, size_t *restrict inout_buflen
                                 break;
                         }
                 case YYJSON_SUBTYPE_REAL:
+                        ;
                         double num_f64 = yyjson_get_real(yy_val);
                         if ((ret = lite3_set_f64(buf, inout_buflen, ofs, bufsz, key, num_f64)) < 0)
                                 return ret;
@@ -99,12 +110,14 @@ int _lite3_json_dec_obj_switch(unsigned char *buf, size_t *restrict inout_buflen
                 }
                 break;
         case YYJSON_TYPE_STR:
+                ;
                 const char *str = yyjson_get_str(yy_val);
                 size_t len = yyjson_get_len(yy_val);
                 if ((ret = lite3_set_str_n(buf, inout_buflen, ofs, bufsz, key, str, len)) < 0)
                         return ret;
                 break;
         case YYJSON_TYPE_OBJ:
+                ;
                 size_t obj_ofs;
                 if ((ret = lite3_set_obj(buf, inout_buflen, ofs, bufsz, key, &obj_ofs)) < 0)
                         return ret;
@@ -112,6 +125,7 @@ int _lite3_json_dec_obj_switch(unsigned char *buf, size_t *restrict inout_buflen
                         return ret;
                 break;
         case YYJSON_TYPE_ARR:
+                ;
                 size_t arr_ofs;
                 if ((ret = lite3_set_arr(buf, inout_buflen, ofs, bufsz, key, &arr_ofs)) < 0)
                         return ret;
@@ -154,11 +168,13 @@ int _lite3_json_dec_arr_switch(unsigned char *buf, size_t *restrict inout_buflen
         case YYJSON_TYPE_NUM:
                 switch (yyjson_get_subtype(yy_val)) {
                 case YYJSON_SUBTYPE_SINT:
+                        ;
                         int64_t num_i64 = yyjson_get_sint(yy_val);
                         if ((ret = lite3_arr_append_i64(buf, inout_buflen, ofs, bufsz, num_i64)) < 0)
                                 return ret;
                         break;
                 case YYJSON_SUBTYPE_UINT:
+                        ;
                         uint64_t num_u64 = yyjson_get_uint(yy_val);
                         if (num_u64 <= INT64_MAX) {
                                 if ((ret = lite3_arr_append_i64(buf, inout_buflen, ofs, bufsz, (int64_t)num_u64)) < 0)
@@ -170,6 +186,7 @@ int _lite3_json_dec_arr_switch(unsigned char *buf, size_t *restrict inout_buflen
                                 break;
                         }
                 case YYJSON_SUBTYPE_REAL:
+                        ;
                         double num_f64 = yyjson_get_real(yy_val);
                         if ((ret = lite3_arr_append_f64(buf, inout_buflen, ofs, bufsz, num_f64)) < 0)
                                 return ret;
@@ -181,12 +198,14 @@ int _lite3_json_dec_arr_switch(unsigned char *buf, size_t *restrict inout_buflen
                 }
                 break;
         case YYJSON_TYPE_STR:
+                ;
                 const char *str = yyjson_get_str(yy_val);
                 size_t len = yyjson_get_len(yy_val);
                 if ((ret = lite3_arr_append_str_n(buf, inout_buflen, ofs, bufsz, str, len)) < 0)
                         return ret;
                 break;
         case YYJSON_TYPE_OBJ:
+                ;
                 size_t obj_ofs;
                 if ((ret = lite3_arr_append_obj(buf, inout_buflen, ofs, bufsz, &obj_ofs)) < 0)
                         return ret;
@@ -194,6 +213,7 @@ int _lite3_json_dec_arr_switch(unsigned char *buf, size_t *restrict inout_buflen
                         return ret;
                 break;
         case YYJSON_TYPE_ARR:
+                ;
                 size_t arr_ofs;
                 if ((ret = lite3_arr_append_arr(buf, inout_buflen, ofs, bufsz, &arr_ofs)) < 0)
                         return ret;
@@ -263,6 +283,7 @@ int _lite3_json_dec_doc(unsigned char *buf, size_t *restrict out_buflen, size_t 
         default:
                 LITE3_PRINT_ERROR("FAILED TO READ JSON: EXPECTING ARRAY OR OBJECT TYPE\n");
                 errno = EINVAL;
+                ret = -1;
                 goto error;
         }
         yyjson_doc_free(doc);
@@ -277,7 +298,7 @@ int lite3_json_dec(unsigned char *buf, size_t *restrict out_buflen, size_t bufsz
         yyjson_read_err err;
         yyjson_doc *doc = yyjson_read_opts((char *)json_str, json_len, YYJSON_READ_NOFLAG , NULL, &err);
         if (!doc) {
-                LITE3_PRINT_ERROR("FAILED TO READ JSON STRING\tyyjson error code: %u\tmsg:%s\tat byte position: %lu\n", err.code, err.msg, err.pos);
+                LITE3_PRINT_ERROR("FAILED TO READ JSON STRING\tyyjson error code: %u\tmsg:%s\tat byte position: %zu\n", err.code, err.msg, err.pos);
                 errno = EINVAL;
                 return -1;
         }
@@ -289,7 +310,7 @@ int lite3_json_dec_file(unsigned char *buf, size_t *restrict out_buflen, size_t 
         yyjson_read_err err;
         yyjson_doc *doc = yyjson_read_file(path, YYJSON_READ_NOFLAG , NULL, &err);
         if (!doc) {
-                LITE3_PRINT_ERROR("FAILED TO READ JSON FILE\tyyjson error code: %u\tmsg:%s\tat byte position: %lu\n", err.code, err.msg, err.pos);
+                LITE3_PRINT_ERROR("FAILED TO READ JSON FILE\tyyjson error code: %u\tmsg:%s\tat byte position: %zu\n", err.code, err.msg, err.pos);
                 errno = EINVAL;
                 return -1;
         }
@@ -301,7 +322,7 @@ int lite3_json_dec_fp(unsigned char *buf, size_t *restrict out_buflen, size_t bu
         yyjson_read_err err;
         yyjson_doc *doc = yyjson_read_fp(fp, YYJSON_READ_NOFLAG , NULL, &err);
         if (!doc) {
-                LITE3_PRINT_ERROR("FAILED TO READ JSON FILE POINTER\tyyjson error code: %u\tmsg:%s\tat byte position: %lu\n", err.code, err.msg, err.pos);
+                LITE3_PRINT_ERROR("FAILED TO READ JSON FILE POINTER\tyyjson error code: %u\tmsg:%s\tat byte position: %zu\n", err.code, err.msg, err.pos);
                 errno = EINVAL;
                 return -1;
         }

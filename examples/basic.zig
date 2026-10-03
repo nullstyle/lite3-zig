@@ -1,68 +1,98 @@
-//! Basic usage of lite3-zig
+//! Basic usage of lite3-zig.
 //!
 //! Build with: zig build examples
 //!
-//! This example demonstrates creating a document, adding fields,
-//! and reading values back.
+//! Creates documents in fixed memory (Buffer) and in growable memory
+//! (Document), writes fields, and reads them back through a View.
 
 const std = @import("std");
 const lite3 = @import("lite3");
+const root = lite3.root;
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var write_buf: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writerStreaming(&write_buf);
-    defer stdout.interface.flush() catch {};
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &write_buf);
+    const out = &stdout.interface;
+    defer out.flush() catch {};
 
-    // --- Buffer API: fixed-size, caller-managed memory ---
-    try stdout.interface.print("=== Buffer API ===\n", .{});
+    // --- Buffer: fixed-size, caller-owned memory ---
+    try out.print("=== Buffer ===\n", .{});
 
     var mem: [4096]u8 align(4) = undefined;
-    var buf = try lite3.Buffer.initObj(&mem);
+    var buf = try lite3.Buffer.init(&mem, .object);
 
-    try buf.setStr(lite3.root, "name", "Alice");
-    try buf.setI64(lite3.root, "age", 30);
-    try buf.setBool(lite3.root, "active", true);
-    try buf.setF64(lite3.root, "score", 99.5);
+    // `set` takes any scalar: integers, floats, bools, strings, null, and
+    // lite3.bytes(...) for binary data.
+    try buf.set(root, "name", "Alice");
+    try buf.set(root, "age", 30);
+    try buf.set(root, "active", true);
+    try buf.set(root, "score", 99.5);
+    try buf.set(root, "avatar", lite3.bytes(&.{ 0x89, 0x50, 0x4e, 0x47 }));
 
-    // Nested object
-    const address = try buf.setObj(lite3.root, "address");
-    try buf.setStr(address, "city", "Wonderland");
-    try buf.setI64(address, "zip", 12345);
+    const address = try buf.setObject(root, "address");
+    try buf.set(address, "city", "Wonderland");
+    try buf.set(address, "zip", 12345);
 
-    // Nested array
-    const tags = try buf.setArr(lite3.root, "tags");
-    try buf.arrAppendStr(tags, "admin");
-    try buf.arrAppendStr(tags, "user");
+    const tags = try buf.setArray(root, "tags");
+    try buf.append(tags, "admin");
+    try buf.append(tags, "user");
 
-    // Read values back
-    try stdout.interface.print("name:    {s}\n", .{try buf.getStr(lite3.root, "name")});
-    try stdout.interface.print("age:     {d}\n", .{try buf.getI64(lite3.root, "age")});
-    try stdout.interface.print("active:  {}\n", .{try buf.getBool(lite3.root, "active")});
-    try stdout.interface.print("entries: {d}\n", .{try buf.count(lite3.root)});
-    try stdout.interface.print("buffer:  {d} / {d} bytes used\n", .{ buf.len, buf.capacity });
+    // Reads go through a View. A View taken before a write returns
+    // error.StaleView afterwards, so take a fresh one after writing.
+    const v = buf.view();
+    const name = try v.get([]const u8, root, "name");
+    const age = try v.get(i64, root, "age");
+    const city = try v.get([]const u8, try v.getObject(root, "address"), "city");
+    try out.print("name:    {s}\n", .{name});
+    try out.print("age:     {d}\n", .{age});
+    try out.print("active:  {}\n", .{try v.get(bool, root, "active")});
+    try out.print("city:    {s}\n", .{city});
+    try out.print("entries: {d}\n", .{try v.count(root)});
+    try check(std.mem.eql(u8, name, "Alice") and age == 30 and std.mem.eql(u8, city, "Wonderland"));
+    try check(try v.count(root) == 7);
+    try out.print("used:    {d} of {d} bytes\n", .{ buf.slice().len, buf.capacity() });
 
-    // --- Context API: auto-growing memory ---
-    try stdout.interface.print("\n=== Context API ===\n", .{});
+    // Keys known at compile time can be hashed at compile time.
+    const name_key = lite3.key("name");
+    try out.print("has name: {}\n", .{try v.has(root, name_key)});
+    try check(try v.has(root, name_key));
 
-    var ctx = try lite3.Context.init();
-    defer ctx.deinit();
+    // Iteration.
+    var it = try v.arrayIterator(tags);
+    var n_tags: u32 = 0;
+    while (try it.next()) |e| : (n_tags += 1) try out.print("tag[{d}]: {s}\n", .{ e.index, e.value.string });
+    try check(n_tags == 2);
 
-    try ctx.resetObj();
-    try ctx.setStr(lite3.root, "event", "login");
-    try ctx.setI64(lite3.root, "timestamp", 1700000000);
+    // JSON encoding needs no allocation.
+    try out.print("json:    {f}\n", .{v});
 
-    const headers = try ctx.setObj(lite3.root, "headers");
-    try ctx.setStr(headers, "content-type", "application/json");
+    // --- Document: growable memory ---
+    try out.print("\n=== Document ===\n", .{});
 
-    // Read context values back
-    try stdout.interface.print("event:     {s}\n", .{try ctx.getStr(lite3.root, "event")});
-    try stdout.interface.print("timestamp: {d}\n", .{try ctx.getI64(lite3.root, "timestamp")});
-    try stdout.interface.print("entries:   {d}\n", .{try ctx.count(lite3.root)});
+    const gpa = init.gpa;
+    var doc = try lite3.Document.init(gpa, .object);
+    defer doc.deinit(gpa);
 
-    // Safe copy: survives even after context mutations
-    var name_buf: [64]u8 = undefined;
-    const name_copy = try ctx.getStrCopy(lite3.root, "event", &name_buf);
-    try stdout.interface.print("safe copy: {s}\n", .{name_copy});
+    try doc.set(gpa, root, "event", "login");
+    try doc.set(gpa, root, "timestamp", 1700000000);
+    const headers = try doc.setObject(gpa, root, "headers");
+    try doc.set(gpa, headers, "content-type", "application/json");
 
-    try stdout.interface.print("\nDone.\n", .{});
+    var obj_it = try doc.view().objectIterator(root);
+    while (try obj_it.next()) |e| try out.print("{s}: {s}\n", .{ e.key, @tagName(e.value) });
+
+    // The serialized bytes can be sent or stored as they are, and read back
+    // with View.fromBytes (which validates them first).
+    const copy = try gpa.dupe(u8, doc.slice());
+    defer gpa.free(copy);
+    const received = try lite3.View.fromBytes(copy);
+    const event = try received.get([]const u8, root, "event");
+    try out.print("event from copy: {s}\n", .{event});
+    try check(std.mem.eql(u8, event, "login"));
+}
+
+/// Examples double as smoke tests: `zig build run-examples` fails if one
+/// prints something unexpected.
+fn check(ok: bool) !void {
+    if (!ok) return error.UnexpectedResult;
 }

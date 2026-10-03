@@ -212,17 +212,24 @@ int lite3_ctx_import_from_buf(lite3_ctx *ctx, const unsigned char *buf, size_t b
                         errno = EOVERFLOW;
                         return -1;
                 }
-                free(ctx->underlying_buf);
+                // Allocate and copy before freeing: on failure the context stays intact, and
+                // `buf` may point into the old buffer.
                 void *new = malloc(new_size);
-                if (!new)
+                if (!new) {
+                        errno = ENOMEM;
                         return -1;
-                ctx->underlying_buf = new;
+                }
                 u8 *new_buf = (u8 *)(((uintptr_t)new + LITE3_NODE_ALIGNMENT_MASK) & ~LITE3_NODE_ALIGNMENT_MASK);
+                memcpy(new_buf, buf, buflen);
+                free(ctx->underlying_buf);
+                ctx->underlying_buf = new;
                 ctx->buf = new_buf;
                 ctx->bufsz = (size_t)((uintptr_t)new + (uintptr_t)new_size - (uintptr_t)new_buf);
+                ctx->buflen = buflen;
+                return 0;
         }
         ctx->buflen = buflen;
-        memcpy(ctx->buf, buf, buflen);
+        memmove(ctx->buf, buf, buflen); // `buf` may overlap the context's own buffer
         return 0;
 }
 

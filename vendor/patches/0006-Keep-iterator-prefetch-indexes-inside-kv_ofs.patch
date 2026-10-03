@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lite3-zig <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 07:20:56 +0000
+Subject: [PATCH] Keep iterator prefetch indexes inside kv_ofs[]
+
+kv_ofs[] has LITE3_NODE_KEY_COUNT_MAX (7) elements, but the prefetch
+hints masked the index with LITE3_NODE_KEY_COUNT_MASK (7), allowing
+kv_ofs[7]. Reduce the index modulo LITE3_NODE_KEY_COUNT_MAX instead.
+The read only feeds a prefetch hint, but it is still an out-of-bounds
+array access that UBSan reports.
+---
+ src/lite3.c | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/src/lite3.c b/src/lite3.c
+index 3589c0a..a623c2e 100644
+--- a/src/lite3.c
++++ b/src/lite3.c
+@@ -480,12 +480,12 @@ int lite3_iter_next(const unsigned char *buf, size_t buflen, lite3_iter *iter, l
+ 		#endif
+ 	}
+ 	#ifdef LITE3_PREFETCHING
+-	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 0) & LITE3_NODE_KEY_COUNT_MASK],      0, 0); // prefetch next items
+-	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 0) & LITE3_NODE_KEY_COUNT_MASK] + 64, 0, 0);
+-	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 1) & LITE3_NODE_KEY_COUNT_MASK],      0, 0);
+-	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 1) & LITE3_NODE_KEY_COUNT_MASK] + 64, 0, 0);
+-	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 2) & LITE3_NODE_KEY_COUNT_MASK],      0, 0);
+-	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 2) & LITE3_NODE_KEY_COUNT_MASK] + 64, 0, 0);
++	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 0) % (u32)LITE3_NODE_KEY_COUNT_MAX],      0, 0); // prefetch next items
++	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 0) % (u32)LITE3_NODE_KEY_COUNT_MAX] + 64, 0, 0);
++	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 1) % (u32)LITE3_NODE_KEY_COUNT_MAX],      0, 0);
++	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 1) % (u32)LITE3_NODE_KEY_COUNT_MAX] + 64, 0, 0);
++	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 2) % (u32)LITE3_NODE_KEY_COUNT_MAX],      0, 0);
++	__builtin_prefetch(buf + node->kv_ofs[(u32)(iter->node_i[iter->depth] + 2) % (u32)LITE3_NODE_KEY_COUNT_MAX] + 64, 0, 0);
+ 	#endif
+ 	return LITE3_ITER_ITEM;
+ }

@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lite3-zig <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 07:17:45 +0000
+Subject: [PATCH] Allow disabling prefetching with LITE3_DISABLE_PREFETCHING
+
+Prefetch hints may fault on non-x86 targets and read past the end of
+kv_ofs[]; builds need a way to turn them off without editing the header.
+---
+ include/lite3.h | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/include/lite3.h b/include/lite3.h
+index ba96219..056e0e0 100644
+--- a/include/lite3.h
++++ b/include/lite3.h
+@@ -180,8 +180,12 @@ Enabled by default.
+ This *may* happen when:
+ 1. reading near unallocated page boundaries
+ 2. untrusted messages contain invalid offsets
++
++Define `LITE3_DISABLE_PREFETCHING` to turn it off without editing this header.
+ */
++#ifndef LITE3_DISABLE_PREFETCHING
+ #define LITE3_PREFETCHING
++#endif
+ 
+ #if defined(DOXYGEN_ONLY) && !defined(LITE3_PREFETCHING)
+ #define LITE3_PREFETCHING

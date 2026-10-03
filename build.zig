@@ -3,164 +3,99 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const arch = target.result.cpu.arch;
 
     // --- Options ---
     const enable_json = b.option(bool, "json", "Enable JSON conversion support (requires yyjson)") orelse true;
-    const enable_error_messages = b.option(bool, "error-messages", "Enable lite3 error messages for debugging") orelse false;
-    const enable_lto = b.option(bool, "lto", "Enable link-time optimization for the C library (currently unsupported)") orelse false;
+    const enable_error_messages = b.option(bool, "error-messages", "Print lite3 error messages to stderr (debugging aid)") orelse false;
+    const enable_lto = b.option(bool, "lto", "Enable link-time optimization across Zig and C (lets calls into the shim inline)") orelse false;
+    // The C code follows the Zig optimize mode by default, so Debug and
+    // ReleaseSafe builds run the vendored C under UBSan.
+    const c_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "c-optimize",
+        "Optimize mode for the lite3 C library (default: same as -Doptimize)",
+    ) orelse optimize;
 
-    if (enable_lto) {
-        std.log.err("`-Dlto=true` is currently unsupported in lite3-zig; remove the flag.", .{});
-        std.process.exit(1);
-    }
-
-    // --- Paths ---
-    const lite3_include_path = b.path("vendor/lite3/include");
-    const lite3_lib_path = b.path("vendor/lite3/lib");
-    const shim_include_path = b.path("src");
-
-    // --- Compile the lite3 C library ---
-    // The C library is always compiled with ReleaseFast because:
-    //   1. It is a vendored dependency whose correctness is tested upstream.
-    //   2. lite3 uses intentional out-of-bounds prefetch hints (__builtin_prefetch)
-    //      that trigger false positives under Zig's Debug-mode bounds checks.
-    const lite3_mod = b.createModule(.{
-        .target = target,
-        .optimize = .ReleaseFast,
-        .link_libc = true,
-    });
-
-    const build_options = b.addOptions();
-    build_options.addOption(bool, "json_enabled", enable_json);
-
-    const c_flags: []const []const u8 = &.{
-        "-std=gnu11",
-        "-Wall",
-        "-Wextra",
-        "-Wpedantic",
-        "-Wno-gnu-statement-expression",
-        "-Wno-gnu-zero-variadic-macro-arguments",
-    };
-
-    // Core source files
-    const core_sources: []const []const u8 = &.{
-        "vendor/lite3/src/lite3.c",
-        "vendor/lite3/src/ctx_api.c",
-        "vendor/lite3/src/debug.c",
-    };
-
-    for (core_sources) |src| {
-        lite3_mod.addCSourceFile(.{
-            .file = b.path(src),
-            .flags = c_flags,
-        });
-    }
-
-    // JSON-related source files
-    if (enable_json) {
-        const json_sources: []const []const u8 = &.{
-            "vendor/lite3/src/json_enc.c",
-            "vendor/lite3/src/json_dec.c",
-            "vendor/lite3/lib/yyjson/yyjson.c",
-            "vendor/lite3/lib/nibble_base64/base64.c",
-        };
-        for (json_sources) |src| {
-            lite3_mod.addCSourceFile(.{
-                .file = b.path(src),
-                .flags = c_flags,
-            });
-        }
-        lite3_mod.addIncludePath(lite3_lib_path);
-    } else {
-        // lite3 headers always declare JSON entry points. Provide explicit stubs
-        // so `-Djson=false` links cleanly and JSON APIs return EINVAL.
-        lite3_mod.addCSourceFile(.{
-            .file = b.path("src/lite3_json_disabled.c"),
-            .flags = c_flags,
-        });
-    }
-
-    // Add the C shim file (with relaxed warnings for lite3 header quirks)
-    const shim_flags: []const []const u8 = &.{
-        "-std=gnu11",
-        "-Wall",
-        "-Wextra",
-        "-Wno-pedantic",
-        "-Wno-gnu-statement-expression",
-        "-Wno-gnu-zero-variadic-macro-arguments",
-    };
-    lite3_mod.addCSourceFile(.{
-        .file = b.path("src/lite3_shim.c"),
-        .flags = shim_flags,
-    });
-
-    lite3_mod.addIncludePath(lite3_include_path);
-    lite3_mod.addIncludePath(shim_include_path);
-
-    if (enable_error_messages) {
-        lite3_mod.addCMacro("LITE3_ERROR_MESSAGES", "");
-    }
-    // Upstream warns that prefetching can crash on non-x86 targets.
-    // Keep it enabled on x86/x86_64 and disable elsewhere.
-    if (arch != .x86 and arch != .x86_64) {
-        lite3_mod.addCMacro("LITE3_DISABLE_PREFETCHING", "1");
-    }
-
-    const lite3_lib = b.addLibrary(.{
-        .linkage = .static,
-        .name = "lite3",
-        .root_module = lite3_mod,
-    });
-
-    b.installArtifact(lite3_lib);
-
-    // --- Public Zig module ---
-    const zig_mod = b.addModule("lite3", .{
-        .root_source_file = b.path("src/lite3.zig"),
+    const config: Config = .{
         .target = target,
         .optimize = optimize,
-    });
-    zig_mod.addOptions("lite3_build_options", build_options);
-    zig_mod.addIncludePath(shim_include_path);
-    zig_mod.linkLibrary(lite3_lib);
+        .c_optimize = c_optimize,
+        .json = enable_json,
+        .error_messages = enable_error_messages,
+        .lto = enable_lto,
+    };
+
+    const lite3 = addLite3(b, config, .public);
+    b.installArtifact(lite3.lib);
+
+    const check_step = b.step("check", "Compile tests, examples and benchmarks without running them");
+
+    // --- Formatting ---
+    const fmt_paths: []const std.Build.LazyPath = &.{ b.path("build.zig"), b.path("build.zig.zon"), b.path("src"), b.path("examples") };
+    const fmt_step = b.step("fmt", "Check formatting (zig fmt)");
+    fmt_step.dependOn(&b.addFmt(.{ .paths = fmt_paths, .check = true }).step);
+
+    // --- API docs ---
+    const docs_obj = b.addObject(.{ .name = "lite3", .root_module = lite3.module });
+    const docs_step = b.step("docs", "Generate API documentation in zig-out/docs");
+    docs_step.dependOn(&b.addInstallDirectory(.{
+        .source_dir = docs_obj.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    }).step);
 
     // --- Tests ---
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/tests.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "lite3", .module = zig_mod },
-        },
-    });
-    test_mod.addIncludePath(shim_include_path);
-    test_mod.linkLibrary(lite3_lib);
-
+    const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose name contains this (repeatable)") orelse &.{};
     const tests = b.addTest(.{
-        .root_module = test_mod,
+        .filters = test_filters,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "lite3", .module = lite3.module }},
+        }),
     });
+    if (enable_lto) enableLto(tests);
+    check_step.dependOn(&tests.step);
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run lite3-zig tests");
     test_step.dependOn(&run_tests.step);
 
-    // --- Benchmarks ---
-    const bench_mod = b.createModule(.{
-        .root_source_file = b.path("src/bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-        .imports = &.{
-            .{ .name = "lite3", .module = zig_mod },
-        },
+    // Same tests under valgrind memcheck (needs valgrind on PATH; on x86_64
+    // build with e.g. -Dcpu=x86_64_v3, as valgrind cannot decode AVX-512).
+    const valgrind = b.addSystemCommand(&.{
+        "valgrind",
+        "--quiet",
+        "--error-exitcode=1",
+        "--leak-check=full",
+        "--errors-for-leak-kinds=definite,indirect",
     });
-    bench_mod.addIncludePath(shim_include_path);
-    bench_mod.linkLibrary(lite3_lib);
+    valgrind.addArtifactArg(tests);
+    const valgrind_step = b.step("test-valgrind", "Run lite3-zig tests under valgrind");
+    valgrind_step.dependOn(&valgrind.step);
 
+    // --- Benchmarks ---
+    // Benchmarks always measure optimized code, so they get their own
+    // ReleaseFast build of the library regardless of -Doptimize.
+    var bench_config = config;
+    bench_config.optimize = .fast;
+    bench_config.c_optimize = .fast;
+    const bench_lite3 = addLite3(b, bench_config, .private);
     const bench_exe = b.addExecutable(.{
         .name = "lite3-bench",
-        .root_module = bench_mod,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = .fast,
+            .imports = &.{.{ .name = "lite3", .module = bench_lite3.module }},
+        }),
     });
+    // The same loops written against lite3's C API, for comparison.
+    bench_exe.root_module.addCSourceFile(.{ .file = b.path("src/bench_raw.c"), .flags = &vendor_flags });
+    bench_exe.root_module.addIncludePath(b.path("vendor/lite3/include"));
+    if (enable_lto) enableLto(bench_exe);
+    check_step.dependOn(&bench_exe.step);
 
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run lite3-zig benchmarks");
@@ -173,24 +108,244 @@ pub fn build(b: *std.Build) void {
     };
 
     const examples_step = b.step("examples", "Build example programs");
-
+    const run_examples_step = b.step("run-examples", "Build and run the example programs");
     for (example_files) |ex| {
-        const ex_mod = b.createModule(.{
-            .root_source_file = b.path(ex.path),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "lite3", .module = zig_mod },
-            },
-        });
-        ex_mod.addIncludePath(shim_include_path);
-        ex_mod.linkLibrary(lite3_lib);
-
         const ex_exe = b.addExecutable(.{
             .name = ex.name,
-            .root_module = ex_mod,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(ex.path),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "lite3", .module = lite3.module }},
+            }),
         });
-
+        if (enable_lto) enableLto(ex_exe);
+        check_step.dependOn(&ex_exe.step);
         examples_step.dependOn(&b.addInstallArtifact(ex_exe, .{}).step);
+        // The examples check their own results and fail if one is wrong.
+        const run_ex = b.addRunArtifact(ex_exe);
+        run_ex.expectExitCode(0);
+        run_examples_step.dependOn(&run_ex.step);
     }
+
+    // The README's quick start, extracted and built like an example, so the
+    // documentation cannot drift from the API.
+    const quickstart = b.addExecutable(.{
+        .name = "readme_quickstart",
+        .root_module = b.createModule(.{
+            .root_source_file = readmeQuickStart(b),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "lite3", .module = lite3.module }},
+        }),
+    });
+    if (enable_lto) enableLto(quickstart);
+    check_step.dependOn(&quickstart.step);
+    const run_quickstart = b.addRunArtifact(quickstart);
+    run_quickstart.expectExitCode(0);
+    run_examples_step.dependOn(&run_quickstart.step);
+
+    // --- Upstream C tests ---
+    // lite3's own test programs, built against the vendored (patched) sources
+    // with the same configuration as the library. They expect to run from
+    // the lite3 source root.
+    const upstream_step = b.step("test-upstream", "Build and run lite3's upstream C tests");
+    for (upstream_tests) |t| {
+        if (t.needs_json and !enable_json) continue;
+        const mod = b.createModule(.{ .target = target, .optimize = c_optimize, .link_libc = true });
+        mod.addIncludePath(b.path("vendor/lite3/include"));
+        mod.addCSourceFile(.{ .file = b.path(t.path), .flags = &vendor_flags });
+        // lite3's C-heap context API is not part of the library (Document
+        // replaces it), but its upstream tests still exercise it.
+        mod.addCSourceFile(.{ .file = b.path("vendor/lite3/src/ctx_api.c"), .flags = &vendor_flags });
+        mod.linkLibrary(lite3.lib);
+        const exe = b.addExecutable(.{ .name = std.fs.path.stem(t.path), .root_module = mod });
+        const run = b.addRunArtifact(exe);
+        run.setCwd(b.path("vendor/lite3"));
+        run.expectExitCode(0);
+        upstream_step.dependOn(&run.step);
+    }
+
+    // --- C lint ---
+    // The project's own C files must compile without warnings. (Zig only
+    // shows C warnings when a compile fails, so they are promoted to errors
+    // here; vendored upstream code is not held to this.)
+    const lint_mod = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+    lint_mod.addIncludePath(b.path("vendor/lite3/include"));
+    lint_mod.addIncludePath(b.path("src"));
+    lint_mod.addCSourceFiles(.{
+        .files = &.{ "src/lite3_shim.c", "src/lite3_json_disabled.c" },
+        .flags = &(shim_flags ++ .{"-Werror"}),
+    });
+    const lint_lib = b.addLibrary(.{ .name = "lite3-lint", .linkage = .static, .root_module = lint_mod });
+    const lint_step = b.step("lint-c", "Compile the project's own C sources with -Werror");
+    lint_step.dependOn(&lint_lib.step);
+}
+
+const upstream_tests = [_]struct { path: []const u8, needs_json: bool }{
+    .{ .path = "vendor/lite3/tests/alignment_zeroing.c", .needs_json = false },
+    .{ .path = "vendor/lite3/tests/collisions.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/john_doe.c", .needs_json = false },
+    .{ .path = "vendor/lite3/tests/nested_generations.c", .needs_json = false },
+    .{ .path = "vendor/lite3/tests/type_queries.c", .needs_json = false },
+    .{ .path = "vendor/lite3/tests/examples/buffer_api_01_building_messages.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/buffer_api_02_reading_messages.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/buffer_api_03_strings.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/buffer_api_04_nesting.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/buffer_api_05_arrays.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/buffer_api_06_iterators.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/buffer_api_07_json_conversion.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/context_api_01_building_messages.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/context_api_02_reading_messages.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/context_api_03_strings.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/context_api_04_nesting.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/context_api_05_arrays.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/context_api_06_iterators.c", .needs_json = true },
+    .{ .path = "vendor/lite3/tests/examples/context_api_07_json_conversion.c", .needs_json = true },
+};
+
+const Config = struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    c_optimize: std.builtin.OptimizeMode,
+    json: bool,
+    error_messages: bool,
+    lto: bool,
+};
+
+const Lite3 = struct {
+    lib: *std.Build.Step.Compile,
+    module: *std.Build.Module,
+};
+
+/// Flags for vendored upstream C sources.
+const vendor_flags = [_][]const u8{
+    "-std=gnu11",
+    "-Wall",
+    "-Wextra",
+    "-Wpedantic",
+    "-Wno-gnu-statement-expression",
+    "-Wno-gnu-zero-variadic-macro-arguments",
+};
+
+/// Flags for this project's C sources. lite3's header macros rely on GNU
+/// extensions, so -Wpedantic is off.
+const shim_flags = [_][]const u8{
+    "-std=gnu11",
+    "-Wall",
+    "-Wextra",
+    "-Wno-pedantic",
+    "-Wno-gnu-statement-expression",
+    "-Wno-gnu-zero-variadic-macro-arguments",
+};
+
+/// Build the lite3 C library plus the Zig wrapper module that links it.
+/// `.public` registers the module as this package's "lite3" export.
+fn addLite3(b: *std.Build, config: Config, visibility: enum { public, private }) Lite3 {
+    const target = config.target;
+
+    const c_safe = isSafe(config.c_optimize);
+    const lite3_mod = b.createModule(.{
+        .target = target,
+        .optimize = config.c_optimize,
+        .link_libc = true,
+        // A sanitized C library linked into an unsanitized (ReleaseFast/Small)
+        // program has no UBSan runtime to report to, so trap instead.
+        .sanitize_c = if (c_safe and !isSafe(config.optimize)) .trap else null,
+    });
+    lite3_mod.addIncludePath(b.path("vendor/lite3/include"));
+    lite3_mod.addIncludePath(b.path("src"));
+
+    lite3_mod.addCSourceFiles(.{
+        .files = &.{
+            "vendor/lite3/src/lite3.c",
+            "vendor/lite3/src/debug.c",
+        },
+        .flags = &vendor_flags,
+    });
+    if (config.json) {
+        // yyjson, base64 and lite3's JSON code as one translation unit with
+        // the third-party symbols made private (see src/lite3_json.c).
+        lite3_mod.addIncludePath(b.path("vendor/lite3/lib"));
+        lite3_mod.addCSourceFile(.{
+            .file = b.path("src/lite3_json.c"),
+            .flags = &(vendor_flags ++ .{"-Wno-unused-function"}),
+        });
+    } else {
+        // lite3 headers always declare JSON entry points. Provide explicit stubs
+        // so `-Djson=false` links cleanly and JSON APIs return EINVAL.
+        lite3_mod.addCSourceFile(.{ .file = b.path("src/lite3_json_disabled.c"), .flags = &shim_flags });
+    }
+    lite3_mod.addCSourceFile(.{ .file = b.path("src/lite3_shim.c"), .flags = &shim_flags });
+
+    if (config.error_messages) lite3_mod.addCMacro("LITE3_ERROR_MESSAGES", "");
+    // Upstream warns that prefetching can crash on non-x86 targets.
+    const arch = target.result.cpu.arch;
+    if (arch != .x86 and arch != .x86_64) lite3_mod.addCMacro("LITE3_DISABLE_PREFETCHING", "1");
+
+    const lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "lite3",
+        .root_module = lite3_mod,
+    });
+    if (config.lto) enableLto(lib);
+
+    // The lite3 wire format is little-endian only. Fail with one clear message
+    // instead of a page of C errors.
+    if (arch.endian() == .big) {
+        const fail = b.addFail("lite3 requires a little-endian target");
+        lib.step.dependOn(&fail.step);
+    }
+
+    // Zig 0.17 removed @cImport; the shim header is translated here instead.
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/lite3_shim.h"),
+        .target = target,
+        .optimize = config.optimize,
+    });
+    translate_c.addIncludePath(b.path("vendor/lite3/include"));
+    translate_c.addIncludePath(b.path("src"));
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "json_enabled", config.json);
+
+    const module_options: std.Build.Module.CreateOptions = .{
+        .root_source_file = b.path("src/lite3.zig"),
+        .target = target,
+        .optimize = config.optimize,
+        .imports = &.{.{ .name = "lite3_c", .module = translate_c.createModule() }},
+    };
+    const module = switch (visibility) {
+        .public => b.addModule("lite3", module_options),
+        .private => b.createModule(module_options),
+    };
+    module.addOptions("lite3_build_options", build_options);
+    module.linkLibrary(lib);
+
+    return .{ .lib = lib, .module = module };
+}
+
+/// The first ```zig block after "## Quick start" in README.md, as a file.
+fn readmeQuickStart(b: *std.Build) std.Build.LazyPath {
+    const readme_path = b.root.join(b.allocator, "README.md") catch @panic("OOM");
+    const readme = readme_path.root_dir.handle.readFileAlloc(b.graph.io, readme_path.sub_path, b.allocator, .limited(1 << 20)) catch |err|
+        std.debug.panic("cannot read README.md: {s}", .{@errorName(err)});
+    const section = std.mem.indexOf(u8, readme, "## Quick start") orelse @panic("README.md has no '## Quick start'");
+    const open = "```zig\n";
+    const start = (std.mem.indexOfPos(u8, readme, section, open) orelse @panic("no zig block in the README quick start")) + open.len;
+    const end = std.mem.indexOfPos(u8, readme, start, "```") orelse @panic("unterminated zig block in README.md");
+    return b.addWriteFiles().add("readme_quickstart.zig", readme[start..end]);
+}
+
+fn isSafe(mode: std.builtin.OptimizeMode) bool {
+    return mode == .debug or mode == .safe;
+}
+
+/// LTO needs the LLVM backend and LLD on every artifact that links the C
+/// library, including Debug builds that would otherwise use the self-hosted
+/// backend.
+fn enableLto(compile: *std.Build.Step.Compile) void {
+    compile.lto = .full;
+    compile.use_llvm = true;
+    compile.use_lld = true;
 }

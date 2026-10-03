@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lite3-zig <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 07:21:20 +0000
+Subject: [PATCH] Guard base64 conversion against int overflow; drop puts()
+
+nibble_base64() takes an int length and computes 4 * (len + pad) in an
+int, which overflows for bytes values above ~512 MiB and under-allocates
+the output (heap overflow). Reject such values with EMSGSIZE before
+calling it, and set errno = ENOMEM when the conversion's allocation
+fails. Remove the puts() calls that wrote to stdout from library code.
+---
+ lib/nibble_base64/base64.c | 6 +-----
+ src/json_enc.c             | 8 ++++++++
+ 2 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/lib/nibble_base64/base64.c b/lib/nibble_base64/base64.c
+index 2f66e2e..ad38257 100644
+--- a/lib/nibble_base64/base64.c
++++ b/lib/nibble_base64/base64.c
+@@ -78,9 +78,7 @@ char* nibble_base64( const void* binaryData, int len, int *flen )
+   // which is NOT counted in flen.
+   if( !base64String )
+   {
+-    puts( "ERROR: base64 could not allocate enough memory." ) ;
+-    puts( "I must stop because I could not get enough" ) ;
+-    return 0;
++    return 0; // caller reports the allocation failure
+   }
+   
+   // EXTRACTING SEXTETS FROM THE OCTETS.
+@@ -258,8 +256,6 @@ unsigned char* nibble_unbase64( const char* ascii, int len, int *flen )
+   unsigned char *bin = (unsigned char*)malloc( *flen );
+   if( !bin )
+   {
+-    puts( "ERROR: unbase64 could not allocate enough memory." ) ;
+-    puts( "I must stop because I could not get enough" ) ;
+     return 0;
+   }
+   
+diff --git a/src/json_enc.c b/src/json_enc.c
+index 7d19247..e58873c 100644
+--- a/src/json_enc.c
++++ b/src/json_enc.c
+@@ -36,6 +36,7 @@
+ #include <string.h>
+ #include <stdint.h>
+ #include <errno.h>
++#include <limits.h>
+ 
+ #include "yyjson/yyjson.h"
+ #include "nibble_base64/base64.h"
+@@ -80,10 +81,17 @@ int _lite3_json_enc_switch(const unsigned char *buf, size_t buflen, size_t nesti
+                 ;
+                 size_t bytes_len;
+                 const u8 *bytes = lite3_val_bytes(val, &bytes_len);
++                // nibble_base64() computes 4 * (len + pad) in an int; keep that from overflowing.
++                if (bytes_len > (size_t)(INT_MAX / 4) - 3) {
++                	LITE3_PRINT_ERROR("BYTES VALUE TOO LARGE FOR BASE64 CONVERSION\n");
++                	errno = EMSGSIZE;
++                	return -1;
++                }
+                 int b64_len;
+                 char *b64 = nibble_base64(bytes, (int)bytes_len, &b64_len);
+                 if (!b64) {
+                 	LITE3_PRINT_ERROR("FAILED TO CONVERT BYTES TO BASE64\n");
++                	errno = ENOMEM;
+                 	// No need to free the `b64` pointer, since the allocation would have failed anyways.
+                 	return -1;
+                 }

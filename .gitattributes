@@ -1,0 +1,3 @@
+# Vendored upstream sources and patches must be kept byte-for-byte (several use CRLF).
+vendor/** -text
+src/testdata/** binary

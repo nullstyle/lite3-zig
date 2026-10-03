@@ -1,18 +1,22 @@
 .{
     .name = .lite3_zig,
     .version = "0.1.0",
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.17.0",
     .fingerprint = 0x9884a36e432d0516,
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "README.md",
         "LICENSE",
+        "THIRD_PARTY_NOTICES.md",
+        "SECURITY.md",
+        "CHANGELOG.md",
         "src",
         "examples",
         "vendor/lite3/include",
         "vendor/lite3/src",
         "vendor/lite3/lib",
         "vendor/lite3/LICENSE",
+        "vendor/lite3/UPSTREAM",
     },
 }

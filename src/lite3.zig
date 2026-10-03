@@ -1,1280 +1,1492 @@
-// lite3-zig: Idiomatic Zig wrapper for the Lite3 serialization library
-//
-// Lite3 is a JSON-compatible zero-copy serialization format that encodes data
-// as a B-tree inside a single contiguous buffer, allowing O(log n) access and
-// mutation on any arbitrary field.
-//
-// Thread safety:
-//   Buffer and Context are NOT thread-safe. Concurrent reads and writes to the
-//   same instance require external synchronization (e.g. a Mutex). In particular:
-//   - Slices returned by getStr/getBytes point into the buffer and are
-//     invalidated by ANY subsequent mutation (including from another thread).
-//   - For Context, mutations may trigger realloc, invalidating ALL prior slices.
-//   - Iterators are invalidated by any mutation to the underlying buffer.
+//! Zig bindings for Lite³, a JSON-compatible zero-copy serialization format
+//! that stores a document as a B-tree inside one contiguous buffer.
+//!
+//! Types:
+//! - `View`: read-only access to serialized bytes. All reads, iteration and
+//!   JSON output live here, implemented in Zig.
+//! - `Buffer`: a document in caller-provided, fixed-size memory.
+//! - `Document`: a growable document; pass the allocator to each call that
+//!   may allocate (like `std.ArrayList`).
+//! - `ManagedDocument`: a `Document` that stores its allocator.
+//!
+//! Writes go through the lite3 C library (B-tree insertion), so every
+//! writable document lives in 4-byte-aligned memory.
+//!
+//! Lifetimes: slices returned by reads (strings, bytes, keys) point into the
+//! document and are valid until its next write. `View`s and iterators know
+//! when their document was written to and return `error.StaleView` instead of
+//! reading stale memory.
+//!
+//! Untrusted input: see SECURITY.md. Every constructor that takes serialized
+//! bytes runs `validate` unless its name ends in `Unchecked`.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("lite3_build_options");
+const c = @import("lite3_c");
+const validation = @import("validate.zig");
 
-const c = @cImport({
-    @cInclude("lite3_shim.h");
-});
+const Allocator = std.mem.Allocator;
 
-/// True when JSON conversion support is compiled in.
+/// True when JSON decoding (yyjson) is compiled in. JSON encoding is always
+/// available.
 pub const json_enabled: bool = build_options.json_enabled;
 
 comptime {
     if (builtin.target.cpu.arch.endian() == .big)
         @compileError("lite3 requires a little-endian target");
     if (builtin.target.os.tag == .windows)
-        @compileError("lite3-zig does not yet support Windows (errno mapping is incomplete)");
+        @compileError("lite3-zig is not yet tested on Windows");
 }
 
 // ---------------------------------------------------------------------------
-// Error types
+// Format constants (vendor/lite3/include/lite3.h)
 // ---------------------------------------------------------------------------
 
-/// Errors returned by lite3 operations.
-pub const Error = error{
-    /// The key was not found in the object.
-    NotFound,
-    /// An invalid argument was provided (e.g. wrong type, null key).
-    InvalidArgument,
-    /// The buffer is too small to hold the data.
-    NoBufferSpace,
-    /// An unspecified lite3 error occurred.
-    Unexpected,
-    /// The generational pointer is stale (buffer was mutated since the
-    /// reference was obtained).
-    StaleReference,
-    /// The buffer data is corrupt or malformed.
-    CorruptData,
-    /// Memory allocation failed (Context API only).
-    OutOfMemory,
-    /// The value was used after deinit or before proper initialization.
-    InvalidState,
-};
+const node_size = 96;
+const node_alignment = 4;
+const tree_height_max = 9;
+const hash_probe_max = 128;
+const djb2_seed: u32 = 5381;
+const ofs_hashes = 4;
+const ofs_size_kc = 32;
+const ofs_kv = 36;
+const ofs_child = 64;
 
-/// Translate a C return code (< 0 on error) into a Zig error.
-/// The lite3 C library returns -1 and sets errno on failure.
-fn translateError(ret: c_int) Error {
-    std.debug.assert(ret < 0);
-    const raw_errno = std.c._errno().*;
-    // In debug builds, catch cases where C returned an error but forgot to set errno.
-    std.debug.assert(raw_errno != 0);
-    return mapErrno(raw_errno);
-}
+/// Largest document lite3 can address (its offsets are 32-bit).
+pub const capacity_limit: usize = std.math.maxInt(u32);
 
-/// Translate the current errno value into a Zig error.
-/// Used for C functions that signal failure via NULL return rather than a negative code.
-fn translateErrno() Error {
-    const raw_errno = std.c._errno().*;
-    if (raw_errno == 0) return Error.Unexpected;
-    return mapErrno(raw_errno);
-}
+/// Deepest container nesting accepted by `validate` and by JSON encoding
+/// (the root is depth 1).
+pub const max_nesting_depth = validation.max_nesting_depth;
 
-/// Map a raw errno integer to a Zig error.
-fn mapErrno(raw_errno: c_int) Error {
-    const raw_u16 = std.math.cast(u16, raw_errno) orelse return Error.Unexpected;
-    const e_val: std.posix.E = @enumFromInt(raw_u16);
-    return switch (e_val) {
-        .NOENT => Error.NotFound,
-        .INVAL => Error.InvalidArgument,
-        .NOBUFS, .MSGSIZE => Error.NoBufferSpace,
-        .BADMSG => Error.CorruptData,
-        .NOMEM => Error.OutOfMemory,
-        .IO, .FAULT, .OVERFLOW => Error.Unexpected,
-        else => Error.Unexpected,
-    };
-}
+/// Longest key a write accepts as a plain (not NUL-terminated) slice when no
+/// allocator is at hand. Longer keys work when passed as a `Key` or a
+/// `[:0]const u8`, or through `Document` (which copies with its allocator).
+pub const max_stack_key_len = 1023;
 
 // ---------------------------------------------------------------------------
-// Value types
+// Basic types
 // ---------------------------------------------------------------------------
 
-/// Lite3 value types.
+/// The type of a value, as stored (lite3's type tags).
 pub const Type = enum(u8) {
     null = 0,
-    bool_ = 1,
-    i64_ = 2,
-    f64_ = 3,
+    bool = 1,
+    int = 2,
+    float = 3,
     bytes = 4,
     string = 5,
     object = 6,
     array = 7,
-    invalid = 8,
-
-    const max_valid: u8 = 8;
 };
 
-/// A tagged union representing any Lite3 value, useful for dynamic access.
-pub const Value = union(enum) {
+/// The two container types.
+pub const Container = enum(u8) {
+    object = 6,
+    array = 7,
+};
+
+/// Position of an object or array inside a document. Obtained from the
+/// document (`root`, `setObject`, `getObject`, ...); only meaningful for the
+/// document it came from.
+pub const Offset = enum(u32) {
+    root = 0,
+    _,
+};
+
+/// The document's root container.
+pub const root = Offset.root;
+
+/// A decoded value. `string` and `bytes` point into the document.
+pub const Value = union(Type) {
     null,
-    bool_: bool,
-    i64_: i64,
-    f64_: f64,
-    string: []const u8,
+    bool: bool,
+    int: i64,
+    float: f64,
     bytes: []const u8,
+    string: []const u8,
     object: Offset,
     array: Offset,
 };
 
-// ---------------------------------------------------------------------------
-// Offset handle
-// ---------------------------------------------------------------------------
-
-/// A typed offset into a Lite3 buffer pointing to an object or array.
-/// Using a distinct type prevents accidentally passing arbitrary `usize` values.
-pub const Offset = enum(usize) {
-    /// The root node is always at offset 0.
-    root = 0,
-    /// Catch-all for runtime offset values returned by C.
-    _,
+/// Wraps a byte slice so `set`/`append` store it as lite3 bytes rather than a
+/// string, and so `get(Bytes, ...)` reads one.
+pub const Bytes = struct {
+    data: []const u8,
 };
 
-/// Convenience alias for `Offset.root`.
-pub const root = Offset.root;
+/// Mark `data` to be stored as bytes.
+pub fn bytes(data: []const u8) Bytes {
+    return .{ .data = data };
+}
 
-/// An opaque handle to a C-allocated JSON string.
-/// Must be freed by calling `deinit()` exactly once.
-pub const JsonString = struct {
-    ptr: [*]u8,
-    len: usize,
+/// A key with its hash precomputed. `key("name")` hashes at compile time,
+/// which makes lookups and writes with a fixed key skip hashing entirely.
+pub const Key = struct {
+    str: [:0]const u8,
+    hash: u32,
 
-    /// Return the JSON content as a slice.
-    pub fn slice(self: JsonString) []const u8 {
-        return self.ptr[0..self.len];
-    }
-
-    /// Free the C-allocated JSON string. Must be called exactly once.
-    pub fn deinit(self: JsonString) void {
-        std.c.free(self.ptr);
+    /// Hash a runtime key once to reuse it for many calls.
+    pub fn init(str: [:0]const u8) Key {
+        return .{ .str = str, .hash = djb2(str) };
     }
 };
 
-// ---------------------------------------------------------------------------
-// Iterator (shared by Buffer and Context)
-// ---------------------------------------------------------------------------
-
-/// An iterator over the entries of a Lite3 object or array.
-///
-/// WARNING: The iterator captures the buffer pointer at creation time.
-/// Any mutation to the underlying buffer (or Context reallocation) invalidates
-/// the iterator. Do not mutate the buffer while iterating.
-pub const Iterator = struct {
-    raw: c.shim_lite3_iter,
-    buf: [*]const u8,
-    buflen: usize,
-
-    pub const Entry = struct {
-        /// The key string (null for array iterators).
-        key: ?[]const u8,
-        /// The byte offset of the value in the buffer.
-        val_offset: Offset,
+/// A compile-time key.
+pub fn key(comptime str: []const u8) Key {
+    if (comptime std.mem.indexOfScalar(u8, str, 0) != null) @compileError("lite3 keys cannot contain NUL");
+    const z: [:0]const u8 = comptime std.fmt.comptimePrint("{s}", .{str});
+    const hash = comptime blk: {
+        @setEvalBranchQuota(str.len * 4 + 1000);
+        break :blk djb2(str);
     };
+    return .{ .str = z, .hash = hash };
+}
 
-    /// Get the next entry from the iterator.
-    /// Returns null when iteration is complete.
-    pub fn next(self: *Iterator) Error!?Entry {
-        var key_ptr: ?[*]const u8 = null;
-        var key_len: u32 = 0;
-        var val_ofs: usize = 0;
-        const ret = c.shim_lite3_iter_next(self.buf, self.buflen, &self.raw, @ptrCast(&key_ptr), &key_len, &val_ofs);
-        if (ret == 1) return null; // DONE
-        if (ret < 0) return translateError(ret);
-        const entry_key: ?[]const u8 = if (key_ptr) |p| p[0..key_len] else null;
-        return Entry{
-            .key = entry_key,
-            .val_offset = @enumFromInt(val_ofs),
-        };
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Shared method implementations (comptime mixin)
-// ---------------------------------------------------------------------------
-
-/// Shared method implementations for Buffer and Context.
-/// This eliminates duplication by generating identical method signatures
-/// that dispatch to the appropriate C functions based on the backend type.
-fn SharedMethods(comptime Self: type) type {
-    const is_ctx = (Self == Context);
-    return struct {
-        /// Maximum key length in bytes. Keys longer than this return InvalidArgument.
-        const max_key_len: usize = 255;
-
-        /// Convert a key slice to a null-terminated stack buffer for passing to C.
-        /// Returns a fixed-size array that can be passed to C via `&kz`.
-        inline fn toKeyZ(key: []const u8) Error![max_key_len + 1]u8 {
-            if (key.len > max_key_len) return Error.InvalidArgument;
-            // C APIs treat keys as NUL-terminated strings; embedded NUL would truncate.
-            if (std.mem.indexOfScalar(u8, key, 0) != null) return Error.InvalidArgument;
-            var buf: [max_key_len + 1]u8 = undefined;
-            @memcpy(buf[0..key.len], key);
-            buf[key.len] = 0;
-            return buf;
-        }
-
-        /// Validate lifecycle/invariants before dispatching to C.
-        inline fn ensureUsable(self: *const Self) Error!void {
-            if (is_ctx) {
-                if (self.ctx == null) return Error.InvalidState;
-                return;
-            }
-            if (self.capacity == 0 and self.len == 0) return Error.InvalidState;
-            if (self.len > self.capacity) return Error.CorruptData;
-            if ((@intFromPtr(self.buf) & 0x3) != 0) return Error.InvalidArgument;
-        }
-
-        /// Save the current len for Buffer (no-op for Context).
-        /// The C library documents that a failed write may still increment
-        /// *inout_buflen, so we snapshot and restore to preserve invariants.
-        inline fn saveLen(self: *Self) usize {
-            return if (!is_ctx) self.len else 0;
-        }
-
-        /// Restore len on error for Buffer (no-op for Context).
-        inline fn restoreLen(self: *Self, saved: usize) void {
-            if (!is_ctx) self.len = saved;
-        }
-
-        // --- Set operations ---
-
-        /// Set a null value for the given key.
-        pub fn setNull(self: *Self, ofs: Offset, key: []const u8) Error!void {
-            try ensureUsable(self);
-            var kz = try toKeyZ(key);
-            const saved = saveLen(self);
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_null(self.raw(), @intFromEnum(ofs), &kz)
-            else
-                c.shim_lite3_set_null(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz);
-            if (ret < 0) {
-                restoreLen(self, saved);
-                return translateError(ret);
-            }
-        }
-
-        /// Set a boolean value for the given key.
-        pub fn setBool(self: *Self, ofs: Offset, key: []const u8, value: bool) Error!void {
-            try ensureUsable(self);
-            var kz = try toKeyZ(key);
-            const saved = saveLen(self);
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_bool(self.raw(), @intFromEnum(ofs), &kz, value)
-            else
-                c.shim_lite3_set_bool(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, value);
-            if (ret < 0) {
-                restoreLen(self, saved);
-                return translateError(ret);
-            }
-        }
-
-        /// Set an i64 value for the given key.
-        pub fn setI64(self: *Self, ofs: Offset, key: []const u8, value: i64) Error!void {
-            try ensureUsable(self);
-            var kz = try toKeyZ(key);
-            const saved = saveLen(self);
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_i64(self.raw(), @intFromEnum(ofs), &kz, value)
-            else
-                c.shim_lite3_set_i64(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, value);
-            if (ret < 0) {
-                restoreLen(self, saved);
-                return translateError(ret);
-            }
-        }
-
-        /// Set an f64 value for the given key.
-        pub fn setF64(self: *Self, ofs: Offset, key: []const u8, value: f64) Error!void {
-            try ensureUsable(self);
-            var kz = try toKeyZ(key);
-            const saved = saveLen(self);
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_f64(self.raw(), @intFromEnum(ofs), &kz, value)
-            else
-                c.shim_lite3_set_f64(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, value);
-            if (ret < 0) {
-                restoreLen(self, saved);
-                return translateError(ret);
-            }
-        }
-
-        /// Set a string value for the given key.
-        pub fn setStr(self: *Self, ofs: Offset, key: []const u8, value: []const u8) Error!void {
-            try ensureUsable(self);
-            var kz = try toKeyZ(key);
-            const saved = saveLen(self);
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_str(self.raw(), @intFromEnum(ofs), &kz, value.ptr, value.len)
-            else
-                c.shim_lite3_set_str(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, value.ptr, value.len);
-            if (ret < 0) {
-                restoreLen(self, saved);
-                return translateError(ret);
-            }
-        }
-
-        /// Set a bytes value for the given key.
-        pub fn setBytes(self: *Self, ofs: Offset, key: []const u8, value: []const u8) Error!void {
-            try ensureUsable(self);
-            var kz = try toKeyZ(key);
-            const saved = saveLen(self);
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_bytes(self.raw(), @intFromEnum(ofs), &kz, value.ptr, value.len)
-            else
-                c.shim_lite3_set_bytes(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, value.ptr, value.len);
-            if (ret < 0) {
-                restoreLen(self, saved);
-                return translateError(ret);
-            }
-        }
-
-        /// Set a nested object for the given key. Returns the offset of the new object.
-        pub fn setObj(self: *Self, ofs: Offset, key: []const u8) Error!Offset {
-            try ensureUsable(self);
-            var kz = try toKeyZ(key);
-            const saved = saveLen(self);
-            var out_ofs: usize = 0;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_obj(self.raw(), @intFromEnum(ofs), &kz, &out_ofs)
-            else
-                c.shim_lite3_set_obj(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, &out_ofs);
-            if (ret < 0) {
-                restoreLen(self, saved);
-                return translateError(ret);
-            }
-            return @enumFromInt(out_ofs);
-        }
-
-        /// Set a nested array for the given key. Returns the offset of the new array.
-        pub fn setArr(self: *Self, ofs: Offset, key: []const u8) Error!Offset {
-            try ensureUsable(self);
-            var kz = try toKeyZ(key);
-            const saved = saveLen(self);
-            var out_ofs: usize = 0;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_set_arr(self.raw(), @intFromEnum(ofs), &kz, &out_ofs)
-            else
-                c.shim_lite3_set_arr(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &kz, &out_ofs);
-            if (ret < 0) {
-                restoreLen(self, saved);
-                return translateError(ret);
-            }
-            return @enumFromInt(out_ofs);
-        }
-
-        // --- Get operations ---
-
-        /// Get the type of a value by key.
-        pub fn getType(self: *const Self, ofs: Offset, key: []const u8) Error!Type {
-            try ensureUsable(self);
-            var kz = try toKeyZ(key);
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_type(self.raw(), @intFromEnum(ofs), &kz)
-            else
-                c.shim_lite3_get_type(self.buf, self.len, @intFromEnum(ofs), &kz);
-            if (ret < 0) return translateError(ret);
-            if (ret > Type.max_valid) return Error.CorruptData;
-            const t: Type = @enumFromInt(@as(u8, @intCast(ret)));
-            if (t == .invalid) return Error.NotFound;
-            return t;
-        }
-
-        /// Check if a key exists. Returns an error if the key conversion fails.
-        pub fn exists(self: *const Self, ofs: Offset, key: []const u8) Error!bool {
-            try ensureUsable(self);
-            var kz = try toKeyZ(key);
-            return if (is_ctx)
-                c.shim_lite3_ctx_exists(self.raw(), @intFromEnum(ofs), &kz) != 0
-            else
-                c.shim_lite3_exists(self.buf, self.len, @intFromEnum(ofs), &kz) != 0;
-        }
-
-        /// Get a boolean value by key.
-        pub fn getBool(self: *const Self, ofs: Offset, key: []const u8) Error!bool {
-            try ensureUsable(self);
-            var kz = try toKeyZ(key);
-            var out: bool = false;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_bool(self.raw(), @intFromEnum(ofs), &kz, &out)
-            else
-                c.shim_lite3_get_bool(self.buf, self.len, @intFromEnum(ofs), &kz, &out);
-            if (ret < 0) return translateError(ret);
-            return out;
-        }
-
-        /// Get an i64 value by key.
-        pub fn getI64(self: *const Self, ofs: Offset, key: []const u8) Error!i64 {
-            try ensureUsable(self);
-            var kz = try toKeyZ(key);
-            var out: i64 = 0;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_i64(self.raw(), @intFromEnum(ofs), &kz, &out)
-            else
-                c.shim_lite3_get_i64(self.buf, self.len, @intFromEnum(ofs), &kz, &out);
-            if (ret < 0) return translateError(ret);
-            return out;
-        }
-
-        /// Get an f64 value by key.
-        pub fn getF64(self: *const Self, ofs: Offset, key: []const u8) Error!f64 {
-            try ensureUsable(self);
-            var kz = try toKeyZ(key);
-            var out: f64 = 0;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_f64(self.raw(), @intFromEnum(ofs), &kz, &out)
-            else
-                c.shim_lite3_get_f64(self.buf, self.len, @intFromEnum(ofs), &kz, &out);
-            if (ret < 0) return translateError(ret);
-            return out;
-        }
-
-        /// Get a string value by key.
-        /// WARNING: The returned slice points directly into the buffer and is
-        /// invalidated by any subsequent mutation. For Context, auto-reallocation
-        /// can cause use-after-free. Use `getStrCopy` for a safe alternative.
-        pub fn getStr(self: *const Self, ofs: Offset, key: []const u8) Error![]const u8 {
-            try ensureUsable(self);
-            var kz = try toKeyZ(key);
-            var out_ptr: ?[*]const u8 = null;
-            var out_len: u32 = 0;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_str(self.raw(), @intFromEnum(ofs), &kz, @ptrCast(&out_ptr), &out_len)
-            else
-                c.shim_lite3_get_str(self.buf, self.len, @intFromEnum(ofs), &kz, @ptrCast(&out_ptr), &out_len);
-            if (ret < 0) return translateError(ret);
-            if (out_ptr) |p| return p[0..out_len];
-            return Error.StaleReference;
-        }
-
-        /// Get a bytes value by key.
-        /// WARNING: The returned slice points directly into the buffer and is
-        /// invalidated by any subsequent mutation. For Context, auto-reallocation
-        /// can cause use-after-free. Use `getBytesCopy` for a safe alternative.
-        pub fn getBytes(self: *const Self, ofs: Offset, key: []const u8) Error![]const u8 {
-            try ensureUsable(self);
-            var kz = try toKeyZ(key);
-            var out_ptr: ?[*]const u8 = null;
-            var out_len: u32 = 0;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_bytes(self.raw(), @intFromEnum(ofs), &kz, &out_ptr, &out_len)
-            else
-                c.shim_lite3_get_bytes(self.buf, self.len, @intFromEnum(ofs), &kz, &out_ptr, &out_len);
-            if (ret < 0) return translateError(ret);
-            if (out_ptr) |p| return p[0..out_len];
-            return Error.StaleReference;
-        }
-
-        /// Get a nested object offset by key.
-        pub fn getObj(self: *const Self, ofs: Offset, key: []const u8) Error!Offset {
-            try ensureUsable(self);
-            var kz = try toKeyZ(key);
-            var out_ofs: usize = 0;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_obj(self.raw(), @intFromEnum(ofs), &kz, &out_ofs)
-            else
-                c.shim_lite3_get_obj(self.buf, self.len, @intFromEnum(ofs), &kz, &out_ofs);
-            if (ret < 0) return translateError(ret);
-            return @enumFromInt(out_ofs);
-        }
-
-        /// Get a nested array offset by key.
-        pub fn getArr(self: *const Self, ofs: Offset, key: []const u8) Error!Offset {
-            try ensureUsable(self);
-            var kz = try toKeyZ(key);
-            var out_ofs: usize = 0;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_get_arr(self.raw(), @intFromEnum(ofs), &kz, &out_ofs)
-            else
-                c.shim_lite3_get_arr(self.buf, self.len, @intFromEnum(ofs), &kz, &out_ofs);
-            if (ret < 0) return translateError(ret);
-            return @enumFromInt(out_ofs);
-        }
-
-        /// Get a string value by key, copying into a caller-supplied buffer.
-        /// Returns the copied slice. Safe to use even after buffer mutations.
-        pub fn getStrCopy(self: *const Self, ofs: Offset, key: []const u8, dest: []u8) Error![]const u8 {
-            try ensureUsable(self);
-            const src = try self.getStr(ofs, key);
-            if (src.len > dest.len) return Error.NoBufferSpace;
-            @memcpy(dest[0..src.len], src);
-            return dest[0..src.len];
-        }
-
-        /// Get a bytes value by key, copying into a caller-supplied buffer.
-        /// Returns the copied slice. Safe to use even after buffer mutations.
-        pub fn getBytesCopy(self: *const Self, ofs: Offset, key: []const u8, dest: []u8) Error![]const u8 {
-            try ensureUsable(self);
-            const src = try self.getBytes(ofs, key);
-            if (src.len > dest.len) return Error.NoBufferSpace;
-            @memcpy(dest[0..src.len], src);
-            return dest[0..src.len];
-        }
-
-        // --- Array append operations ---
-
-        /// Append a null value to an array.
-        pub fn arrAppendNull(self: *Self, ofs: Offset) Error!void {
-            try ensureUsable(self);
-            const saved = saveLen(self);
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_null(self.raw(), @intFromEnum(ofs))
-            else
-                c.shim_lite3_arr_append_null(self.buf, &self.len, @intFromEnum(ofs), self.capacity);
-            if (ret < 0) {
-                restoreLen(self, saved);
-                return translateError(ret);
-            }
-        }
-
-        /// Append a boolean value to an array.
-        pub fn arrAppendBool(self: *Self, ofs: Offset, value: bool) Error!void {
-            try ensureUsable(self);
-            const saved = saveLen(self);
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_bool(self.raw(), @intFromEnum(ofs), value)
-            else
-                c.shim_lite3_arr_append_bool(self.buf, &self.len, @intFromEnum(ofs), self.capacity, value);
-            if (ret < 0) {
-                restoreLen(self, saved);
-                return translateError(ret);
-            }
-        }
-
-        /// Append an i64 value to an array.
-        pub fn arrAppendI64(self: *Self, ofs: Offset, value: i64) Error!void {
-            try ensureUsable(self);
-            const saved = saveLen(self);
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_i64(self.raw(), @intFromEnum(ofs), value)
-            else
-                c.shim_lite3_arr_append_i64(self.buf, &self.len, @intFromEnum(ofs), self.capacity, value);
-            if (ret < 0) {
-                restoreLen(self, saved);
-                return translateError(ret);
-            }
-        }
-
-        /// Append an f64 value to an array.
-        pub fn arrAppendF64(self: *Self, ofs: Offset, value: f64) Error!void {
-            try ensureUsable(self);
-            const saved = saveLen(self);
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_f64(self.raw(), @intFromEnum(ofs), value)
-            else
-                c.shim_lite3_arr_append_f64(self.buf, &self.len, @intFromEnum(ofs), self.capacity, value);
-            if (ret < 0) {
-                restoreLen(self, saved);
-                return translateError(ret);
-            }
-        }
-
-        /// Append a string value to an array.
-        pub fn arrAppendStr(self: *Self, ofs: Offset, value: []const u8) Error!void {
-            try ensureUsable(self);
-            const saved = saveLen(self);
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_str(self.raw(), @intFromEnum(ofs), value.ptr, value.len)
-            else
-                c.shim_lite3_arr_append_str(self.buf, &self.len, @intFromEnum(ofs), self.capacity, value.ptr, value.len);
-            if (ret < 0) {
-                restoreLen(self, saved);
-                return translateError(ret);
-            }
-        }
-
-        /// Append a bytes value to an array.
-        pub fn arrAppendBytes(self: *Self, ofs: Offset, value: []const u8) Error!void {
-            try ensureUsable(self);
-            const saved = saveLen(self);
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_bytes(self.raw(), @intFromEnum(ofs), value.ptr, value.len)
-            else
-                c.shim_lite3_arr_append_bytes(self.buf, &self.len, @intFromEnum(ofs), self.capacity, value.ptr, value.len);
-            if (ret < 0) {
-                restoreLen(self, saved);
-                return translateError(ret);
-            }
-        }
-
-        /// Append a nested object to an array. Returns the offset of the new object.
-        pub fn arrAppendObj(self: *Self, ofs: Offset) Error!Offset {
-            try ensureUsable(self);
-            const saved = saveLen(self);
-            var out_ofs: usize = 0;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_obj(self.raw(), @intFromEnum(ofs), &out_ofs)
-            else
-                c.shim_lite3_arr_append_obj(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &out_ofs);
-            if (ret < 0) {
-                restoreLen(self, saved);
-                return translateError(ret);
-            }
-            return @enumFromInt(out_ofs);
-        }
-
-        /// Append a nested array to an array. Returns the offset of the new array.
-        pub fn arrAppendArr(self: *Self, ofs: Offset) Error!Offset {
-            try ensureUsable(self);
-            const saved = saveLen(self);
-            var out_ofs: usize = 0;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_append_arr(self.raw(), @intFromEnum(ofs), &out_ofs)
-            else
-                c.shim_lite3_arr_append_arr(self.buf, &self.len, @intFromEnum(ofs), self.capacity, &out_ofs);
-            if (ret < 0) {
-                restoreLen(self, saved);
-                return translateError(ret);
-            }
-            return @enumFromInt(out_ofs);
-        }
-
-        // --- Array get operations ---
-
-        /// Get a boolean value from an array by index.
-        pub fn arrGetBool(self: *const Self, ofs: Offset, index: u32) Error!bool {
-            try ensureUsable(self);
-            var out: bool = false;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_bool(self.raw(), @intFromEnum(ofs), index, &out)
-            else
-                c.shim_lite3_arr_get_bool(self.buf, self.len, @intFromEnum(ofs), index, &out);
-            if (ret < 0) return translateError(ret);
-            return out;
-        }
-
-        /// Get an i64 value from an array by index.
-        pub fn arrGetI64(self: *const Self, ofs: Offset, index: u32) Error!i64 {
-            try ensureUsable(self);
-            var out: i64 = 0;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_i64(self.raw(), @intFromEnum(ofs), index, &out)
-            else
-                c.shim_lite3_arr_get_i64(self.buf, self.len, @intFromEnum(ofs), index, &out);
-            if (ret < 0) return translateError(ret);
-            return out;
-        }
-
-        /// Get an f64 value from an array by index.
-        pub fn arrGetF64(self: *const Self, ofs: Offset, index: u32) Error!f64 {
-            try ensureUsable(self);
-            var out: f64 = 0;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_f64(self.raw(), @intFromEnum(ofs), index, &out)
-            else
-                c.shim_lite3_arr_get_f64(self.buf, self.len, @intFromEnum(ofs), index, &out);
-            if (ret < 0) return translateError(ret);
-            return out;
-        }
-
-        /// Get a string value from an array by index.
-        /// WARNING: The returned slice points directly into the buffer and is
-        /// invalidated by any subsequent mutation. For Context, auto-reallocation
-        /// can cause use-after-free. Use `arrGetStrCopy` for a safe alternative.
-        pub fn arrGetStr(self: *const Self, ofs: Offset, index: u32) Error![]const u8 {
-            try ensureUsable(self);
-            var out_ptr: ?[*]const u8 = null;
-            var out_len: u32 = 0;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_str(self.raw(), @intFromEnum(ofs), index, @ptrCast(&out_ptr), &out_len)
-            else
-                c.shim_lite3_arr_get_str(self.buf, self.len, @intFromEnum(ofs), index, @ptrCast(&out_ptr), &out_len);
-            if (ret < 0) return translateError(ret);
-            if (out_ptr) |p| return p[0..out_len];
-            return Error.StaleReference;
-        }
-
-        /// Get a bytes value from an array by index.
-        /// WARNING: The returned slice points directly into the buffer and is
-        /// invalidated by any subsequent mutation. For Context, auto-reallocation
-        /// can cause use-after-free. Use `arrGetBytesCopy` for a safe alternative.
-        pub fn arrGetBytes(self: *const Self, ofs: Offset, index: u32) Error![]const u8 {
-            try ensureUsable(self);
-            var out_ptr: ?[*]const u8 = null;
-            var out_len: u32 = 0;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_bytes(self.raw(), @intFromEnum(ofs), index, &out_ptr, &out_len)
-            else
-                c.shim_lite3_arr_get_bytes(self.buf, self.len, @intFromEnum(ofs), index, &out_ptr, &out_len);
-            if (ret < 0) return translateError(ret);
-            if (out_ptr) |p| return p[0..out_len];
-            return Error.StaleReference;
-        }
-
-        /// Get a nested object offset from an array by index.
-        pub fn arrGetObj(self: *const Self, ofs: Offset, index: u32) Error!Offset {
-            try ensureUsable(self);
-            var out_ofs: usize = 0;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_obj(self.raw(), @intFromEnum(ofs), index, &out_ofs)
-            else
-                c.shim_lite3_arr_get_obj(self.buf, self.len, @intFromEnum(ofs), index, &out_ofs);
-            if (ret < 0) return translateError(ret);
-            return @enumFromInt(out_ofs);
-        }
-
-        /// Get a nested array offset from an array by index.
-        pub fn arrGetArr(self: *const Self, ofs: Offset, index: u32) Error!Offset {
-            try ensureUsable(self);
-            var out_ofs: usize = 0;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_arr(self.raw(), @intFromEnum(ofs), index, &out_ofs)
-            else
-                c.shim_lite3_arr_get_arr(self.buf, self.len, @intFromEnum(ofs), index, &out_ofs);
-            if (ret < 0) return translateError(ret);
-            return @enumFromInt(out_ofs);
-        }
-
-        /// Get the type of an array element by index.
-        pub fn arrGetType(self: *const Self, ofs: Offset, index: u32) Error!Type {
-            try ensureUsable(self);
-            const t = if (is_ctx)
-                c.shim_lite3_ctx_arr_get_type(self.raw(), @intFromEnum(ofs), index)
-            else
-                c.shim_lite3_arr_get_type(self.buf, self.len, @intFromEnum(ofs), index);
-            if (t < 0) return translateError(t);
-            if (t > Type.max_valid) return Error.CorruptData;
-            const ret: Type = @enumFromInt(@as(u8, @intCast(t)));
-            if (ret == .invalid) return Error.NotFound;
-            return ret;
-        }
-
-        /// Get a string value from an array by index, copying into a caller-supplied buffer.
-        /// Returns the copied slice. Safe to use even after buffer mutations.
-        pub fn arrGetStrCopy(self: *const Self, ofs: Offset, index: u32, dest: []u8) Error![]const u8 {
-            try ensureUsable(self);
-            const src = try self.arrGetStr(ofs, index);
-            if (src.len > dest.len) return Error.NoBufferSpace;
-            @memcpy(dest[0..src.len], src);
-            return dest[0..src.len];
-        }
-
-        /// Get a bytes value from an array by index, copying into a caller-supplied buffer.
-        /// Returns the copied slice. Safe to use even after buffer mutations.
-        pub fn arrGetBytesCopy(self: *const Self, ofs: Offset, index: u32, dest: []u8) Error![]const u8 {
-            try ensureUsable(self);
-            const src = try self.arrGetBytes(ofs, index);
-            if (src.len > dest.len) return Error.NoBufferSpace;
-            @memcpy(dest[0..src.len], src);
-            return dest[0..src.len];
-        }
-
-        // --- Utility ---
-
-        /// Return the number of entries in an object or elements in an array.
-        pub fn count(self: *const Self, ofs: Offset) Error!u32 {
-            try ensureUsable(self);
-            var out: u32 = 0;
-            const ret = if (is_ctx)
-                c.shim_lite3_ctx_count(self.raw(), @intFromEnum(ofs), &out)
-            else
-                c.shim_lite3_count(self.buf, self.len, @intFromEnum(ofs), &out);
-            if (ret < 0) return translateError(ret);
-            return out;
-        }
-
-        /// Create an iterator over the entries at the given offset.
-        ///
-        /// WARNING: The iterator captures the buffer pointer at creation time.
-        /// Any mutation (or Context reallocation) invalidates the iterator.
-        pub fn iterate(self: *const Self, ofs: Offset) Error!Iterator {
-            try ensureUsable(self);
-            const buf_ptr: [*]const u8 = if (is_ctx) c.shim_lite3_ctx_buf(self.raw()) else self.buf;
-            const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.raw()) else self.len;
-            var iter: c.shim_lite3_iter = undefined;
-            const ret = c.shim_lite3_iter_create(buf_ptr, buf_len, @intFromEnum(ofs), &iter);
-            if (ret < 0) return translateError(ret);
-            return Iterator{
-                .raw = iter,
-                .buf = buf_ptr,
-                .buflen = buf_len,
-            };
-        }
-
-        // --- JSON ---
-
-        /// Encode the buffer contents as a JSON string.
-        /// The returned `JsonString` is allocated by the C library and must be freed with `.deinit()`.
-        pub fn jsonEncode(self: *const Self, ofs: Offset) Error!JsonString {
-            try ensureUsable(self);
-            if (!json_enabled) return Error.InvalidArgument;
-            const buf_ptr: [*]const u8 = if (is_ctx) c.shim_lite3_ctx_buf(self.raw()) else self.buf;
-            const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.raw()) else self.len;
-            var out_len: usize = 0;
-            std.c._errno().* = 0;
-            const ptr: ?[*]u8 = @ptrCast(c.shim_lite3_json_enc(buf_ptr, buf_len, @intFromEnum(ofs), &out_len));
-            if (ptr) |p| return JsonString{ .ptr = p, .len = out_len };
-            return translateErrno();
-        }
-
-        /// Encode the buffer contents as a pretty-printed JSON string.
-        /// The returned `JsonString` is allocated by the C library and must be freed with `.deinit()`.
-        pub fn jsonEncodePretty(self: *const Self, ofs: Offset) Error!JsonString {
-            try ensureUsable(self);
-            if (!json_enabled) return Error.InvalidArgument;
-            const buf_ptr: [*]const u8 = if (is_ctx) c.shim_lite3_ctx_buf(self.raw()) else self.buf;
-            const buf_len: usize = if (is_ctx) c.shim_lite3_ctx_buflen(self.raw()) else self.len;
-            var out_len: usize = 0;
-            std.c._errno().* = 0;
-            const ptr: ?[*]u8 = @ptrCast(c.shim_lite3_json_enc_pretty(buf_ptr, buf_len, @intFromEnum(ofs), &out_len));
-            if (ptr) |p| return JsonString{ .ptr = p, .len = out_len };
-            return translateErrno();
-        }
-
-        /// Get the value at the given key as a tagged union.
-        /// WARNING: String and bytes slices point into the buffer; see getStr safety notes.
-        pub fn getValue(self: *const Self, ofs: Offset, key: []const u8) Error!Value {
-            try ensureUsable(self);
-            const t = try self.getType(ofs, key);
-            return switch (t) {
-                .null => .null,
-                .bool_ => .{ .bool_ = try self.getBool(ofs, key) },
-                .i64_ => .{ .i64_ = try self.getI64(ofs, key) },
-                .f64_ => .{ .f64_ = try self.getF64(ofs, key) },
-                .string => .{ .string = try self.getStr(ofs, key) },
-                .bytes => .{ .bytes = try self.getBytes(ofs, key) },
-                .object => .{ .object = try self.getObj(ofs, key) },
-                .array => .{ .array = try self.getArr(ofs, key) },
-                .invalid => Error.Unexpected,
-            };
-        }
-    };
+fn djb2(str: []const u8) u32 {
+    var h = djb2_seed;
+    for (str) |b| h = (h << 5) +% h +% b;
+    return h;
 }
 
 // ---------------------------------------------------------------------------
-// Buffer API
+// Errors
 // ---------------------------------------------------------------------------
 
-/// A Lite3 buffer backed by caller-supplied memory.
+/// Errors from reading a document.
+pub const ReadError = error{
+    /// No entry with that key.
+    NotFound,
+    /// The value or container is of a different type than requested.
+    TypeMismatch,
+    /// Array index past the end.
+    IndexOutOfBounds,
+    /// An integer does not fit the requested type.
+    IntegerOverflow,
+    /// The document is malformed (only possible for unvalidated bytes).
+    CorruptData,
+    /// The Offset does not point at a container of this document.
+    InvalidOffset,
+    /// The document was written to after this View or iterator was taken.
+    StaleView,
+};
+
+/// Errors from writing to a fixed-size document (`Buffer`).
+pub const WriteError = error{
+    /// The document is full.
+    NoSpaceLeft,
+    TypeMismatch,
+    IndexOutOfBounds,
+    /// An integer value does not fit in i64.
+    IntegerOverflow,
+    /// The key contains a NUL byte.
+    InvalidKey,
+    /// The key is too long (see `max_stack_key_len`), or longer than lite3's
+    /// limit of 2^30 bytes.
+    KeyTooLong,
+    /// Every slot in the key's hash probe sequence holds another key. lite3's
+    /// hash is unseeded, so crafted keys can cause this; see SECURITY.md.
+    KeyCollision,
+    /// A string or bytes value longer than lite3's 4 GiB limit.
+    ValueTooLarge,
+    /// The value lies inside this Buffer and is larger than the scratch space
+    /// used to copy it aside; copy it first.
+    ValueAliasesDocument,
+    InvalidOffset,
+    CorruptData,
+};
+
+/// Errors from writing to a growable document.
+pub const GrowError = error{OutOfMemory} || WriteError;
+
+/// Errors from decoding JSON.
+pub const DecodeError = error{
+    /// Not valid JSON; `JsonDiagnostics` has the position.
+    SyntaxError,
+    /// Nested deeper than 32 levels (lite3's JSON limit).
+    NestingTooDeep,
+    /// An object key contains `\u0000`.
+    InvalidKey,
+    /// The root is not an object or array.
+    InvalidRoot,
+    KeyCollision,
+    /// The result does not fit (Buffer) or would exceed `max_capacity`.
+    NoSpaceLeft,
+    OutOfMemory,
+    Unexpected,
+};
+
+/// Errors from encoding JSON.
+pub const EncodeError = error{
+    /// NaN or infinity cannot be represented in JSON.
+    NonFiniteNumber,
+    /// A string value is not valid UTF-8.
+    InvalidUtf8,
+    /// Containers nested deeper than `max_nesting_depth`.
+    NestingTooDeep,
+} || ReadError || std.Io.Writer.Error;
+
+/// Union of every error this module returns.
+pub const Error = ReadError || GrowError || DecodeError || EncodeError;
+
+/// Where JSON parsing failed.
+pub const JsonDiagnostics = struct {
+    /// yyjson error code.
+    code: u32 = 0,
+    /// Byte offset into the input.
+    position: usize = 0,
+    /// Static description.
+    message: []const u8 = "",
+};
+
+// ---------------------------------------------------------------------------
+// Validation
+// ---------------------------------------------------------------------------
+
+/// Check that `bytes` (a document's used bytes, root at offset 0) is a
+/// well-formed lite3 document. A document that passes can be read and written
+/// through this API without out-of-bounds access or unbounded work, whatever
+/// its origin. Linear time, no allocation.
 ///
-/// This wraps the lite3 "Buffer API" and provides an idiomatic Zig interface
-/// with proper error handling and slice-based access.
+/// It does not detect structure sharing that fits inside dead space (bytes
+/// left behind by overwrites): such a document is still safe, but a later
+/// write may make parts of it read as `CorruptData`. `validateStrict` rules
+/// that out too.
+pub fn validate(document: []const u8) error{CorruptData}!void {
+    return validation.validate(document);
+}
+
+/// Like `validate`, and additionally proves that no byte belongs to two nodes
+/// or entries, so the document stays valid under any sequence of writes. Use
+/// it before modifying documents from untrusted sources. Needs `len / 8`
+/// bytes of scratch memory.
+pub fn validateStrict(gpa: Allocator, document: []const u8) error{ CorruptData, OutOfMemory }!void {
+    return validation.validateStrict(gpa, document);
+}
+
+// ---------------------------------------------------------------------------
+// Keys as arguments
+// ---------------------------------------------------------------------------
+
+/// A key argument resolved to bytes plus hash. `z` is set when the bytes are
+/// known to be followed by a NUL (which lite3's write path needs).
+const KeyArg = struct {
+    bytes: []const u8,
+    hash: u32,
+    z: ?[*:0]const u8,
+};
+
+/// Accepts a `Key`, anything that coerces to `[:0]const u8` (string
+/// literals), or a `[]const u8`.
+fn keyArg(k: anytype) KeyArg {
+    const T = @TypeOf(k);
+    if (T == Key) return .{ .bytes = k.str, .hash = k.hash, .z = k.str.ptr };
+    if (comptime isSentinelString(T)) {
+        const s: [:0]const u8 = k;
+        return .{ .bytes = s, .hash = djb2(s), .z = s.ptr };
+    }
+    const s: []const u8 = k;
+    return .{ .bytes = s, .hash = djb2(s), .z = null };
+}
+
+fn isSentinelString(comptime T: type) bool {
+    const s = std.meta.sentinel(T) orelse return false;
+    return s == 0 and std.meta.Elem(T) == u8;
+}
+
+// ---------------------------------------------------------------------------
+// View: reads
+// ---------------------------------------------------------------------------
+
+/// Read-only access to a serialized document. Cheap to copy. Obtained from
+/// `Buffer.view`/`Document.view`, or from bytes with `View.fromBytes`.
+pub const View = struct {
+    bytes: []const u8,
+    /// Write counter of the owning document, if any.
+    epoch: ?*const u32 = null,
+    epoch_seen: u32 = 0,
+
+    /// View `document` (its used bytes) after `validate`.
+    pub fn fromBytes(document: []const u8) ReadError!View {
+        validate(document) catch return error.CorruptData;
+        return .{ .bytes = document };
+    }
+
+    /// View bytes this program produced itself, without validation. Reads
+    /// stay in bounds either way; validation also guarantees consistency.
+    pub fn fromBytesUnchecked(document: []const u8) View {
+        return .{ .bytes = document };
+    }
+
+    fn live(v: View) ReadError!void {
+        if (v.epoch) |e| if (e.* != v.epoch_seen) return error.StaleView;
+    }
+
+    fn u32At(v: View, ofs: usize) u32 {
+        return std.mem.readInt(u32, v.bytes[ofs..][0..4], .little);
+    }
+
+    fn inBounds(v: View, ofs: usize, len: usize) bool {
+        return ofs <= v.bytes.len and len <= v.bytes.len - ofs;
+    }
+
+    /// Type of the container at `at`.
+    pub fn containerType(v: View, at: Offset) ReadError!Container {
+        try v.live();
+        const ofs: usize = @backingInt(at);
+        if (ofs % node_alignment != 0 or !v.inBounds(ofs, node_size)) return error.InvalidOffset;
+        return switch (v.bytes[ofs]) {
+            6 => .object,
+            7 => .array,
+            else => error.InvalidOffset,
+        };
+    }
+
+    fn expect(v: View, at: Offset, want: Container) ReadError!void {
+        if (try v.containerType(at) != want) return error.TypeMismatch;
+    }
+
+    /// Type of the root container.
+    pub fn rootType(v: View) ReadError!Container {
+        return v.containerType(root);
+    }
+
+    /// Number of entries in the object or array at `at`.
+    pub fn count(v: View, at: Offset) ReadError!u32 {
+        _ = try v.containerType(at);
+        return v.u32At(@as(usize, @backingInt(at)) + ofs_size_kc) >> 6;
+    }
+
+    /// Find `hash` in the container rooted at `ofs` the way lite3's lookup
+    /// does; returns the kv offset. Every read is bounds-checked.
+    fn findHash(v: View, ofs: usize, hash: u32) ReadError!?usize {
+        var node = ofs;
+        var walks: usize = 0;
+        while (true) {
+            if (node % node_alignment != 0 or !v.inBounds(node, node_size)) return error.CorruptData;
+            const kc = v.u32At(node + ofs_size_kc) & 0x7;
+            var i: usize = 0;
+            while (i < kc and v.u32At(node + ofs_hashes + 4 * i) < hash) i += 1;
+            if (i < kc and v.u32At(node + ofs_hashes + 4 * i) == hash) return v.u32At(node + ofs_kv + 4 * i);
+            if (v.u32At(node + ofs_child) == 0) return null;
+            walks += 1;
+            if (walks > tree_height_max) return error.CorruptData;
+            node = v.u32At(node + ofs_child + 4 * i);
+        }
+    }
+
+    /// Decode the key entry at `kv`: key bytes (without NUL) and the offset
+    /// of the value that follows.
+    fn keyAt(v: View, kv: usize) ReadError!struct { key: []const u8, value_ofs: usize } {
+        if (!v.inBounds(kv, 1)) return error.CorruptData;
+        const tag_len: usize = (v.bytes[kv] & 0x3) + 1;
+        if (!v.inBounds(kv, tag_len)) return error.CorruptData;
+        var tag: u32 = 0;
+        for (0..tag_len) |i| tag |= @as(u32, v.bytes[kv + i]) << @intCast(8 * i);
+        const size: usize = tag >> 2;
+        const start = kv + tag_len;
+        if (size == 0 or !v.inBounds(start, size) or v.bytes[start + size - 1] != 0) return error.CorruptData;
+        return .{ .key = v.bytes[start .. start + size - 1], .value_ofs = start + size };
+    }
+
+    /// Value offset for `k` in the object at `at` (lite3's probing).
+    fn lookup(v: View, at: Offset, k: KeyArg) ReadError!usize {
+        try v.expect(at, .object);
+        const ofs: usize = @backingInt(at);
+        for (0..hash_probe_max) |attempt| {
+            const probe = k.hash +% @as(u32, @intCast(attempt * attempt));
+            const kv = try v.findHash(ofs, probe) orelse return error.NotFound;
+            const entry = try v.keyAt(kv);
+            if (std.mem.eql(u8, entry.key, k.bytes)) return entry.value_ofs;
+        }
+        return error.NotFound;
+    }
+
+    /// Value offset for `index` in the array at `arr`.
+    fn lookupIndex(v: View, arr: Offset, index: u32) ReadError!usize {
+        try v.expect(arr, .array);
+        if (index >= try v.count(arr)) return error.IndexOutOfBounds;
+        return try v.findHash(@backingInt(arr), index) orelse error.CorruptData;
+    }
+
+    fn valueAt(v: View, ofs: usize) ReadError!Value {
+        if (!v.inBounds(ofs, 1)) return error.CorruptData;
+        const t = v.bytes[ofs];
+        switch (t) {
+            0 => return .null,
+            1 => {
+                if (!v.inBounds(ofs, 2) or v.bytes[ofs + 1] > 1) return error.CorruptData;
+                return .{ .bool = v.bytes[ofs + 1] == 1 };
+            },
+            2, 3 => {
+                if (!v.inBounds(ofs, 9)) return error.CorruptData;
+                const raw = std.mem.readInt(u64, v.bytes[ofs + 1 ..][0..8], .little);
+                return if (t == 2) .{ .int = @bitCast(raw) } else .{ .float = @bitCast(raw) };
+            },
+            4, 5 => {
+                if (!v.inBounds(ofs, 5)) return error.CorruptData;
+                const n: usize = v.u32At(ofs + 1);
+                if (!v.inBounds(ofs + 5, n)) return error.CorruptData;
+                const data = v.bytes[ofs + 5 .. ofs + 5 + n];
+                if (t == 4) return .{ .bytes = data };
+                if (n == 0 or data[n - 1] != 0) return error.CorruptData;
+                return .{ .string = data[0 .. n - 1] };
+            },
+            6, 7 => {
+                if (ofs % node_alignment != 0 or !v.inBounds(ofs, node_size)) return error.CorruptData;
+                const o: Offset = @fromBackingInt(@intCast(ofs));
+                return if (t == 6) .{ .object = o } else .{ .array = o };
+            },
+            else => return error.CorruptData,
+        }
+    }
+
+    /// The value for `k` in the object at `at`.
+    pub fn getValue(v: View, at: Offset, k: anytype) ReadError!Value {
+        return v.valueAt(try v.lookup(at, keyArg(k)));
+    }
+
+    /// The value at `index` in the array at `arr`.
+    pub fn arrValue(v: View, arr: Offset, index: u32) ReadError!Value {
+        return v.valueAt(try v.lookupIndex(arr, index));
+    }
+
+    /// The value for `k`, as `T`: `bool`, an integer type (range-checked), a
+    /// float type, `[]const u8` (string), `Bytes`, `Value`, or `?T` of any of
+    /// these (a stored null reads as `null`).
+    pub fn get(v: View, comptime T: type, at: Offset, k: anytype) ReadError!T {
+        return convert(T, try v.getValue(at, k));
+    }
+
+    /// The array element at `index`, as `T` (see `get`).
+    pub fn arrGet(v: View, comptime T: type, arr: Offset, index: u32) ReadError!T {
+        return convert(T, try v.arrValue(arr, index));
+    }
+
+    /// The object stored under `k`.
+    pub fn getObject(v: View, at: Offset, k: anytype) ReadError!Offset {
+        return switch (try v.getValue(at, k)) {
+            .object => |o| o,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// The array stored under `k`.
+    pub fn getArray(v: View, at: Offset, k: anytype) ReadError!Offset {
+        return switch (try v.getValue(at, k)) {
+            .array => |o| o,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// The object at `index` in the array at `arr`.
+    pub fn arrGetObject(v: View, arr: Offset, index: u32) ReadError!Offset {
+        return switch (try v.arrValue(arr, index)) {
+            .object => |o| o,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// The array at `index` in the array at `arr`.
+    pub fn arrGetArray(v: View, arr: Offset, index: u32) ReadError!Offset {
+        return switch (try v.arrValue(arr, index)) {
+            .array => |o| o,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// Type of the value stored under `k`.
+    pub fn typeOf(v: View, at: Offset, k: anytype) ReadError!Type {
+        return std.meta.activeTag(try v.getValue(at, k));
+    }
+
+    /// Whether the object at `at` has key `k`.
+    pub fn has(v: View, at: Offset, k: anytype) ReadError!bool {
+        _ = v.lookup(at, keyArg(k)) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        return true;
+    }
+
+    /// Iterate the entries of the object at `at`.
+    pub fn objectIterator(v: View, at: Offset) ReadError!ObjectIterator {
+        try v.expect(at, .object);
+        return .{ .walk = try Walk.init(v, at) };
+    }
+
+    /// Iterate the elements of the array at `arr`.
+    pub fn arrayIterator(v: View, arr: Offset) ReadError!ArrayIterator {
+        try v.expect(arr, .array);
+        return .{ .walk = try Walk.init(v, arr) };
+    }
+
+    /// Write the container at `at` as JSON.
+    pub fn writeJson(v: View, at: Offset, w: *std.Io.Writer, options: JsonOptions) EncodeError!void {
+        const t = try v.containerType(at);
+        try writeJsonValue(v, if (t == .object) .{ .object = at } else .{ .array = at }, w, options, 1);
+        if (options.whitespace == .indent_2) try w.writeByte('\n');
+    }
+
+    /// The container at `at` as a JSON string allocated with `gpa`.
+    pub fn jsonAlloc(v: View, gpa: Allocator, at: Offset, options: JsonOptions) (EncodeError || error{OutOfMemory})![]u8 {
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        v.writeJson(at, &out.writer, options) catch |err| switch (err) {
+            error.WriteFailed => return error.OutOfMemory,
+            else => |e| return e,
+        };
+        return out.toOwnedSlice();
+    }
+
+    /// `{f}` formatting: the document as compact JSON.
+    pub fn format(v: View, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        v.writeJson(root, w, .{}) catch |err| switch (err) {
+            error.WriteFailed => return error.WriteFailed,
+            else => |e| try w.print("<lite3: {s}>", .{@errorName(e)}),
+        };
+    }
+};
+
+fn convert(comptime T: type, value: Value) ReadError!T {
+    if (T == Value) return value;
+    switch (@typeInfo(T)) {
+        .optional => |o| return if (value == .null) null else try convert(o.child, value),
+        .bool => return switch (value) {
+            .bool => |b| b,
+            else => error.TypeMismatch,
+        },
+        .int => return switch (value) {
+            .int => |i| std.math.cast(T, i) orelse error.IntegerOverflow,
+            else => error.TypeMismatch,
+        },
+        .float => return switch (value) {
+            .float => |f| @floatCast(f),
+            else => error.TypeMismatch,
+        },
+        else => {},
+    }
+    if (T == []const u8) return switch (value) {
+        .string => |s| s,
+        else => error.TypeMismatch,
+    };
+    if (T == Bytes) return switch (value) {
+        .bytes => |b| .{ .data = b },
+        else => error.TypeMismatch,
+    };
+    @compileError("lite3: cannot read a value as " ++ @typeName(T));
+}
+
+// ---------------------------------------------------------------------------
+// Iteration
+// ---------------------------------------------------------------------------
+
+/// In-order walk over one container's B-tree, yielding kv offsets. Bounded by
+/// the container's element count (and the document size) even for malformed
+/// documents.
+const Walk = struct {
+    view: View,
+    path: [tree_height_max + 1]Cursor = undefined,
+    depth: u8 = 0,
+    remaining: usize,
+
+    const Cursor = struct { ofs: u32, key_count: u8, internal: bool, pos: u8 = 0 };
+
+    fn init(v: View, at: Offset) ReadError!Walk {
+        const n = try v.count(at);
+        var w: Walk = .{ .view = v, .remaining = @min(n, v.bytes.len) };
+        w.path[0] = try w.cursor(@backingInt(at));
+        return w;
+    }
+
+    fn cursor(w: *const Walk, ofs: usize) ReadError!Cursor {
+        const v = w.view;
+        if (ofs % node_alignment != 0 or !v.inBounds(ofs, node_size)) return error.CorruptData;
+        return .{
+            .ofs = @intCast(ofs),
+            .key_count = @intCast(v.u32At(ofs + ofs_size_kc) & 0x7),
+            .internal = v.u32At(ofs + ofs_child) != 0,
+        };
+    }
+
+    fn next(w: *Walk) ReadError!?usize {
+        try w.view.live();
+        while (true) {
+            const cur = &w.path[w.depth];
+            if (cur.pos > 2 * @as(usize, cur.key_count)) {
+                if (w.depth == 0) return null;
+                w.depth -= 1;
+                continue;
+            }
+            const pos = cur.pos;
+            cur.pos += 1;
+            if (pos % 2 == 0) {
+                if (!cur.internal) continue;
+                if (w.depth == tree_height_max) return error.CorruptData;
+                const child = w.view.u32At(@as(usize, cur.ofs) + ofs_child + 2 * @as(usize, pos));
+                const next_cursor = try w.cursor(child);
+                w.depth += 1;
+                w.path[w.depth] = next_cursor;
+                continue;
+            }
+            if (w.remaining == 0) return error.CorruptData;
+            w.remaining -= 1;
+            return w.view.u32At(@as(usize, cur.ofs) + ofs_kv + 4 * @as(usize, pos / 2));
+        }
+    }
+};
+
+/// Iterates an object's entries in storage (hash) order.
+pub const ObjectIterator = struct {
+    walk: Walk,
+
+    pub const Entry = struct {
+        /// Points into the document; valid until its next write.
+        key: []const u8,
+        value: Value,
+    };
+
+    pub fn next(it: *ObjectIterator) ReadError!?Entry {
+        const kv = try it.walk.next() orelse return null;
+        const entry = try it.walk.view.keyAt(kv);
+        return .{ .key = entry.key, .value = try it.walk.view.valueAt(entry.value_ofs) };
+    }
+};
+
+/// Iterates an array's elements in index order.
+pub const ArrayIterator = struct {
+    walk: Walk,
+    index: u32 = 0,
+
+    pub const Element = struct {
+        index: u32,
+        value: Value,
+    };
+
+    pub fn next(it: *ArrayIterator) ReadError!?Element {
+        const kv = try it.walk.next() orelse return null;
+        defer it.index += 1;
+        return .{ .index = it.index, .value = try it.walk.view.valueAt(kv) };
+    }
+};
+
+// ---------------------------------------------------------------------------
+// JSON encoding (pure Zig)
+// ---------------------------------------------------------------------------
+
+pub const JsonOptions = struct {
+    whitespace: enum { minified, indent_2 } = .minified,
+};
+
+fn writeJsonValue(v: View, value: Value, w: *std.Io.Writer, options: JsonOptions, depth: usize) EncodeError!void {
+    switch (value) {
+        .null => try w.writeAll("null"),
+        .bool => |b| try w.writeAll(if (b) "true" else "false"),
+        .int => |i| try w.print("{d}", .{i}),
+        .float => |f| try writeJsonFloat(f, w),
+        .string => |s| {
+            if (!std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
+            try writeJsonString(s, w);
+        },
+        .bytes => |b| {
+            // lite3's JSON form for bytes: a base64 string.
+            try w.writeByte('"');
+            var chunk: [3 * 256]u8 = undefined;
+            var encoded: [4 * 256]u8 = undefined;
+            var rest = b;
+            while (rest.len > 0) {
+                const n = @min(rest.len, chunk.len);
+                @memcpy(chunk[0..n], rest[0..n]);
+                try w.writeAll(std.base64.standard.Encoder.encode(&encoded, chunk[0..n]));
+                rest = rest[n..];
+            }
+            try w.writeByte('"');
+        },
+        .object => |o| {
+            if (depth > max_nesting_depth) return error.NestingTooDeep;
+            var it = try v.objectIterator(o);
+            try w.writeByte('{');
+            var first = true;
+            while (try it.next()) |e| : (first = false) {
+                if (!first) try w.writeByte(',');
+                try newline(w, options, depth);
+                if (!std.unicode.utf8ValidateSlice(e.key)) return error.InvalidUtf8;
+                try writeJsonString(e.key, w);
+                try w.writeAll(if (options.whitespace == .minified) ":" else ": ");
+                try writeJsonValue(v, e.value, w, options, depth + 1);
+            }
+            if (!first) try newline(w, options, depth - 1);
+            try w.writeByte('}');
+        },
+        .array => |a| {
+            if (depth > max_nesting_depth) return error.NestingTooDeep;
+            var it = try v.arrayIterator(a);
+            try w.writeByte('[');
+            var first = true;
+            while (try it.next()) |e| : (first = false) {
+                if (!first) try w.writeByte(',');
+                try newline(w, options, depth);
+                try writeJsonValue(v, e.value, w, options, depth + 1);
+            }
+            if (!first) try newline(w, options, depth - 1);
+            try w.writeByte(']');
+        },
+    }
+}
+
+fn newline(w: *std.Io.Writer, options: JsonOptions, depth: usize) std.Io.Writer.Error!void {
+    if (options.whitespace == .minified) return;
+    try w.writeByte('\n');
+    try w.splatByteAll(' ', 2 * depth);
+}
+
+fn writeJsonFloat(f: f64, w: *std.Io.Writer) EncodeError!void {
+    if (!std.math.isFinite(f)) return error.NonFiniteNumber;
+    const a = @abs(f);
+    var buf: [64]u8 = undefined;
+    // Shortest round-trip digits; scientific notation outside a readable range.
+    const text = (if (a != 0 and (a < 1e-5 or a >= 1e16))
+        std.fmt.bufPrint(&buf, "{e}", .{f})
+    else
+        std.fmt.bufPrint(&buf, "{d}", .{f})) catch unreachable;
+    try w.writeAll(text);
+    // Keep floats distinguishable from integers when read back.
+    if (std.mem.indexOfAny(u8, text, ".e") == null) try w.writeAll(".0");
+}
+
+fn writeJsonString(s: []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.writeByte('"');
+    var start: usize = 0;
+    for (s, 0..) |ch, i| {
+        const escape: ?[]const u8 = switch (ch) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            0x08 => "\\b",
+            0x0c => "\\f",
+            else => null,
+        };
+        if (escape == null and ch >= 0x20) continue;
+        try w.writeAll(s[start..i]);
+        if (escape) |e| try w.writeAll(e) else try w.print("\\u{x:0>4}", .{ch});
+        start = i + 1;
+    }
+    try w.writeAll(s[start..]);
+    try w.writeByte('"');
+}
+
+// ---------------------------------------------------------------------------
+// Writing (shared by Buffer and Document)
+// ---------------------------------------------------------------------------
+
+/// A value as it will be stored.
+const Scalar = union(enum) {
+    null,
+    bool: bool,
+    int: i64,
+    float: f64,
+    string: []const u8,
+    bytes: []const u8,
+
+    fn of(value: anytype) WriteError!Scalar {
+        const T = @TypeOf(value);
+        if (T == Scalar) return value;
+        if (T == @TypeOf(null)) return .null;
+        if (T == Bytes) return .{ .bytes = value.data };
+        switch (@typeInfo(T)) {
+            .bool => return .{ .bool = value },
+            .int, .comptime_int => return .{ .int = std.math.cast(i64, value) orelse return error.IntegerOverflow },
+            .float, .comptime_float => return .{ .float = value },
+            .optional => return if (value) |inner| of(inner) else .null,
+            else => {},
+        }
+        if (comptime isStringLike(T)) return .{ .string = value };
+        @compileError("lite3: cannot store a value of type " ++ @typeName(T) ++
+            " (use bool, an integer, a float, a string, lite3.bytes(...), or null)");
+    }
+
+    fn typeTag(s: Scalar) u8 {
+        return switch (s) {
+            .null => 0,
+            .bool => 1,
+            .int => 2,
+            .float => 3,
+            .bytes => 4,
+            .string => 5,
+        };
+    }
+
+    /// Payload size after the type byte.
+    fn payloadLen(s: Scalar) WriteError!usize {
+        return switch (s) {
+            .null => 0,
+            .bool => 1,
+            .int, .float => 8,
+            .bytes => |b| if (b.len > std.math.maxInt(u32)) error.ValueTooLarge else 4 + b.len,
+            .string => |str| if (str.len >= std.math.maxInt(u32)) error.ValueTooLarge else 4 + str.len + 1,
+        };
+    }
+
+    fn data(s: Scalar) []const u8 {
+        return switch (s) {
+            .string => |d| d,
+            .bytes => |d| d,
+            else => &.{},
+        };
+    }
+
+    fn withData(s: Scalar, d: []const u8) Scalar {
+        return switch (s) {
+            .string => .{ .string = d },
+            .bytes => .{ .bytes = d },
+            else => s,
+        };
+    }
+
+    fn writePayload(s: Scalar, out: []u8) void {
+        switch (s) {
+            .null => {},
+            .bool => |b| out[0] = @intFromBool(b),
+            .int => |i| std.mem.writeInt(i64, out[0..8], i, .little),
+            .float => |f| std.mem.writeInt(u64, out[0..8], @bitCast(f), .little),
+            .bytes => |b| {
+                std.mem.writeInt(u32, out[0..4], @intCast(b.len), .little);
+                @memmove(out[4..][0..b.len], b);
+            },
+            .string => |str| {
+                std.mem.writeInt(u32, out[0..4], @intCast(str.len + 1), .little);
+                @memmove(out[4..][0..str.len], str);
+                out[4 + str.len] = 0;
+            },
+        }
+    }
+};
+
+fn isStringLike(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .pointer => |p| switch (p.size) {
+            .slice => p.child == u8,
+            .one => switch (@typeInfo(p.child)) {
+                .array => |a| a.child == u8,
+                else => false,
+            },
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// Where an entry goes: a key in an object, or an index in an array.
+const Slot = union(enum) {
+    key: KeyArg,
+    index: u32,
+};
+
+fn mapStatus(ret: c_int) WriteError {
+    return switch (-ret) {
+        c.LITE3ZIG_E_NO_SPACE => error.NoSpaceLeft,
+        c.LITE3ZIG_E_KEY_COLLISION => error.KeyCollision,
+        else => error.CorruptData,
+    };
+}
+
+/// Writes against `mem[0..len.*]`. Callers check the target container and
+/// slot first, and supply a NUL-terminated key.
+const Raw = struct {
+    mem: []align(4) u8,
+    len: *usize,
+
+    fn view(r: Raw) View {
+        return .{ .bytes = r.mem[0..r.len.*] };
+    }
+
+    fn keyParts(slot: Slot, z: ?[*:0]const u8) struct { ptr: ?[*:0]const u8, hash: u32, size: u32 } {
+        return switch (slot) {
+            .key => |k| .{ .ptr = z, .hash = k.hash, .size = @intCast(k.bytes.len + 1) },
+            .index => |i| .{ .ptr = null, .hash = i, .size = 0 },
+        };
+    }
+
+    inline fn insertScalar(r: Raw, at: Offset, slot: Slot, z: ?[*:0]const u8, value: Scalar) WriteError!void {
+        const payload_len = try value.payloadLen();
+        const k = keyParts(slot, z);
+        var payload_ofs: u32 = 0;
+        const ret = c.shim_insert(r.mem.ptr, r.len, @backingInt(at), r.mem.len, k.ptr, k.hash, k.size, value.typeTag(), payload_len, &payload_ofs);
+        if (ret < 0) return mapStatus(ret);
+        value.writePayload(r.mem[payload_ofs..][0..payload_len]);
+    }
+
+    fn insertContainer(r: Raw, at: Offset, slot: Slot, z: ?[*:0]const u8, kind: Container) WriteError!Offset {
+        const k = keyParts(slot, z);
+        var out: u32 = 0;
+        const ret = c.shim_insert_container(r.mem.ptr, r.len, @backingInt(at), r.mem.len, k.ptr, k.hash, k.size, @backingInt(kind), &out);
+        if (ret < 0) return mapStatus(ret);
+        return @fromBackingInt(out);
+    }
+};
+
+/// Check the target of a write and resolve the slot.
+inline fn writeSlot(v: View, at: Offset, target: anytype) WriteError!Slot {
+    const T = @TypeOf(target);
+    if (T == Append) {
+        try expectWritable(v, at, .array);
+        return .{ .index = v.count(at) catch unreachable };
+    }
+    if (T == ArrayIndex) {
+        try expectWritable(v, at, .array);
+        if (target.index > v.count(at) catch unreachable) return error.IndexOutOfBounds;
+        return .{ .index = target.index };
+    }
+    try expectWritable(v, at, .object);
+    const k = keyArg(target);
+    if (std.mem.indexOfScalar(u8, k.bytes, 0) != null) return error.InvalidKey;
+    if (k.bytes.len + 1 >= 1 << 30) return error.KeyTooLong;
+    return .{ .key = k };
+}
+
+const Append = struct {};
+const ArrayIndex = struct { index: u32 };
+
+fn expectWritable(v: View, at: Offset, want: Container) WriteError!void {
+    const got = v.containerType(at) catch |err| return switch (err) {
+        error.InvalidOffset => error.InvalidOffset,
+        else => error.CorruptData,
+    };
+    if (got != want) return error.TypeMismatch;
+}
+
+/// Upper bound of the bytes a write can add: entry, alignment, two nodes.
+fn writeReserve(slot: Slot, payload_len: usize) usize {
+    const key_len = switch (slot) {
+        .key => |k| 4 + k.bytes.len + 1,
+        .index => 0,
+    };
+    return key_len + 1 + payload_len + node_alignment + 2 * node_size;
+}
+
+fn overlaps(mem: []const u8, data: []const u8) bool {
+    if (data.len == 0) return false;
+    const m = @intFromPtr(mem.ptr);
+    const d = @intFromPtr(data.ptr);
+    return d < m + mem.len and m < d + data.len;
+}
+
+// ---------------------------------------------------------------------------
+// Buffer
+// ---------------------------------------------------------------------------
+
+/// A document in caller-owned memory of fixed size. Writes fail with
+/// `error.NoSpaceLeft` when it is full.
 pub const Buffer = struct {
-    buf: [*]u8,
+    mem: []align(4) u8,
     len: usize,
-    capacity: usize,
+    epoch: u32 = 0,
 
-    // Import shared methods
-    pub const setNull = SharedMethods(Buffer).setNull;
-    pub const setBool = SharedMethods(Buffer).setBool;
-    pub const setI64 = SharedMethods(Buffer).setI64;
-    pub const setF64 = SharedMethods(Buffer).setF64;
-    pub const setStr = SharedMethods(Buffer).setStr;
-    pub const setBytes = SharedMethods(Buffer).setBytes;
-    pub const setObj = SharedMethods(Buffer).setObj;
-    pub const setArr = SharedMethods(Buffer).setArr;
-    pub const getType = SharedMethods(Buffer).getType;
-    pub const exists = SharedMethods(Buffer).exists;
-    pub const getBool = SharedMethods(Buffer).getBool;
-    pub const getI64 = SharedMethods(Buffer).getI64;
-    pub const getF64 = SharedMethods(Buffer).getF64;
-    pub const getStr = SharedMethods(Buffer).getStr;
-    pub const getBytes = SharedMethods(Buffer).getBytes;
-    pub const getObj = SharedMethods(Buffer).getObj;
-    pub const getArr = SharedMethods(Buffer).getArr;
-    pub const getStrCopy = SharedMethods(Buffer).getStrCopy;
-    pub const getBytesCopy = SharedMethods(Buffer).getBytesCopy;
-    pub const arrAppendNull = SharedMethods(Buffer).arrAppendNull;
-    pub const arrAppendBool = SharedMethods(Buffer).arrAppendBool;
-    pub const arrAppendI64 = SharedMethods(Buffer).arrAppendI64;
-    pub const arrAppendF64 = SharedMethods(Buffer).arrAppendF64;
-    pub const arrAppendStr = SharedMethods(Buffer).arrAppendStr;
-    pub const arrAppendBytes = SharedMethods(Buffer).arrAppendBytes;
-    pub const arrAppendObj = SharedMethods(Buffer).arrAppendObj;
-    pub const arrAppendArr = SharedMethods(Buffer).arrAppendArr;
-    pub const arrGetBool = SharedMethods(Buffer).arrGetBool;
-    pub const arrGetI64 = SharedMethods(Buffer).arrGetI64;
-    pub const arrGetF64 = SharedMethods(Buffer).arrGetF64;
-    pub const arrGetStr = SharedMethods(Buffer).arrGetStr;
-    pub const arrGetBytes = SharedMethods(Buffer).arrGetBytes;
-    pub const arrGetObj = SharedMethods(Buffer).arrGetObj;
-    pub const arrGetArr = SharedMethods(Buffer).arrGetArr;
-    pub const arrGetType = SharedMethods(Buffer).arrGetType;
-    pub const arrGetStrCopy = SharedMethods(Buffer).arrGetStrCopy;
-    pub const arrGetBytesCopy = SharedMethods(Buffer).arrGetBytesCopy;
-    pub const count = SharedMethods(Buffer).count;
-    pub const iterate = SharedMethods(Buffer).iterate;
-    pub const jsonEncode = SharedMethods(Buffer).jsonEncode;
-    pub const jsonEncodePretty = SharedMethods(Buffer).jsonEncodePretty;
-    pub const getValue = SharedMethods(Buffer).getValue;
+    /// Size of scratch space used to copy aside a value that lies inside
+    /// this Buffer (`setStr(k, view.get(...))` and the like).
+    pub const alias_scratch_len = 4096;
 
-    // Buffer-specific methods
-
-    /// Initialize a new Lite3 buffer as an object.
-    pub fn initObj(mem: []align(4) u8) Error!Buffer {
-        var buflen: usize = 0;
-        const ret = lite3_init_obj(mem.ptr, &buflen, mem.len);
-        if (ret < 0) return translateError(ret);
-        return Buffer{
-            .buf = mem.ptr,
-            .len = buflen,
-            .capacity = mem.len,
-        };
-    }
-
-    /// Initialize a new Lite3 buffer as an array.
-    pub fn initArr(mem: []align(4) u8) Error!Buffer {
-        var buflen: usize = 0;
-        const ret = lite3_init_arr(mem.ptr, &buflen, mem.len);
-        if (ret < 0) return translateError(ret);
-        return Buffer{
-            .buf = mem.ptr,
-            .len = buflen,
-            .capacity = mem.len,
-        };
-    }
-
-    /// Construct a buffer view from existing Lite3 bytes copied into `mem`.
-    pub fn fromSerialized(mem: []align(4) u8, used_len: usize) Error!Buffer {
-        if (used_len == 0 or used_len > mem.len) return Error.InvalidArgument;
-        return Buffer{
-            .buf = mem.ptr,
-            .len = used_len,
-            .capacity = mem.len,
-        };
-    }
-
-    /// Return the underlying buffer as a slice of the used portion.
-    pub fn data(self: *const Buffer) []const u8 {
-        if (self.capacity == 0 and self.len == 0) return &.{};
-        if (self.len > self.capacity) return &.{};
-        return self.buf[0..self.len];
-    }
-
-    /// Decode a JSON string into a buffer, reinitializing it.
-    pub fn jsonDecode(mem: []align(4) u8, json: []const u8) Error!Buffer {
-        if (!json_enabled) return Error.InvalidArgument;
-        var buflen: usize = 0;
-        const ret = c.shim_lite3_json_dec(mem.ptr, &buflen, mem.len, json.ptr, json.len);
-        if (ret < 0) return translateError(ret);
-        return Buffer{
-            .buf = mem.ptr,
-            .len = buflen,
-            .capacity = mem.len,
-        };
-    }
-
-    /// Encode the buffer contents as JSON into a caller-supplied buffer.
-    /// Returns the number of bytes written.
-    pub fn jsonEncodeBuf(self: *const Buffer, ofs: Offset, out: []u8) Error!usize {
-        if (!json_enabled) return Error.InvalidArgument;
-        const ret = c.shim_lite3_json_enc_buf(self.buf, self.len, @intFromEnum(ofs), out.ptr, out.len);
-        if (ret < 0) return translateError(@intCast(ret));
-        return @intCast(ret);
-    }
-};
-
-// Extern declarations for the non-inline C functions
-extern fn lite3_init_obj(buf: [*]u8, out_buflen: *usize, bufsz: usize) c_int;
-extern fn lite3_init_arr(buf: [*]u8, out_buflen: *usize, bufsz: usize) c_int;
-
-// ---------------------------------------------------------------------------
-// Context API
-// ---------------------------------------------------------------------------
-
-/// A Lite3 context with automatic memory management.
-///
-/// This wraps the lite3 "Context API" where allocations are handled internally
-/// by the C library (malloc/free).
-pub const Context = struct {
-    ctx: ?*c.lite3_ctx,
-    const dead_storage: [4]u8 align(4) = .{ 0, 0, 0, 0 };
-
-    inline fn raw(self: *const Context) *c.lite3_ctx {
-        return self.ctx.?;
-    }
-
-    inline fn ensureAlive(self: *const Context) Error!void {
-        if (self.ctx == null) return Error.InvalidState;
-    }
-
-    // Import shared methods
-    pub const setNull = SharedMethods(Context).setNull;
-    pub const setBool = SharedMethods(Context).setBool;
-    pub const setI64 = SharedMethods(Context).setI64;
-    pub const setF64 = SharedMethods(Context).setF64;
-    pub const setStr = SharedMethods(Context).setStr;
-    pub const setBytes = SharedMethods(Context).setBytes;
-    pub const setObj = SharedMethods(Context).setObj;
-    pub const setArr = SharedMethods(Context).setArr;
-    pub const getType = SharedMethods(Context).getType;
-    pub const exists = SharedMethods(Context).exists;
-    pub const getBool = SharedMethods(Context).getBool;
-    pub const getI64 = SharedMethods(Context).getI64;
-    pub const getF64 = SharedMethods(Context).getF64;
-    pub const getStr = SharedMethods(Context).getStr;
-    pub const getBytes = SharedMethods(Context).getBytes;
-    pub const getObj = SharedMethods(Context).getObj;
-    pub const getArr = SharedMethods(Context).getArr;
-    pub const getStrCopy = SharedMethods(Context).getStrCopy;
-    pub const getBytesCopy = SharedMethods(Context).getBytesCopy;
-    pub const arrAppendNull = SharedMethods(Context).arrAppendNull;
-    pub const arrAppendBool = SharedMethods(Context).arrAppendBool;
-    pub const arrAppendI64 = SharedMethods(Context).arrAppendI64;
-    pub const arrAppendF64 = SharedMethods(Context).arrAppendF64;
-    pub const arrAppendStr = SharedMethods(Context).arrAppendStr;
-    pub const arrAppendBytes = SharedMethods(Context).arrAppendBytes;
-    pub const arrAppendObj = SharedMethods(Context).arrAppendObj;
-    pub const arrAppendArr = SharedMethods(Context).arrAppendArr;
-    pub const arrGetBool = SharedMethods(Context).arrGetBool;
-    pub const arrGetI64 = SharedMethods(Context).arrGetI64;
-    pub const arrGetF64 = SharedMethods(Context).arrGetF64;
-    pub const arrGetStr = SharedMethods(Context).arrGetStr;
-    pub const arrGetBytes = SharedMethods(Context).arrGetBytes;
-    pub const arrGetObj = SharedMethods(Context).arrGetObj;
-    pub const arrGetArr = SharedMethods(Context).arrGetArr;
-    pub const arrGetType = SharedMethods(Context).arrGetType;
-    pub const arrGetStrCopy = SharedMethods(Context).arrGetStrCopy;
-    pub const arrGetBytesCopy = SharedMethods(Context).arrGetBytesCopy;
-    pub const count = SharedMethods(Context).count;
-    pub const iterate = SharedMethods(Context).iterate;
-    pub const jsonEncode = SharedMethods(Context).jsonEncode;
-    pub const jsonEncodePretty = SharedMethods(Context).jsonEncodePretty;
-    pub const getValue = SharedMethods(Context).getValue;
-
-    // Context-specific methods
-
-    /// Initialize a new context with default size.
-    pub fn init() Error!Context {
-        std.c._errno().* = 0;
-        const ctx = c.shim_lite3_ctx_create();
-        if (ctx == null) return translateErrno();
-        return Context{ .ctx = ctx.? };
-    }
-
-    /// Initialize a new context with a specific buffer size.
-    pub fn initWithSize(bufsz: usize) Error!Context {
-        std.c._errno().* = 0;
-        const ctx = c.shim_lite3_ctx_create_with_size(bufsz);
-        if (ctx == null) return translateErrno();
-        return Context{ .ctx = ctx.? };
-    }
-
-    /// Initialize a context by copying from an existing buffer.
-    pub fn initFromBuf(buf: []const u8) Error!Context {
-        std.c._errno().* = 0;
-        const ctx = c.shim_lite3_ctx_create_from_buf(buf.ptr, buf.len);
-        if (ctx == null) return translateErrno();
-        return Context{ .ctx = ctx.? };
-    }
-
-    /// Release context resources. Safe to call multiple times.
-    pub fn deinit(self: *Context) void {
-        if (self.ctx) |ctx| {
-            c.shim_lite3_ctx_destroy(ctx);
-            self.ctx = null;
-        }
-    }
-
-    /// Return the underlying buffer pointer.
-    pub fn bufPtr(self: *const Context) [*]const u8 {
-        if (self.ctx == null) return @constCast(&dead_storage)[0..].ptr;
-        return c.shim_lite3_ctx_buf(self.raw());
-    }
-
-    /// Return the underlying buffer as a slice of the used portion.
-    pub fn data(self: *const Context) []const u8 {
-        if (self.ctx == null) return &.{};
-        const buf = c.shim_lite3_ctx_buf(self.raw());
-        const buflen = c.shim_lite3_ctx_buflen(self.raw());
-        return buf[0..buflen];
-    }
-
-    /// Reset the context root value to an object.
-    pub fn resetObj(self: *Context) Error!void {
-        try self.ensureAlive();
-        const ret = c.shim_lite3_ctx_init_obj(self.raw());
-        if (ret < 0) return translateError(ret);
-    }
-
-    /// Reset the context root value to an array.
-    pub fn resetArr(self: *Context) Error!void {
-        try self.ensureAlive();
-        const ret = c.shim_lite3_ctx_init_arr(self.raw());
-        if (ret < 0) return translateError(ret);
-    }
-
-    /// Decode a JSON string into this context.
-    pub fn jsonDecode(self: *Context, json: []const u8) Error!void {
-        if (!json_enabled) return Error.InvalidArgument;
-        try self.ensureAlive();
-        const ret = c.shim_lite3_ctx_json_dec(self.raw(), json.ptr, json.len);
-        if (ret < 0) return translateError(ret);
-    }
-
-    /// Import data from an existing buffer into this context.
-    pub fn importFromBuf(self: *Context, buf: []const u8) Error!void {
-        try self.ensureAlive();
-        const ret = c.shim_lite3_ctx_import_from_buf(self.raw(), buf.ptr, buf.len);
-        if (ret < 0) return translateError(ret);
-    }
-};
-
-// ---------------------------------------------------------------------------
-// ManagedContext (allocator-explicit, Zig-owned growth)
-// ---------------------------------------------------------------------------
-
-/// A Zig-managed, allocator-explicit context built on top of `Buffer`.
-///
-/// Unlike `Context`, this type performs all memory management through a caller-
-/// provided `std.mem.Allocator`. It retries mutating operations on
-/// `Error.NoBufferSpace` by growing the backing allocation.
-pub const ManagedContext = struct {
-    allocator: std.mem.Allocator,
-    storage: ?[]align(4) u8,
-    inner: Buffer,
-
-    /// Matches lite3_context_api.h default minimum context size.
-    pub const default_capacity: usize = 1024;
-    const max_capacity: usize = std.math.maxInt(u32);
-
-    const dead_storage: [4]u8 align(4) = .{ 0, 0, 0, 0 };
-
-    inline fn innerBuf(self: *ManagedContext) *Buffer {
-        return &self.inner;
-    }
-
-    inline fn innerBufConst(self: *const ManagedContext) *const Buffer {
-        return &self.inner;
-    }
-
-    inline fn storageSlice(self: *ManagedContext) []align(4) u8 {
-        return self.storage orelse @constCast(dead_storage[0..]);
-    }
-
-    inline fn ensureAlive(self: *const ManagedContext) Error!void {
-        if (self.storage == null) return Error.InvalidState;
-    }
-
-    fn clampCapacity(requested_capacity: usize) Error!usize {
-        if (requested_capacity > max_capacity) return Error.InvalidArgument;
-        return @max(requested_capacity, default_capacity);
-    }
-
-    fn nextCapacity(current: usize) Error!usize {
-        if (current >= max_capacity) return Error.NoBufferSpace;
-        if (current > max_capacity / 4) return max_capacity;
-        const grown = std.math.mul(usize, current, 4) catch max_capacity;
-        if (grown <= current) return Error.NoBufferSpace;
-        return @min(grown, max_capacity);
-    }
-
-    fn grow(self: *ManagedContext) Error!void {
-        try self.ensureAlive();
-        const old_mem = self.storageSlice();
-        const new_cap = try nextCapacity(old_mem.len);
-        const new_mem = self.allocator.realloc(old_mem, new_cap) catch return Error.OutOfMemory;
-        self.storage = new_mem;
-        self.inner.buf = new_mem.ptr;
-        self.inner.capacity = new_mem.len;
-    }
-
-    fn ensureCapacity(self: *ManagedContext, required: usize) Error!void {
-        try self.ensureAlive();
-        if (required > max_capacity) return Error.InvalidArgument;
-        while (self.storageSlice().len < required) {
-            try self.grow();
-        }
-    }
-
-    fn callWithGrowth(self: *ManagedContext, comptime func: anytype, args: anytype) @TypeOf(@call(.auto, func, args)) {
-        try self.ensureAlive();
-        while (true) {
-            return @call(.auto, func, args) catch |err| switch (err) {
-                Error.NoBufferSpace => {
-                    try self.grow();
-                    continue;
-                },
-                else => return err,
-            };
-        }
-    }
-
-    /// Initialize a new managed context with default capacity.
-    pub fn init(allocator: std.mem.Allocator) Error!ManagedContext {
-        return initWithCapacity(allocator, default_capacity);
-    }
-
-    /// Initialize a new managed context with explicit initial capacity.
-    pub fn initWithCapacity(allocator: std.mem.Allocator, requested_capacity: usize) Error!ManagedContext {
-        const cap = try clampCapacity(requested_capacity);
-        const mem = allocator.alignedAlloc(u8, .@"4", cap) catch return Error.OutOfMemory;
-        errdefer allocator.free(mem);
-        const inner = try Buffer.initObj(mem);
-        return ManagedContext{
-            .allocator = allocator,
-            .storage = mem,
-            .inner = inner,
-        };
-    }
-
-    /// Initialize a managed context from an existing Lite3 buffer.
-    pub fn initFromBuf(allocator: std.mem.Allocator, src: []const u8) Error!ManagedContext {
-        if (src.len == 0) return Error.InvalidArgument;
-        var self = try initWithCapacity(allocator, src.len);
-        errdefer self.deinit();
-        try self.importFromBuf(src);
+    /// An empty document of the given root type in `mem`.
+    pub fn init(mem: []align(4) u8, root_type: Container) WriteError!Buffer {
+        var self: Buffer = .{ .mem = mem, .len = 0 };
+        try self.reset(root_type);
         return self;
     }
 
-    /// Release owned memory. Safe to call multiple times.
-    pub fn deinit(self: *ManagedContext) void {
-        if (self.storage) |mem| {
-            self.allocator.free(mem);
-            self.storage = null;
-            self.inner = Buffer{
-                .buf = @constCast(&dead_storage)[0..].ptr,
-                .len = 0,
-                .capacity = 0,
+    /// Use the `len` serialized bytes at the start of `mem` after
+    /// `validate`. The rest of `mem` is room to grow.
+    pub fn fromBytes(mem: []align(4) u8, len: usize) ReadError!Buffer {
+        if (len > mem.len) return error.CorruptData;
+        validate(mem[0..len]) catch return error.CorruptData;
+        return .{ .mem = mem, .len = len };
+    }
+
+    /// Like `fromBytes` without validation; only for bytes this program
+    /// produced itself.
+    pub fn fromBytesUnchecked(mem: []align(4) u8, len: usize) Buffer {
+        std.debug.assert(len <= mem.len);
+        return .{ .mem = mem, .len = len };
+    }
+
+    /// Decode JSON into `mem`. `gpa` holds the parse tree while decoding.
+    /// On failure the contents of `mem` are unspecified.
+    pub fn fromJson(gpa: Allocator, mem: []align(4) u8, json: []const u8, diag: ?*JsonDiagnostics) DecodeError!Buffer {
+        comptime requireJson();
+        const gpa_copy = gpa;
+        const doc = try jsonParse(&gpa_copy, json, diag);
+        defer c.shim_json_free(doc.handle);
+        var len: usize = 0;
+        try jsonConvert(doc, mem, &len);
+        return .{ .mem = mem, .len = len };
+    }
+
+    /// Read access. The View fails with `error.StaleView` after this Buffer
+    /// is written to.
+    pub fn view(self: *const Buffer) View {
+        return .{ .bytes = self.mem[0..self.len], .epoch = &self.epoch, .epoch_seen = self.epoch };
+    }
+
+    /// The serialized document.
+    pub fn slice(self: *const Buffer) []const u8 {
+        return self.mem[0..self.len];
+    }
+
+    pub fn capacity(self: *const Buffer) usize {
+        return self.mem.len;
+    }
+
+    /// Make the document an empty object or array.
+    pub fn reset(self: *Buffer, root_type: Container) WriteError!void {
+        self.epoch +%= 1;
+        var len: usize = 0;
+        const ret = c.shim_init(self.mem.ptr, &len, self.mem.len, @backingInt(root_type));
+        if (ret < 0) return error.NoSpaceLeft;
+        self.len = len;
+    }
+
+    fn raw(self: *Buffer) Raw {
+        return .{ .mem = self.mem, .len = &self.len };
+    }
+
+    fn write(self: *Buffer, at: Offset, target: anytype, value: anytype) WriteError!void {
+        const scalar = try Scalar.of(value);
+        const slot = try writeSlot(self.raw().view(), at, target);
+        self.epoch +%= 1;
+        // A value inside this Buffer could be clobbered (lite3 zeroes the old
+        // value on overwrite) before it is copied in, and so could a key.
+        if (directKey(slot, self.mem)) |z| {
+            if (!overlaps(self.mem, scalar.data())) return self.raw().insertScalar(at, slot, z, scalar);
+        }
+        return self.writeCopied(at, slot, scalar);
+    }
+
+    /// `write` with the key and value copied out of the document first.
+    /// Kept out of line so the common path has a small stack frame.
+    noinline fn writeCopied(self: *Buffer, at: Offset, slot: Slot, scalar: Scalar) WriteError!void {
+        var key_buf: [max_stack_key_len + 1]u8 = undefined;
+        const z = try stackKey(slot, &key_buf, self.mem);
+        var scratch: [alias_scratch_len]u8 = undefined;
+        const data = scalar.data();
+        var stored = scalar;
+        if (overlaps(self.mem, data)) {
+            if (data.len > scratch.len) return error.ValueAliasesDocument;
+            @memcpy(scratch[0..data.len], data);
+            stored = scalar.withData(scratch[0..data.len]);
+        }
+        return self.raw().insertScalar(at, slot, z, stored);
+    }
+
+    fn writeContainer(self: *Buffer, at: Offset, target: anytype, kind: Container) WriteError!Offset {
+        const slot = try writeSlot(self.raw().view(), at, target);
+        self.epoch +%= 1;
+        if (directKey(slot, self.mem)) |z| return self.raw().insertContainer(at, slot, z, kind);
+        var key_buf: [max_stack_key_len + 1]u8 = undefined;
+        const z = try stackKey(slot, &key_buf, self.mem);
+        return self.raw().insertContainer(at, slot, z, kind);
+    }
+
+    /// Store `value` under key `k` in the object at `at`, replacing any
+    /// existing value. `value`: null, bool, an integer, a float, a string
+    /// (`[]const u8`), or `lite3.bytes(...)`.
+    pub fn set(self: *Buffer, at: Offset, k: anytype, value: anytype) WriteError!void {
+        return self.write(at, k, value);
+    }
+
+    /// Store an empty object under `k`; returns its Offset.
+    pub fn setObject(self: *Buffer, at: Offset, k: anytype) WriteError!Offset {
+        return self.writeContainer(at, k, .object);
+    }
+
+    /// Store an empty array under `k`; returns its Offset.
+    pub fn setArray(self: *Buffer, at: Offset, k: anytype) WriteError!Offset {
+        return self.writeContainer(at, k, .array);
+    }
+
+    /// Append `value` to the array at `arr`.
+    pub fn append(self: *Buffer, arr: Offset, value: anytype) WriteError!void {
+        return self.write(arr, Append{}, value);
+    }
+
+    pub fn appendObject(self: *Buffer, arr: Offset) WriteError!Offset {
+        return self.writeContainer(arr, Append{}, .object);
+    }
+
+    pub fn appendArray(self: *Buffer, arr: Offset) WriteError!Offset {
+        return self.writeContainer(arr, Append{}, .array);
+    }
+
+    /// Replace element `index` of the array at `arr` (`index == count`
+    /// appends).
+    pub fn arrSet(self: *Buffer, arr: Offset, index: u32, value: anytype) WriteError!void {
+        return self.write(arr, ArrayIndex{ .index = index }, value);
+    }
+
+    pub fn arrSetObject(self: *Buffer, arr: Offset, index: u32) WriteError!Offset {
+        return self.writeContainer(arr, ArrayIndex{ .index = index }, .object);
+    }
+
+    pub fn arrSetArray(self: *Buffer, arr: Offset, index: u32) WriteError!Offset {
+        return self.writeContainer(arr, ArrayIndex{ .index = index }, .array);
+    }
+};
+
+/// The key's own NUL-terminated pointer (null for array slots), or null if
+/// it has to be copied first (see `stackKey`).
+inline fn directKey(slot: Slot, doc: []const u8) ??[*:0]const u8 {
+    const k = switch (slot) {
+        .key => |k| k,
+        .index => return @as(?[*:0]const u8, null),
+    };
+    const z = k.z orelse return null;
+    if (overlaps(doc, k.bytes)) return null;
+    return z;
+}
+
+/// NUL-terminated pointer for a key, copying into `buf` when the key has no
+/// terminator or lies inside the document (lite3 may zero the old entry
+/// before copying the key in).
+fn stackKey(slot: Slot, buf: []u8, doc: []const u8) WriteError!?[*:0]const u8 {
+    const k = switch (slot) {
+        .key => |k| k,
+        .index => return null,
+    };
+    if (k.z) |z| if (!overlaps(doc, k.bytes)) return z;
+    if (k.bytes.len >= buf.len) return error.KeyTooLong;
+    @memcpy(buf[0..k.bytes.len], k.bytes);
+    buf[k.bytes.len] = 0;
+    return buf[0..k.bytes.len :0].ptr;
+}
+
+// ---------------------------------------------------------------------------
+// JSON decoding (yyjson, via the shim)
+// ---------------------------------------------------------------------------
+
+fn requireJson() void {
+    if (!json_enabled) @compileError("JSON decoding is disabled in this build (-Djson=false)");
+}
+
+const ParsedJson = struct { handle: ?*anyopaque, size_hint: usize };
+
+/// yyjson allocations go through the Zig allocator. yyjson's `free` gets no
+/// size, so each block carries its size in a 16-byte header.
+const YyAlloc = struct {
+    const header = 16;
+
+    fn alloc(ctx: ?*anyopaque, size: usize) callconv(.c) ?*anyopaque {
+        const gpa: *const Allocator = @ptrCast(@alignCast(ctx));
+        const block = gpa.alignedAlloc(u8, .@"16", size + header) catch return null;
+        std.mem.writeInt(usize, block[0..@sizeOf(usize)], size, .little);
+        return block.ptr + header;
+    }
+
+    fn realloc(ctx: ?*anyopaque, ptr: ?*anyopaque, old_size: usize, size: usize) callconv(.c) ?*anyopaque {
+        const new = alloc(ctx, size) orelse return null;
+        if (ptr) |p| {
+            const old: [*]const u8 = @ptrCast(p);
+            @memcpy(@as([*]u8, @ptrCast(new))[0..@min(old_size, size)], old[0..@min(old_size, size)]);
+            free(ctx, p);
+        }
+        return new;
+    }
+
+    fn free(ctx: ?*anyopaque, ptr: ?*anyopaque) callconv(.c) void {
+        const p = ptr orelse return;
+        const gpa: *const Allocator = @ptrCast(@alignCast(ctx));
+        const block: [*]align(16) u8 = @alignCast(@as([*]u8, @ptrCast(p)) - header);
+        const size = std.mem.readInt(usize, block[0..@sizeOf(usize)], .little);
+        gpa.free(block[0 .. size + header]);
+    }
+};
+
+/// Parse `json` with yyjson. `gpa` must stay valid (at the same address)
+/// until `c.shim_json_free(handle)`: yyjson keeps the pointer.
+fn jsonParse(gpa: *const Allocator, json: []const u8, diag: ?*JsonDiagnostics) DecodeError!ParsedJson {
+    const alc: c.shim_alc = .{ .malloc = YyAlloc.alloc, .realloc = YyAlloc.realloc, .free = YyAlloc.free, .ctx = @constCast(gpa) };
+    var d: c.shim_json_diag = undefined;
+    var handle: ?*anyopaque = null;
+    const ret = c.shim_json_parse(json.ptr, json.len, &alc, &d, &handle);
+    if (ret < 0) {
+        if (ret == -c.LITE3ZIG_E_JSON_SYNTAX) if (diag) |out| {
+            out.* = .{ .code = d.code, .position = d.position, .message = if (d.message) |m| std.mem.span(m) else "" };
+        };
+        return mapDecodeStatus(ret);
+    }
+    return .{ .handle = handle, .size_hint = json.len };
+}
+
+fn mapDecodeStatus(ret: c_int) DecodeError {
+    return switch (-ret) {
+        c.LITE3ZIG_E_JSON_SYNTAX => error.SyntaxError,
+        c.LITE3ZIG_E_JSON_NESTING => error.NestingTooDeep,
+        c.LITE3ZIG_E_JSON_KEY => error.InvalidKey,
+        c.LITE3ZIG_E_JSON_ROOT => error.InvalidRoot,
+        c.LITE3ZIG_E_KEY_COLLISION => error.KeyCollision,
+        c.LITE3ZIG_E_NO_SPACE => error.NoSpaceLeft,
+        c.LITE3ZIG_E_NO_MEMORY => error.OutOfMemory,
+        else => error.Unexpected,
+    };
+}
+
+fn jsonConvert(doc: ParsedJson, mem: []align(4) u8, len: *usize) DecodeError!void {
+    const ret = c.shim_json_convert(doc.handle, mem.ptr, len, mem.len);
+    if (ret < 0) return mapDecodeStatus(ret);
+}
+
+// ---------------------------------------------------------------------------
+// Document
+// ---------------------------------------------------------------------------
+
+/// Checks in safe builds that a Document is always used with the same
+/// allocator.
+const GpaCheck = if (std.debug.runtime_safety) struct {
+    ptr: *anyopaque,
+    vtable: *const Allocator.VTable,
+
+    fn of(gpa: Allocator) @This() {
+        return .{ .ptr = gpa.ptr, .vtable = gpa.vtable };
+    }
+
+    fn check(self: @This(), gpa: Allocator) void {
+        if (self.ptr != gpa.ptr or self.vtable != gpa.vtable)
+            @panic("lite3.Document used with a different allocator than it was created with");
+    }
+} else struct {
+    fn of(_: Allocator) @This() {
+        return .{};
+    }
+
+    fn check(_: @This(), _: Allocator) void {}
+};
+
+/// A growable document. Pass the same allocator to every call that takes
+/// one, and to `deinit` (checked in safe builds). Do not copy a Document by
+/// value; use `clone`.
+pub const Document = struct {
+    storage: []align(4) u8,
+    len: usize,
+    epoch: u32 = 0,
+    /// Growth beyond this many bytes fails with `error.NoSpaceLeft`.
+    max_capacity: usize = capacity_limit,
+    gpa_check: GpaCheck,
+
+    pub const default_capacity = 1024;
+
+    pub const Options = struct {
+        root: Container = .object,
+        initial_capacity: usize = default_capacity,
+        /// Upper bound for growth (at most `capacity_limit`). Set it when
+        /// the content comes from untrusted input.
+        max_capacity: usize = capacity_limit,
+    };
+
+    /// An empty object or array.
+    pub fn init(gpa: Allocator, root_type: Container) GrowError!Document {
+        return initOptions(gpa, .{ .root = root_type });
+    }
+
+    pub fn initOptions(gpa: Allocator, options: Options) GrowError!Document {
+        const max = @min(options.max_capacity, capacity_limit);
+        if (max < node_size) return error.NoSpaceLeft;
+        const cap = std.mem.alignForward(usize, @max(@min(options.initial_capacity, max), node_size), node_alignment);
+        const storage = try gpa.alignedAlloc(u8, .@"4", @min(cap, max));
+        var self: Document = .{ .storage = storage, .len = 0, .max_capacity = max, .gpa_check = .of(gpa) };
+        self.reset(options.root);
+        return self;
+    }
+
+    /// Copy `document` (serialized bytes) after `validate`.
+    pub fn fromBytes(gpa: Allocator, document: []const u8) (ReadError || error{OutOfMemory})!Document {
+        validate(document) catch return error.CorruptData;
+        return fromBytesUnchecked(gpa, document);
+    }
+
+    /// Like `fromBytes` without validation; only for bytes this program
+    /// produced itself.
+    pub fn fromBytesUnchecked(gpa: Allocator, document: []const u8) error{OutOfMemory}!Document {
+        const storage = try gpa.alignedAlloc(u8, .@"4", @max(document.len, node_size));
+        @memcpy(storage[0..document.len], document);
+        return .{ .storage = storage, .len = document.len, .gpa_check = .of(gpa) };
+    }
+
+    pub const JsonOptions = struct {
+        max_capacity: usize = capacity_limit,
+        diagnostics: ?*JsonDiagnostics = null,
+    };
+
+    /// Decode JSON into a new Document.
+    pub fn fromJson(gpa: Allocator, json: []const u8, options: Document.JsonOptions) DecodeError!Document {
+        comptime requireJson();
+        const max = @min(options.max_capacity, capacity_limit);
+        const gpa_copy = gpa;
+        const parsed = try jsonParse(&gpa_copy, json, options.diagnostics);
+        defer c.shim_json_free(parsed.handle);
+        // lite3 documents run larger than their JSON; grow until it fits.
+        var cap = std.mem.alignForward(usize, @min(@max(default_capacity, json.len *| 2), max), node_alignment);
+        while (true) {
+            const storage = try gpa.alignedAlloc(u8, .@"4", @min(cap, max));
+            var len: usize = 0;
+            jsonConvert(parsed, storage, &len) catch |err| {
+                gpa.free(storage);
+                if (err != error.NoSpaceLeft or cap >= max) return err;
+                cap = @min(cap *| 2, max);
+                continue;
             };
+            return .{ .storage = storage, .len = len, .max_capacity = max, .gpa_check = .of(gpa) };
         }
     }
 
-    /// Return the current used bytes.
-    pub fn data(self: *const ManagedContext) []const u8 {
-        if (self.storage == null) return &.{};
-        return self.innerBufConst().data();
+    pub fn deinit(self: *Document, gpa: Allocator) void {
+        self.gpa_check.check(gpa);
+        gpa.free(self.storage);
+        self.* = undefined;
     }
 
-    /// Return the current backing capacity in bytes.
-    pub fn capacity(self: *const ManagedContext) usize {
-        if (self.storage == null) return 0;
-        return self.innerBufConst().capacity;
+    /// Read access. The View fails with `error.StaleView` after this
+    /// Document is written to.
+    pub fn view(self: *const Document) View {
+        return .{ .bytes = self.storage[0..self.len], .epoch = &self.epoch, .epoch_seen = self.epoch };
     }
 
-    /// Reset the root value to an object.
-    pub fn resetObj(self: *ManagedContext) Error!void {
-        try self.ensureAlive();
-        self.inner = try Buffer.initObj(self.storageSlice());
+    /// The serialized document.
+    pub fn slice(self: *const Document) []const u8 {
+        return self.storage[0..self.len];
     }
 
-    /// Reset the root value to an array.
-    pub fn resetArr(self: *ManagedContext) Error!void {
-        try self.ensureAlive();
-        self.inner = try Buffer.initArr(self.storageSlice());
+    pub fn capacity(self: *const Document) usize {
+        return self.storage.len;
     }
 
-    /// Replace contents with an existing Lite3 buffer.
-    pub fn importFromBuf(self: *ManagedContext, src: []const u8) Error!void {
-        if (src.len == 0) return Error.InvalidArgument;
-        try self.ensureCapacity(src.len);
-        const mem = self.storageSlice();
-        @memcpy(mem[0..src.len], src);
-        self.inner.buf = mem.ptr;
-        self.inner.len = src.len;
-        self.inner.capacity = mem.len;
+    /// Make the document an empty object or array. Keeps the allocation.
+    pub fn reset(self: *Document, root_type: Container) void {
+        self.epoch +%= 1;
+        var len: usize = 0;
+        const ret = c.shim_init(self.storage.ptr, &len, self.storage.len, @backingInt(root_type));
+        std.debug.assert(ret == 0); // storage always holds at least one node
+        self.len = len;
     }
 
-    /// Decode JSON into the managed buffer, growing as needed.
-    pub fn jsonDecode(self: *ManagedContext, json: []const u8) Error!void {
-        if (!json_enabled) return Error.InvalidArgument;
-        try self.ensureAlive();
+    /// Replace the content with a copy of `document` after `validate`. On
+    /// failure the content is unchanged. `document` may be (part of) this
+    /// Document's own bytes.
+    pub fn importBytes(self: *Document, gpa: Allocator, document: []const u8) (ReadError || error{ OutOfMemory, NoSpaceLeft })!void {
+        validate(document) catch return error.CorruptData;
+        return self.importBytesUnchecked(gpa, document);
+    }
+
+    /// Like `importBytes` without validation.
+    pub fn importBytesUnchecked(self: *Document, gpa: Allocator, document: []const u8) error{ OutOfMemory, NoSpaceLeft }!void {
+        self.gpa_check.check(gpa);
+        if (document.len > self.max_capacity) return error.NoSpaceLeft;
+        self.epoch +%= 1;
+        if (overlaps(self.storage, document) or document.len <= self.storage.len) {
+            // Fits (own bytes always do): move in place.
+            std.debug.assert(document.len <= self.storage.len);
+            @memmove(self.storage[0..document.len], document);
+        } else {
+            const storage = try gpa.alignedAlloc(u8, .@"4", document.len);
+            @memcpy(storage, document);
+            gpa.free(self.storage);
+            self.storage = storage;
+        }
+        self.len = document.len;
+    }
+
+    /// Replace the content with decoded JSON. On failure the content is
+    /// unchanged (the result is built in new memory, then swapped in).
+    pub fn decodeJson(self: *Document, gpa: Allocator, json: []const u8, diagnostics: ?*JsonDiagnostics) DecodeError!void {
+        comptime requireJson();
+        self.gpa_check.check(gpa);
+        var new = try fromJson(gpa, json, .{ .max_capacity = self.max_capacity, .diagnostics = diagnostics });
+        gpa.free(self.storage);
+        self.storage = new.storage;
+        self.len = new.len;
+        self.epoch +%= 1;
+        new = undefined;
+    }
+
+    /// Make room for `additional` more bytes.
+    pub fn reserve(self: *Document, gpa: Allocator, additional: usize) GrowError!void {
+        self.gpa_check.check(gpa);
+        const needed = std.math.add(usize, self.len, additional) catch return error.NoSpaceLeft;
+        if (needed <= self.storage.len) return;
+        try self.grow(gpa, needed);
+    }
+
+    /// Release unused capacity.
+    pub fn shrinkToFit(self: *Document, gpa: Allocator) error{OutOfMemory}!void {
+        self.gpa_check.check(gpa);
+        const target = std.mem.alignForward(usize, @max(self.len, node_size), node_alignment);
+        if (target >= self.storage.len) return;
+        try self.moveTo(gpa, target);
+    }
+
+    fn grow(self: *Document, gpa: Allocator, min_capacity: usize) GrowError!void {
+        if (min_capacity > self.max_capacity or self.storage.len >= self.max_capacity) return error.NoSpaceLeft;
+        const doubled = self.storage.len *| 2;
+        const target = std.mem.alignForward(usize, @min(@max(min_capacity, doubled), self.max_capacity), node_alignment);
+        try self.moveTo(gpa, @min(target, self.max_capacity));
+    }
+
+    /// Move the content into a new allocation of `new_capacity` bytes. Only
+    /// the used bytes are copied.
+    fn moveTo(self: *Document, gpa: Allocator, new_capacity: usize) error{OutOfMemory}!void {
+        const storage = try gpa.alignedAlloc(u8, .@"4", new_capacity);
+        @memcpy(storage[0..self.len], self.storage[0..self.len]);
+        gpa.free(self.storage);
+        self.storage = storage;
+        self.epoch +%= 1;
+    }
+
+    fn raw(self: *Document) Raw {
+        return .{ .mem = self.storage, .len = &self.len };
+    }
+
+    /// Resolve the key to a NUL-terminated pointer that stays valid across
+    /// growth: borrowed if possible, else copied (stack, or heap if long).
+    fn ownedKey(self: *const Document, gpa: Allocator, slot: Slot, stack: []u8, heap: *?[:0]u8) GrowError!?[*:0]const u8 {
+        const k = switch (slot) {
+            .key => |k| k,
+            .index => return null,
+        };
+        if (k.z) |z| if (!overlaps(self.storage, k.bytes)) return z;
+        if (k.bytes.len < stack.len) return stackKey(.{ .key = .{ .bytes = k.bytes, .hash = k.hash, .z = null } }, stack, &.{});
+        const copy = try gpa.allocSentinel(u8, k.bytes.len, 0);
+        @memcpy(copy, k.bytes);
+        heap.* = copy;
+        return copy.ptr;
+    }
+
+    fn write(self: *Document, gpa: Allocator, at: Offset, target: anytype, value: anytype) GrowError!void {
+        self.gpa_check.check(gpa);
+        const scalar = try Scalar.of(value);
+        const slot = try writeSlot(self.view(), at, target);
+        self.epoch +%= 1;
+        var key_stack: [256]u8 = undefined;
+        var key_heap: ?[:0]u8 = null;
+        defer if (key_heap) |h| gpa.free(h);
+        const z = try self.ownedKey(gpa, slot, &key_stack, &key_heap);
+
+        // Copy a value that lies inside this Document aside: growth would
+        // free it, and lite3 zeroes the old value on overwrite.
+        var owned: ?[]u8 = null;
+        defer if (owned) |o| gpa.free(o);
+        var stored = scalar;
+        if (overlaps(self.storage, scalar.data())) {
+            owned = try gpa.dupe(u8, scalar.data());
+            stored = scalar.withData(owned.?);
+        }
+
+        const reserve_len = writeReserve(slot, try stored.payloadLen());
+        try self.reserve(gpa, reserve_len);
         while (true) {
-            const mem = self.storageSlice();
-            self.inner = Buffer.jsonDecode(mem, json) catch |err| switch (err) {
-                Error.NoBufferSpace => {
-                    try self.grow();
+            self.raw().insertScalar(at, slot, z, stored) catch |err| switch (err) {
+                // A failed write may have split nodes (still a valid
+                // document); retrying with more room completes it.
+                error.NoSpaceLeft => {
+                    try self.grow(gpa, self.storage.len + 1);
                     continue;
                 },
                 else => return err,
@@ -1283,533 +1495,259 @@ pub const ManagedContext = struct {
         }
     }
 
-    // --- Mutating operations (auto-grow on NoBufferSpace) ---
-
-    pub fn setNull(self: *ManagedContext, ofs: Offset, key: []const u8) Error!void {
-        return self.callWithGrowth(Buffer.setNull, .{ self.innerBuf(), ofs, key });
+    fn writeContainer(self: *Document, gpa: Allocator, at: Offset, target: anytype, kind: Container) GrowError!Offset {
+        self.gpa_check.check(gpa);
+        const slot = try writeSlot(self.view(), at, target);
+        self.epoch +%= 1;
+        var key_stack: [256]u8 = undefined;
+        var key_heap: ?[:0]u8 = null;
+        defer if (key_heap) |h| gpa.free(h);
+        const z = try self.ownedKey(gpa, slot, &key_stack, &key_heap);
+        try self.reserve(gpa, writeReserve(slot, node_size));
+        while (true) {
+            return self.raw().insertContainer(at, slot, z, kind) catch |err| switch (err) {
+                error.NoSpaceLeft => {
+                    try self.grow(gpa, self.storage.len + 1);
+                    continue;
+                },
+                else => return err,
+            };
+        }
     }
 
-    pub fn setBool(self: *ManagedContext, ofs: Offset, key: []const u8, value: bool) Error!void {
-        return self.callWithGrowth(Buffer.setBool, .{ self.innerBuf(), ofs, key, value });
+    /// Store `value` under key `k` in the object at `at` (see `Buffer.set`).
+    pub fn set(self: *Document, gpa: Allocator, at: Offset, k: anytype, value: anytype) GrowError!void {
+        return self.write(gpa, at, k, value);
     }
 
-    pub fn setI64(self: *ManagedContext, ofs: Offset, key: []const u8, value: i64) Error!void {
-        return self.callWithGrowth(Buffer.setI64, .{ self.innerBuf(), ofs, key, value });
+    pub fn setObject(self: *Document, gpa: Allocator, at: Offset, k: anytype) GrowError!Offset {
+        return self.writeContainer(gpa, at, k, .object);
     }
 
-    pub fn setF64(self: *ManagedContext, ofs: Offset, key: []const u8, value: f64) Error!void {
-        return self.callWithGrowth(Buffer.setF64, .{ self.innerBuf(), ofs, key, value });
+    pub fn setArray(self: *Document, gpa: Allocator, at: Offset, k: anytype) GrowError!Offset {
+        return self.writeContainer(gpa, at, k, .array);
     }
 
-    pub fn setStr(self: *ManagedContext, ofs: Offset, key: []const u8, value: []const u8) Error!void {
-        return self.callWithGrowth(Buffer.setStr, .{ self.innerBuf(), ofs, key, value });
+    pub fn append(self: *Document, gpa: Allocator, arr: Offset, value: anytype) GrowError!void {
+        return self.write(gpa, arr, Append{}, value);
     }
 
-    pub fn setBytes(self: *ManagedContext, ofs: Offset, key: []const u8, value: []const u8) Error!void {
-        return self.callWithGrowth(Buffer.setBytes, .{ self.innerBuf(), ofs, key, value });
+    pub fn appendObject(self: *Document, gpa: Allocator, arr: Offset) GrowError!Offset {
+        return self.writeContainer(gpa, arr, Append{}, .object);
     }
 
-    pub fn setObj(self: *ManagedContext, ofs: Offset, key: []const u8) Error!Offset {
-        return self.callWithGrowth(Buffer.setObj, .{ self.innerBuf(), ofs, key });
+    pub fn appendArray(self: *Document, gpa: Allocator, arr: Offset) GrowError!Offset {
+        return self.writeContainer(gpa, arr, Append{}, .array);
     }
 
-    pub fn setArr(self: *ManagedContext, ofs: Offset, key: []const u8) Error!Offset {
-        return self.callWithGrowth(Buffer.setArr, .{ self.innerBuf(), ofs, key });
+    pub fn arrSet(self: *Document, gpa: Allocator, arr: Offset, index: u32, value: anytype) GrowError!void {
+        return self.write(gpa, arr, ArrayIndex{ .index = index }, value);
     }
 
-    pub fn arrAppendNull(self: *ManagedContext, ofs: Offset) Error!void {
-        return self.callWithGrowth(Buffer.arrAppendNull, .{ self.innerBuf(), ofs });
+    pub fn arrSetObject(self: *Document, gpa: Allocator, arr: Offset, index: u32) GrowError!Offset {
+        return self.writeContainer(gpa, arr, ArrayIndex{ .index = index }, .object);
     }
 
-    pub fn arrAppendBool(self: *ManagedContext, ofs: Offset, value: bool) Error!void {
-        return self.callWithGrowth(Buffer.arrAppendBool, .{ self.innerBuf(), ofs, value });
+    pub fn arrSetArray(self: *Document, gpa: Allocator, arr: Offset, index: u32) GrowError!Offset {
+        return self.writeContainer(gpa, arr, ArrayIndex{ .index = index }, .array);
     }
 
-    pub fn arrAppendI64(self: *ManagedContext, ofs: Offset, value: i64) Error!void {
-        return self.callWithGrowth(Buffer.arrAppendI64, .{ self.innerBuf(), ofs, value });
+    /// A copy containing only live data: space left behind by overwrites is
+    /// not copied.
+    pub fn clone(self: *const Document, gpa: Allocator) (GrowError || ReadError)!Document {
+        self.gpa_check.check(gpa);
+        const v = self.view();
+        var out = try initOptions(gpa, .{
+            .root = try v.rootType(),
+            .initial_capacity = self.len,
+            .max_capacity = self.max_capacity,
+        });
+        errdefer out.deinit(gpa);
+        try copyTree(gpa, v, &out);
+        return out;
     }
 
-    pub fn arrAppendF64(self: *ManagedContext, ofs: Offset, value: f64) Error!void {
-        return self.callWithGrowth(Buffer.arrAppendF64, .{ self.innerBuf(), ofs, value });
-    }
-
-    pub fn arrAppendStr(self: *ManagedContext, ofs: Offset, value: []const u8) Error!void {
-        return self.callWithGrowth(Buffer.arrAppendStr, .{ self.innerBuf(), ofs, value });
-    }
-
-    pub fn arrAppendBytes(self: *ManagedContext, ofs: Offset, value: []const u8) Error!void {
-        return self.callWithGrowth(Buffer.arrAppendBytes, .{ self.innerBuf(), ofs, value });
-    }
-
-    pub fn arrAppendObj(self: *ManagedContext, ofs: Offset) Error!Offset {
-        return self.callWithGrowth(Buffer.arrAppendObj, .{ self.innerBuf(), ofs });
-    }
-
-    pub fn arrAppendArr(self: *ManagedContext, ofs: Offset) Error!Offset {
-        return self.callWithGrowth(Buffer.arrAppendArr, .{ self.innerBuf(), ofs });
-    }
-
-    // --- Non-mutating operations ---
-
-    pub fn getType(self: *const ManagedContext, ofs: Offset, key: []const u8) Error!Type {
-        return self.innerBufConst().getType(ofs, key);
-    }
-
-    pub fn exists(self: *const ManagedContext, ofs: Offset, key: []const u8) Error!bool {
-        return self.innerBufConst().exists(ofs, key);
-    }
-
-    pub fn getBool(self: *const ManagedContext, ofs: Offset, key: []const u8) Error!bool {
-        return self.innerBufConst().getBool(ofs, key);
-    }
-
-    pub fn getI64(self: *const ManagedContext, ofs: Offset, key: []const u8) Error!i64 {
-        return self.innerBufConst().getI64(ofs, key);
-    }
-
-    pub fn getF64(self: *const ManagedContext, ofs: Offset, key: []const u8) Error!f64 {
-        return self.innerBufConst().getF64(ofs, key);
-    }
-
-    pub fn getStr(self: *const ManagedContext, ofs: Offset, key: []const u8) Error![]const u8 {
-        return self.innerBufConst().getStr(ofs, key);
-    }
-
-    pub fn getBytes(self: *const ManagedContext, ofs: Offset, key: []const u8) Error![]const u8 {
-        return self.innerBufConst().getBytes(ofs, key);
-    }
-
-    pub fn getObj(self: *const ManagedContext, ofs: Offset, key: []const u8) Error!Offset {
-        return self.innerBufConst().getObj(ofs, key);
-    }
-
-    pub fn getArr(self: *const ManagedContext, ofs: Offset, key: []const u8) Error!Offset {
-        return self.innerBufConst().getArr(ofs, key);
-    }
-
-    pub fn getStrCopy(self: *const ManagedContext, ofs: Offset, key: []const u8, dest: []u8) Error![]const u8 {
-        return self.innerBufConst().getStrCopy(ofs, key, dest);
-    }
-
-    pub fn getBytesCopy(self: *const ManagedContext, ofs: Offset, key: []const u8, dest: []u8) Error![]const u8 {
-        return self.innerBufConst().getBytesCopy(ofs, key, dest);
-    }
-
-    pub fn arrGetBool(self: *const ManagedContext, ofs: Offset, index: u32) Error!bool {
-        return self.innerBufConst().arrGetBool(ofs, index);
-    }
-
-    pub fn arrGetI64(self: *const ManagedContext, ofs: Offset, index: u32) Error!i64 {
-        return self.innerBufConst().arrGetI64(ofs, index);
-    }
-
-    pub fn arrGetF64(self: *const ManagedContext, ofs: Offset, index: u32) Error!f64 {
-        return self.innerBufConst().arrGetF64(ofs, index);
-    }
-
-    pub fn arrGetStr(self: *const ManagedContext, ofs: Offset, index: u32) Error![]const u8 {
-        return self.innerBufConst().arrGetStr(ofs, index);
-    }
-
-    pub fn arrGetBytes(self: *const ManagedContext, ofs: Offset, index: u32) Error![]const u8 {
-        return self.innerBufConst().arrGetBytes(ofs, index);
-    }
-
-    pub fn arrGetObj(self: *const ManagedContext, ofs: Offset, index: u32) Error!Offset {
-        return self.innerBufConst().arrGetObj(ofs, index);
-    }
-
-    pub fn arrGetArr(self: *const ManagedContext, ofs: Offset, index: u32) Error!Offset {
-        return self.innerBufConst().arrGetArr(ofs, index);
-    }
-
-    pub fn arrGetType(self: *const ManagedContext, ofs: Offset, index: u32) Error!Type {
-        return self.innerBufConst().arrGetType(ofs, index);
-    }
-
-    pub fn arrGetStrCopy(self: *const ManagedContext, ofs: Offset, index: u32, dest: []u8) Error![]const u8 {
-        return self.innerBufConst().arrGetStrCopy(ofs, index, dest);
-    }
-
-    pub fn arrGetBytesCopy(self: *const ManagedContext, ofs: Offset, index: u32, dest: []u8) Error![]const u8 {
-        return self.innerBufConst().arrGetBytesCopy(ofs, index, dest);
-    }
-
-    pub fn count(self: *const ManagedContext, ofs: Offset) Error!u32 {
-        return self.innerBufConst().count(ofs);
-    }
-
-    pub fn iterate(self: *const ManagedContext, ofs: Offset) Error!Iterator {
-        return self.innerBufConst().iterate(ofs);
-    }
-
-    pub fn jsonEncode(self: *const ManagedContext, ofs: Offset) Error!JsonString {
-        return self.innerBufConst().jsonEncode(ofs);
-    }
-
-    pub fn jsonEncodePretty(self: *const ManagedContext, ofs: Offset) Error!JsonString {
-        return self.innerBufConst().jsonEncodePretty(ofs);
-    }
-
-    pub fn jsonEncodeBuf(self: *const ManagedContext, ofs: Offset, out: []u8) Error!usize {
-        return self.innerBufConst().jsonEncodeBuf(ofs, out);
-    }
-
-    pub fn getValue(self: *const ManagedContext, ofs: Offset, key: []const u8) Error!Value {
-        return self.innerBufConst().getValue(ofs, key);
+    /// Rebuild the document to reclaim space left behind by overwrites.
+    /// Offsets from before are invalid afterwards.
+    pub fn compact(self: *Document, gpa: Allocator) (GrowError || ReadError)!void {
+        var fresh = try self.clone(gpa);
+        gpa.free(self.storage);
+        self.storage = fresh.storage;
+        self.len = fresh.len;
+        self.epoch +%= 1;
+        fresh = undefined;
     }
 };
 
-// ---------------------------------------------------------------------------
-// ExternalContext (allocator-provided per growth-capable operation)
-// ---------------------------------------------------------------------------
-
-/// An allocator-explicit context that does not store an allocator internally.
-///
-/// Callers provide an allocator for operations that may need to grow the
-/// backing storage (`set*`, `arrAppend*`, `importFromBuf`, `jsonDecode`) and
-/// for `deinit`.
-pub const ExternalContext = struct {
-    storage: ?[]align(4) u8,
-    inner: Buffer,
-
-    /// Matches lite3_context_api.h default minimum context size.
-    pub const default_capacity: usize = 1024;
-    const max_capacity: usize = std.math.maxInt(u32);
-
-    const dead_storage: [4]u8 align(4) = .{ 0, 0, 0, 0 };
-
-    inline fn innerBuf(self: *ExternalContext) *Buffer {
-        return &self.inner;
-    }
-
-    inline fn innerBufConst(self: *const ExternalContext) *const Buffer {
-        return &self.inner;
-    }
-
-    inline fn storageSlice(self: *ExternalContext) []align(4) u8 {
-        return self.storage orelse @constCast(dead_storage[0..]);
-    }
-
-    inline fn ensureAlive(self: *const ExternalContext) Error!void {
-        if (self.storage == null) return Error.InvalidState;
-    }
-
-    fn clampCapacity(requested_capacity: usize) Error!usize {
-        if (requested_capacity > max_capacity) return Error.InvalidArgument;
-        return @max(requested_capacity, default_capacity);
-    }
-
-    fn nextCapacity(current: usize) Error!usize {
-        if (current >= max_capacity) return Error.NoBufferSpace;
-        if (current > max_capacity / 4) return max_capacity;
-        const grown = std.math.mul(usize, current, 4) catch max_capacity;
-        if (grown <= current) return Error.NoBufferSpace;
-        return @min(grown, max_capacity);
-    }
-
-    fn grow(self: *ExternalContext, allocator: std.mem.Allocator) Error!void {
-        try self.ensureAlive();
-        const old_mem = self.storageSlice();
-        const new_cap = try nextCapacity(old_mem.len);
-        const new_mem = allocator.realloc(old_mem, new_cap) catch return Error.OutOfMemory;
-        self.storage = new_mem;
-        self.inner.buf = new_mem.ptr;
-        self.inner.capacity = new_mem.len;
-    }
-
-    fn ensureCapacity(self: *ExternalContext, allocator: std.mem.Allocator, required: usize) Error!void {
-        try self.ensureAlive();
-        if (required > max_capacity) return Error.InvalidArgument;
-        while (self.storageSlice().len < required) {
-            try self.grow(allocator);
-        }
-    }
-
-    fn callWithGrowth(
-        self: *ExternalContext,
-        allocator: std.mem.Allocator,
-        comptime func: anytype,
-        args: anytype,
-    ) @TypeOf(@call(.auto, func, args)) {
-        try self.ensureAlive();
-        while (true) {
-            return @call(.auto, func, args) catch |err| switch (err) {
-                Error.NoBufferSpace => {
-                    try self.grow(allocator);
-                    continue;
-                },
-                else => return err,
-            };
-        }
-    }
-
-    /// Initialize a new external context with default capacity.
-    pub fn init(allocator: std.mem.Allocator) Error!ExternalContext {
-        return initWithCapacity(allocator, default_capacity);
-    }
-
-    /// Initialize a new external context with explicit initial capacity.
-    pub fn initWithCapacity(allocator: std.mem.Allocator, requested_capacity: usize) Error!ExternalContext {
-        const cap = try clampCapacity(requested_capacity);
-        const mem = allocator.alignedAlloc(u8, .@"4", cap) catch return Error.OutOfMemory;
-        errdefer allocator.free(mem);
-        const inner = try Buffer.initObj(mem);
-        return ExternalContext{
-            .storage = mem,
-            .inner = inner,
+/// Copy every entry of `src` into the (empty) `dst`, iteratively.
+fn copyTree(gpa: Allocator, src: View, dst: *Document) (GrowError || ReadError)!void {
+    const Frame = struct {
+        it: union(enum) { object: ObjectIterator, array: ArrayIterator },
+        dst: Offset,
+    };
+    var stack: std.ArrayList(Frame) = .empty;
+    defer stack.deinit(gpa);
+    try stack.append(gpa, .{
+        .it = switch (try src.rootType()) {
+            .object => .{ .object = try src.objectIterator(root) },
+            .array => .{ .array = try src.arrayIterator(root) },
+        },
+        .dst = root,
+    });
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        const at = top.dst;
+        var key_bytes: ?[]const u8 = null;
+        const value = switch (top.it) {
+            .object => |*it| if (try it.next()) |e| blk: {
+                key_bytes = e.key;
+                break :blk e.value;
+            } else null,
+            .array => |*it| if (try it.next()) |e| e.value else null,
+        } orelse {
+            _ = stack.pop();
+            continue;
         };
-    }
-
-    /// Initialize an external context from an existing Lite3 buffer.
-    pub fn initFromBuf(allocator: std.mem.Allocator, src: []const u8) Error!ExternalContext {
-        if (src.len == 0) return Error.InvalidArgument;
-        var self = try initWithCapacity(allocator, src.len);
-        errdefer self.deinit(allocator);
-        try self.importFromBuf(allocator, src);
-        return self;
-    }
-
-    /// Release owned memory. Safe to call multiple times.
-    ///
-    /// The allocator must match the one used for init/growth operations.
-    pub fn deinit(self: *ExternalContext, allocator: std.mem.Allocator) void {
-        if (self.storage) |mem| {
-            allocator.free(mem);
-            self.storage = null;
-            self.inner = Buffer{
-                .buf = @constCast(&dead_storage)[0..].ptr,
-                .len = 0,
-                .capacity = 0,
-            };
+        switch (value) {
+            .object, .array => |inner| {
+                const kind: Container = if (value == .object) .object else .array;
+                const new = if (key_bytes) |k|
+                    try dst.writeContainer(gpa, at, k, kind)
+                else
+                    try dst.writeContainer(gpa, at, Append{}, kind);
+                try stack.append(gpa, .{
+                    .it = if (kind == .object) .{ .object = try src.objectIterator(inner) } else .{ .array = try src.arrayIterator(inner) },
+                    .dst = new,
+                });
+            },
+            else => {
+                const scalar: Scalar = switch (value) {
+                    .null => .null,
+                    .bool => |b| .{ .bool = b },
+                    .int => |i| .{ .int = i },
+                    .float => |f| .{ .float = f },
+                    .string => |str| .{ .string = str },
+                    .bytes => |b| .{ .bytes = b },
+                    .object, .array => unreachable,
+                };
+                if (key_bytes) |k| try dst.write(gpa, at, k, scalar) else try dst.write(gpa, at, Append{}, scalar);
+            },
         }
     }
+}
 
-    /// Return the current used bytes.
-    pub fn data(self: *const ExternalContext) []const u8 {
-        if (self.storage == null) return &.{};
-        return self.innerBufConst().data();
+// ---------------------------------------------------------------------------
+// ManagedDocument
+// ---------------------------------------------------------------------------
+
+/// A `Document` that stores its allocator. Same operations without the
+/// allocator argument.
+pub const ManagedDocument = struct {
+    gpa: Allocator,
+    doc: Document,
+
+    pub fn init(gpa: Allocator, root_type: Container) GrowError!ManagedDocument {
+        return .{ .gpa = gpa, .doc = try .init(gpa, root_type) };
     }
 
-    /// Return the current backing capacity in bytes.
-    pub fn capacity(self: *const ExternalContext) usize {
-        if (self.storage == null) return 0;
-        return self.innerBufConst().capacity;
+    pub fn initOptions(gpa: Allocator, options: Document.Options) GrowError!ManagedDocument {
+        return .{ .gpa = gpa, .doc = try .initOptions(gpa, options) };
     }
 
-    /// Reset the root value to an object.
-    pub fn resetObj(self: *ExternalContext) Error!void {
-        try self.ensureAlive();
-        self.inner = try Buffer.initObj(self.storageSlice());
+    pub fn fromBytes(gpa: Allocator, document: []const u8) (ReadError || error{OutOfMemory})!ManagedDocument {
+        return .{ .gpa = gpa, .doc = try .fromBytes(gpa, document) };
     }
 
-    /// Reset the root value to an array.
-    pub fn resetArr(self: *ExternalContext) Error!void {
-        try self.ensureAlive();
-        self.inner = try Buffer.initArr(self.storageSlice());
+    pub fn fromBytesUnchecked(gpa: Allocator, document: []const u8) error{OutOfMemory}!ManagedDocument {
+        return .{ .gpa = gpa, .doc = try .fromBytesUnchecked(gpa, document) };
     }
 
-    /// Replace contents with an existing Lite3 buffer.
-    pub fn importFromBuf(self: *ExternalContext, allocator: std.mem.Allocator, src: []const u8) Error!void {
-        if (src.len == 0) return Error.InvalidArgument;
-        try self.ensureCapacity(allocator, src.len);
-        const mem = self.storageSlice();
-        @memcpy(mem[0..src.len], src);
-        self.inner.buf = mem.ptr;
-        self.inner.len = src.len;
-        self.inner.capacity = mem.len;
+    pub fn fromJson(gpa: Allocator, json: []const u8, options: Document.JsonOptions) DecodeError!ManagedDocument {
+        return .{ .gpa = gpa, .doc = try .fromJson(gpa, json, options) };
     }
 
-    /// Decode JSON into the external buffer, growing as needed.
-    pub fn jsonDecode(self: *ExternalContext, allocator: std.mem.Allocator, json: []const u8) Error!void {
-        if (!json_enabled) return Error.InvalidArgument;
-        try self.ensureAlive();
-        while (true) {
-            const mem = self.storageSlice();
-            self.inner = Buffer.jsonDecode(mem, json) catch |err| switch (err) {
-                Error.NoBufferSpace => {
-                    try self.grow(allocator);
-                    continue;
-                },
-                else => return err,
-            };
-            return;
-        }
+    pub fn deinit(self: *ManagedDocument) void {
+        self.doc.deinit(self.gpa);
+        self.* = undefined;
     }
 
-    // --- Mutating operations (auto-grow on NoBufferSpace) ---
-
-    pub fn setNull(self: *ExternalContext, allocator: std.mem.Allocator, ofs: Offset, key: []const u8) Error!void {
-        return self.callWithGrowth(allocator, Buffer.setNull, .{ self.innerBuf(), ofs, key });
+    pub fn view(self: *const ManagedDocument) View {
+        return self.doc.view();
     }
 
-    pub fn setBool(self: *ExternalContext, allocator: std.mem.Allocator, ofs: Offset, key: []const u8, value: bool) Error!void {
-        return self.callWithGrowth(allocator, Buffer.setBool, .{ self.innerBuf(), ofs, key, value });
+    pub fn slice(self: *const ManagedDocument) []const u8 {
+        return self.doc.slice();
     }
 
-    pub fn setI64(self: *ExternalContext, allocator: std.mem.Allocator, ofs: Offset, key: []const u8, value: i64) Error!void {
-        return self.callWithGrowth(allocator, Buffer.setI64, .{ self.innerBuf(), ofs, key, value });
+    pub fn capacity(self: *const ManagedDocument) usize {
+        return self.doc.capacity();
     }
 
-    pub fn setF64(self: *ExternalContext, allocator: std.mem.Allocator, ofs: Offset, key: []const u8, value: f64) Error!void {
-        return self.callWithGrowth(allocator, Buffer.setF64, .{ self.innerBuf(), ofs, key, value });
+    pub fn reset(self: *ManagedDocument, root_type: Container) void {
+        self.doc.reset(root_type);
     }
 
-    pub fn setStr(self: *ExternalContext, allocator: std.mem.Allocator, ofs: Offset, key: []const u8, value: []const u8) Error!void {
-        return self.callWithGrowth(allocator, Buffer.setStr, .{ self.innerBuf(), ofs, key, value });
+    pub fn importBytes(self: *ManagedDocument, document: []const u8) (ReadError || error{ OutOfMemory, NoSpaceLeft })!void {
+        return self.doc.importBytes(self.gpa, document);
     }
 
-    pub fn setBytes(self: *ExternalContext, allocator: std.mem.Allocator, ofs: Offset, key: []const u8, value: []const u8) Error!void {
-        return self.callWithGrowth(allocator, Buffer.setBytes, .{ self.innerBuf(), ofs, key, value });
+    pub fn importBytesUnchecked(self: *ManagedDocument, document: []const u8) error{ OutOfMemory, NoSpaceLeft }!void {
+        return self.doc.importBytesUnchecked(self.gpa, document);
     }
 
-    pub fn setObj(self: *ExternalContext, allocator: std.mem.Allocator, ofs: Offset, key: []const u8) Error!Offset {
-        return self.callWithGrowth(allocator, Buffer.setObj, .{ self.innerBuf(), ofs, key });
+    pub fn decodeJson(self: *ManagedDocument, json: []const u8, diagnostics: ?*JsonDiagnostics) DecodeError!void {
+        return self.doc.decodeJson(self.gpa, json, diagnostics);
     }
 
-    pub fn setArr(self: *ExternalContext, allocator: std.mem.Allocator, ofs: Offset, key: []const u8) Error!Offset {
-        return self.callWithGrowth(allocator, Buffer.setArr, .{ self.innerBuf(), ofs, key });
+    pub fn reserve(self: *ManagedDocument, additional: usize) GrowError!void {
+        return self.doc.reserve(self.gpa, additional);
     }
 
-    pub fn arrAppendNull(self: *ExternalContext, allocator: std.mem.Allocator, ofs: Offset) Error!void {
-        return self.callWithGrowth(allocator, Buffer.arrAppendNull, .{ self.innerBuf(), ofs });
+    pub fn shrinkToFit(self: *ManagedDocument) error{OutOfMemory}!void {
+        return self.doc.shrinkToFit(self.gpa);
     }
 
-    pub fn arrAppendBool(self: *ExternalContext, allocator: std.mem.Allocator, ofs: Offset, value: bool) Error!void {
-        return self.callWithGrowth(allocator, Buffer.arrAppendBool, .{ self.innerBuf(), ofs, value });
+    pub fn set(self: *ManagedDocument, at: Offset, k: anytype, value: anytype) GrowError!void {
+        return self.doc.set(self.gpa, at, k, value);
     }
 
-    pub fn arrAppendI64(self: *ExternalContext, allocator: std.mem.Allocator, ofs: Offset, value: i64) Error!void {
-        return self.callWithGrowth(allocator, Buffer.arrAppendI64, .{ self.innerBuf(), ofs, value });
+    pub fn setObject(self: *ManagedDocument, at: Offset, k: anytype) GrowError!Offset {
+        return self.doc.setObject(self.gpa, at, k);
     }
 
-    pub fn arrAppendF64(self: *ExternalContext, allocator: std.mem.Allocator, ofs: Offset, value: f64) Error!void {
-        return self.callWithGrowth(allocator, Buffer.arrAppendF64, .{ self.innerBuf(), ofs, value });
+    pub fn setArray(self: *ManagedDocument, at: Offset, k: anytype) GrowError!Offset {
+        return self.doc.setArray(self.gpa, at, k);
     }
 
-    pub fn arrAppendStr(self: *ExternalContext, allocator: std.mem.Allocator, ofs: Offset, value: []const u8) Error!void {
-        return self.callWithGrowth(allocator, Buffer.arrAppendStr, .{ self.innerBuf(), ofs, value });
+    pub fn append(self: *ManagedDocument, arr: Offset, value: anytype) GrowError!void {
+        return self.doc.append(self.gpa, arr, value);
     }
 
-    pub fn arrAppendBytes(self: *ExternalContext, allocator: std.mem.Allocator, ofs: Offset, value: []const u8) Error!void {
-        return self.callWithGrowth(allocator, Buffer.arrAppendBytes, .{ self.innerBuf(), ofs, value });
+    pub fn appendObject(self: *ManagedDocument, arr: Offset) GrowError!Offset {
+        return self.doc.appendObject(self.gpa, arr);
     }
 
-    pub fn arrAppendObj(self: *ExternalContext, allocator: std.mem.Allocator, ofs: Offset) Error!Offset {
-        return self.callWithGrowth(allocator, Buffer.arrAppendObj, .{ self.innerBuf(), ofs });
+    pub fn appendArray(self: *ManagedDocument, arr: Offset) GrowError!Offset {
+        return self.doc.appendArray(self.gpa, arr);
     }
 
-    pub fn arrAppendArr(self: *ExternalContext, allocator: std.mem.Allocator, ofs: Offset) Error!Offset {
-        return self.callWithGrowth(allocator, Buffer.arrAppendArr, .{ self.innerBuf(), ofs });
+    pub fn arrSet(self: *ManagedDocument, arr: Offset, index: u32, value: anytype) GrowError!void {
+        return self.doc.arrSet(self.gpa, arr, index, value);
     }
 
-    // --- Non-mutating operations ---
-
-    pub fn getType(self: *const ExternalContext, ofs: Offset, key: []const u8) Error!Type {
-        return self.innerBufConst().getType(ofs, key);
+    pub fn arrSetObject(self: *ManagedDocument, arr: Offset, index: u32) GrowError!Offset {
+        return self.doc.arrSetObject(self.gpa, arr, index);
     }
 
-    pub fn exists(self: *const ExternalContext, ofs: Offset, key: []const u8) Error!bool {
-        return self.innerBufConst().exists(ofs, key);
+    pub fn arrSetArray(self: *ManagedDocument, arr: Offset, index: u32) GrowError!Offset {
+        return self.doc.arrSetArray(self.gpa, arr, index);
     }
 
-    pub fn getBool(self: *const ExternalContext, ofs: Offset, key: []const u8) Error!bool {
-        return self.innerBufConst().getBool(ofs, key);
+    pub fn clone(self: *const ManagedDocument) (GrowError || ReadError)!ManagedDocument {
+        return .{ .gpa = self.gpa, .doc = try self.doc.clone(self.gpa) };
     }
 
-    pub fn getI64(self: *const ExternalContext, ofs: Offset, key: []const u8) Error!i64 {
-        return self.innerBufConst().getI64(ofs, key);
-    }
-
-    pub fn getF64(self: *const ExternalContext, ofs: Offset, key: []const u8) Error!f64 {
-        return self.innerBufConst().getF64(ofs, key);
-    }
-
-    pub fn getStr(self: *const ExternalContext, ofs: Offset, key: []const u8) Error![]const u8 {
-        return self.innerBufConst().getStr(ofs, key);
-    }
-
-    pub fn getBytes(self: *const ExternalContext, ofs: Offset, key: []const u8) Error![]const u8 {
-        return self.innerBufConst().getBytes(ofs, key);
-    }
-
-    pub fn getObj(self: *const ExternalContext, ofs: Offset, key: []const u8) Error!Offset {
-        return self.innerBufConst().getObj(ofs, key);
-    }
-
-    pub fn getArr(self: *const ExternalContext, ofs: Offset, key: []const u8) Error!Offset {
-        return self.innerBufConst().getArr(ofs, key);
-    }
-
-    pub fn getStrCopy(self: *const ExternalContext, ofs: Offset, key: []const u8, dest: []u8) Error![]const u8 {
-        return self.innerBufConst().getStrCopy(ofs, key, dest);
-    }
-
-    pub fn getBytesCopy(self: *const ExternalContext, ofs: Offset, key: []const u8, dest: []u8) Error![]const u8 {
-        return self.innerBufConst().getBytesCopy(ofs, key, dest);
-    }
-
-    pub fn arrGetBool(self: *const ExternalContext, ofs: Offset, index: u32) Error!bool {
-        return self.innerBufConst().arrGetBool(ofs, index);
-    }
-
-    pub fn arrGetI64(self: *const ExternalContext, ofs: Offset, index: u32) Error!i64 {
-        return self.innerBufConst().arrGetI64(ofs, index);
-    }
-
-    pub fn arrGetF64(self: *const ExternalContext, ofs: Offset, index: u32) Error!f64 {
-        return self.innerBufConst().arrGetF64(ofs, index);
-    }
-
-    pub fn arrGetStr(self: *const ExternalContext, ofs: Offset, index: u32) Error![]const u8 {
-        return self.innerBufConst().arrGetStr(ofs, index);
-    }
-
-    pub fn arrGetBytes(self: *const ExternalContext, ofs: Offset, index: u32) Error![]const u8 {
-        return self.innerBufConst().arrGetBytes(ofs, index);
-    }
-
-    pub fn arrGetObj(self: *const ExternalContext, ofs: Offset, index: u32) Error!Offset {
-        return self.innerBufConst().arrGetObj(ofs, index);
-    }
-
-    pub fn arrGetArr(self: *const ExternalContext, ofs: Offset, index: u32) Error!Offset {
-        return self.innerBufConst().arrGetArr(ofs, index);
-    }
-
-    pub fn arrGetType(self: *const ExternalContext, ofs: Offset, index: u32) Error!Type {
-        return self.innerBufConst().arrGetType(ofs, index);
-    }
-
-    pub fn arrGetStrCopy(self: *const ExternalContext, ofs: Offset, index: u32, dest: []u8) Error![]const u8 {
-        return self.innerBufConst().arrGetStrCopy(ofs, index, dest);
-    }
-
-    pub fn arrGetBytesCopy(self: *const ExternalContext, ofs: Offset, index: u32, dest: []u8) Error![]const u8 {
-        return self.innerBufConst().arrGetBytesCopy(ofs, index, dest);
-    }
-
-    pub fn count(self: *const ExternalContext, ofs: Offset) Error!u32 {
-        return self.innerBufConst().count(ofs);
-    }
-
-    pub fn iterate(self: *const ExternalContext, ofs: Offset) Error!Iterator {
-        return self.innerBufConst().iterate(ofs);
-    }
-
-    pub fn jsonEncode(self: *const ExternalContext, ofs: Offset) Error!JsonString {
-        return self.innerBufConst().jsonEncode(ofs);
-    }
-
-    pub fn jsonEncodePretty(self: *const ExternalContext, ofs: Offset) Error!JsonString {
-        return self.innerBufConst().jsonEncodePretty(ofs);
-    }
-
-    pub fn jsonEncodeBuf(self: *const ExternalContext, ofs: Offset, out: []u8) Error!usize {
-        return self.innerBufConst().jsonEncodeBuf(ofs, out);
-    }
-
-    pub fn getValue(self: *const ExternalContext, ofs: Offset, key: []const u8) Error!Value {
-        return self.innerBufConst().getValue(ofs, key);
+    pub fn compact(self: *ManagedDocument) (GrowError || ReadError)!void {
+        return self.doc.compact(self.gpa);
     }
 };

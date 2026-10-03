@@ -1,314 +1,240 @@
-//! Benchmark suite for lite3-zig
+//! Benchmarks for lite3-zig.
 //!
 //! Run with: zig build bench
-//! Results show min/median/max nanoseconds per operation across multiple trials.
+//!
+//! Each benchmark runs the same loop through the Zig API and directly
+//! against lite3's C API (src/bench_raw.c) and reports the median time per
+//! operation of several trials, and the wrapper's overhead.
 
 const std = @import("std");
 const lite3 = @import("lite3");
+const root = lite3.root;
 
-const Timer = std.time.Timer;
+extern fn raw_set_i64(buf: [*]u8, bufsz: usize, n: u64) i64;
+extern fn raw_get_i64(buf: [*]const u8, len: usize, n: u64) i64;
+extern fn raw_set_str(buf: [*]u8, bufsz: usize, n: u64) i64;
+extern fn raw_get_str(buf: [*]const u8, len: usize, n: u64) i64;
+extern fn raw_append_i64(buf: [*]u8, bufsz: usize, n: u64) i64;
+extern fn raw_iterate(buf: [*]const u8, len: usize) i64;
 
-const NUM_TRIALS = 5;
+/// Process I/O handle, set once in `main`. Needed for clock access.
+var io: std.Io = undefined;
+/// The process's general-purpose allocator, set once in `main`.
+var gpa: std.mem.Allocator = undefined;
 
-fn formatRate(count: u64, elapsed_ns: u64) f64 {
-    return @as(f64, @floatFromInt(count)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0);
+const trials = 7;
+const str_value = "hello world benchmark string";
+
+var big_mem: [4 << 20]u8 align(4) = undefined;
+var small_mem: [65536]u8 align(4) = undefined;
+
+fn now() std.Io.Timestamp {
+    return std.Io.Timestamp.now(io, .awake);
 }
 
-fn nsPerOp(count: u64, elapsed_ns: u64) f64 {
-    return @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(count));
-}
-
-fn printStats(name: []const u8, count: u64, times: *[NUM_TRIALS]u64) void {
-    std.mem.sort(u64, times, {}, std.sort.asc(u64));
-    const min = times[0];
-    const median = times[NUM_TRIALS / 2];
-    const max = times[NUM_TRIALS - 1];
-    std.debug.print("  {s:<14} {d:>12.0} ops/sec  (min {d:.1} ns/op, med {d:.1}, max {d:.1})\n", .{
-        name,
-        formatRate(count, median),
-        nsPerOp(count, min),
-        nsPerOp(count, median),
-        nsPerOp(count, max),
-    });
-}
-
-fn benchSetGetI64() !void {
-    const iterations: u64 = 100_000;
-
-    // --- set_i64 ---
-    var set_times: [NUM_TRIALS]u64 = undefined;
-    {
-        // warmup
-        var mem: [65536]u8 align(4) = undefined;
-        var buf = try lite3.Buffer.initObj(&mem);
-        try buf.setI64(lite3.root, "key", 42);
-    }
-    for (&set_times) |*t| {
-        var mem: [65536]u8 align(4) = undefined;
-        var buf = try lite3.Buffer.initObj(&mem);
-        var timer = try Timer.start();
-        for (0..iterations) |_| {
-            try buf.setI64(lite3.root, "key", 42);
-        }
-        t.* = timer.read();
-        std.mem.doNotOptimizeAway(&buf);
-    }
-    printStats("set_i64:", iterations, &set_times);
-
-    // --- get_i64 ---
-    var get_times: [NUM_TRIALS]u64 = undefined;
-    for (&get_times) |*t| {
-        var mem: [65536]u8 align(4) = undefined;
-        var buf = try lite3.Buffer.initObj(&mem);
-        try buf.setI64(lite3.root, "key", 42);
-        var timer = try Timer.start();
-        for (0..iterations) |_| {
-            const val = try buf.getI64(lite3.root, "key");
-            std.mem.doNotOptimizeAway(&val);
-        }
-        t.* = timer.read();
-    }
-    printStats("get_i64:", iterations, &get_times);
-}
-
-fn benchSetGetStr() !void {
-    const iterations: u64 = 100_000;
-
-    // --- set_str ---
-    var set_times: [NUM_TRIALS]u64 = undefined;
-    {
-        var mem: [65536]u8 align(4) = undefined;
-        var buf = try lite3.Buffer.initObj(&mem);
-        try buf.setStr(lite3.root, "key", "hello world benchmark string");
-        std.mem.doNotOptimizeAway(&buf);
-    }
-    for (&set_times) |*t| {
-        var mem: [65536]u8 align(4) = undefined;
-        var buf = try lite3.Buffer.initObj(&mem);
-        var timer = try Timer.start();
-        for (0..iterations) |_| {
-            try buf.setStr(lite3.root, "key", "hello world benchmark string");
-        }
-        t.* = timer.read();
-        std.mem.doNotOptimizeAway(&buf);
-    }
-    printStats("set_str:", iterations, &set_times);
-
-    // --- get_str ---
-    var get_times: [NUM_TRIALS]u64 = undefined;
-    for (&get_times) |*t| {
-        var mem: [65536]u8 align(4) = undefined;
-        var buf = try lite3.Buffer.initObj(&mem);
-        try buf.setStr(lite3.root, "key", "hello world benchmark string");
-        var timer = try Timer.start();
-        for (0..iterations) |_| {
-            const val = try buf.getStr(lite3.root, "key");
-            std.mem.doNotOptimizeAway(&val);
-        }
-        t.* = timer.read();
-    }
-    printStats("get_str:", iterations, &get_times);
-}
-
-fn benchArrayAppend() !void {
-    const iterations: u64 = 50_000;
-
-    var times: [NUM_TRIALS]u64 = undefined;
-    {
-        // warmup
-        var mem: [4194304]u8 align(4) = undefined;
-        var buf = try lite3.Buffer.initArr(&mem);
-        for (0..iterations) |i| {
-            try buf.arrAppendI64(lite3.root, @intCast(i));
-        }
-        std.mem.doNotOptimizeAway(&buf);
-    }
+/// Median nanoseconds per operation of `trials` runs of `body(n)`.
+fn measure(n: usize, comptime body: fn (usize) anyerror!void) !f64 {
+    try body(n); // warm up
+    var times: [trials]u64 = undefined;
     for (&times) |*t| {
-        var mem: [4194304]u8 align(4) = undefined;
-        var buf = try lite3.Buffer.initArr(&mem);
-        var timer = try Timer.start();
-        for (0..iterations) |i| {
-            try buf.arrAppendI64(lite3.root, @intCast(i));
-        }
-        t.* = timer.read();
-        std.mem.doNotOptimizeAway(&buf);
-    }
-    printStats("arr_append:", iterations, &times);
-}
-
-fn benchIterate() !void {
-    var mem: [4194304]u8 align(4) = undefined;
-    var buf = try lite3.Buffer.initArr(&mem);
-
-    const n: u64 = 10_000;
-    for (0..n) |i| {
-        try buf.arrAppendI64(lite3.root, @intCast(i));
-    }
-
-    const iterations: u64 = 100;
-    var times: [NUM_TRIALS]u64 = undefined;
-    {
-        // warmup
-        var iter = try buf.iterate(lite3.root);
-        var sink: usize = 0;
-        while (try iter.next()) |entry| {
-            sink +%= @intFromEnum(entry.val_offset);
-        }
-        std.mem.doNotOptimizeAway(&sink);
-    }
-    for (&times) |*t| {
-        var timer = try Timer.start();
-        for (0..iterations) |_| {
-            var iter = try buf.iterate(lite3.root);
-            var sink: usize = 0;
-            while (try iter.next()) |entry| {
-                sink +%= @intFromEnum(entry.val_offset);
-            }
-            std.mem.doNotOptimizeAway(&sink);
-        }
-        t.* = timer.read();
+        const start = now();
+        try body(n);
+        t.* = @intCast(@max(start.durationTo(now()).nanoseconds, 0));
     }
     std.mem.sort(u64, &times, {}, std.sort.asc(u64));
-    const median = times[NUM_TRIALS / 2];
-    std.debug.print("  {s:<14} {d:>12.0} iters/sec ({d} elements)  (min {d:.1} ns/op, med {d:.1}, max {d:.1})\n", .{
-        "iterate:",
-        formatRate(iterations, median),
-        n,
-        nsPerOp(iterations, times[0]),
-        nsPerOp(iterations, median),
-        nsPerOp(iterations, times[NUM_TRIALS - 1]),
-    });
+    return @as(f64, @floatFromInt(times[trials / 2])) / @as(f64, @floatFromInt(n));
 }
 
-fn benchJsonRoundTrip() !void {
+fn report(name: []const u8, zig_ns: f64, raw_ns: ?f64) void {
+    if (raw_ns) |raw| {
+        std.debug.print("  {s:<26} {d:>8.1} ns/op   C {d:>8.1} ns/op   overhead {d:>6.1}%\n", .{ name, zig_ns, raw, (zig_ns / raw - 1.0) * 100.0 });
+    } else {
+        std.debug.print("  {s:<26} {d:>8.1} ns/op\n", .{ name, zig_ns });
+    }
+}
+
+fn check(ret: i64) !void {
+    if (ret < 0) return error.RawBenchmarkFailed;
+}
+
+// --- Bodies ---
+
+fn zigSetI64Plain(n: usize) !void {
+    var buf = try lite3.Buffer.init(&small_mem, .object);
+    for (0..n) |_| try buf.set(root, "key", 42);
+    std.mem.doNotOptimizeAway(&buf);
+}
+
+fn zigSetI64Key(n: usize) !void {
+    var buf = try lite3.Buffer.init(&small_mem, .object);
+    for (0..n) |_| try buf.set(root, lite3.key("key"), 42);
+    std.mem.doNotOptimizeAway(&buf);
+}
+
+fn rawSetI64(n: usize) !void {
+    try check(raw_set_i64(&small_mem, small_mem.len, n));
+}
+
+fn prepI64() !lite3.Buffer {
+    var buf = try lite3.Buffer.init(&small_mem, .object);
+    try buf.set(root, "key", 42);
+    return buf;
+}
+
+fn zigGetI64Plain(n: usize) !void {
+    const buf = try prepI64();
+    const v = buf.view();
+    var sum: i64 = 0;
+    for (0..n) |_| sum +%= try v.get(i64, root, "key");
+    std.mem.doNotOptimizeAway(sum);
+}
+
+fn zigGetI64Key(n: usize) !void {
+    const buf = try prepI64();
+    const v = buf.view();
+    var sum: i64 = 0;
+    for (0..n) |_| sum +%= try v.get(i64, root, lite3.key("key"));
+    std.mem.doNotOptimizeAway(sum);
+}
+
+fn rawGetI64(n: usize) !void {
+    const buf = try prepI64();
+    try check(raw_get_i64(buf.slice().ptr, buf.slice().len, n));
+}
+
+fn zigSetStr(n: usize) !void {
+    var buf = try lite3.Buffer.init(&small_mem, .object);
+    for (0..n) |_| try buf.set(root, lite3.key("key"), str_value);
+    std.mem.doNotOptimizeAway(&buf);
+}
+
+fn rawSetStr(n: usize) !void {
+    try check(raw_set_str(&small_mem, small_mem.len, n));
+}
+
+fn prepStr() !lite3.Buffer {
+    var buf = try lite3.Buffer.init(&small_mem, .object);
+    try buf.set(root, "key", str_value);
+    return buf;
+}
+
+fn zigGetStr(n: usize) !void {
+    const buf = try prepStr();
+    const v = buf.view();
+    var sum: usize = 0;
+    for (0..n) |_| sum +%= (try v.get([]const u8, root, lite3.key("key"))).len;
+    std.mem.doNotOptimizeAway(sum);
+}
+
+fn rawGetStr(n: usize) !void {
+    const buf = try prepStr();
+    try check(raw_get_str(buf.slice().ptr, buf.slice().len, n));
+}
+
+fn zigAppend(n: usize) !void {
+    var buf = try lite3.Buffer.init(&big_mem, .array);
+    for (0..n) |i| try buf.append(root, i);
+    std.mem.doNotOptimizeAway(&buf);
+}
+
+fn rawAppend(n: usize) !void {
+    try check(raw_append_i64(&big_mem, big_mem.len, n));
+}
+
+const iterate_len = 10_000;
+
+fn prepIterate() !lite3.Buffer {
+    var buf = try lite3.Buffer.init(&big_mem, .array);
+    for (0..iterate_len) |i| try buf.append(root, i);
+    return buf;
+}
+
+/// `n` counts elements visited, so results are per element.
+fn zigIterate(n: usize) !void {
+    const buf = try prepIterate();
+    const v = buf.view();
+    for (0..n / iterate_len) |_| {
+        var it = try v.arrayIterator(root);
+        var sum: i64 = 0;
+        while (try it.next()) |e| sum +%= e.value.int;
+        std.mem.doNotOptimizeAway(sum);
+    }
+}
+
+fn rawIterate(n: usize) !void {
+    const buf = try prepIterate();
+    for (0..n / iterate_len) |_| try check(raw_iterate(buf.slice().ptr, buf.slice().len));
+}
+
+fn zigDocumentSet(n: usize) !void {
+    var doc = try lite3.Document.init(gpa, .object);
+    defer doc.deinit(gpa);
+    for (0..n) |_| try doc.set(gpa, root, lite3.key("key"), 42);
+}
+
+fn prepJson() !lite3.Buffer {
+    var buf = try lite3.Buffer.init(&small_mem, .object);
+    try buf.set(root, "name", "benchmark");
+    try buf.set(root, "value", 42);
+    try buf.set(root, "active", true);
+    try buf.set(root, "score", 99.5);
+    const arr = try buf.setArray(root, "items");
+    for (0..10) |i| try buf.append(arr, i);
+    return buf;
+}
+
+fn zigJsonEncode(n: usize) !void {
+    const buf = try prepJson();
+    var out: [4096]u8 = undefined;
+    for (0..n) |_| {
+        var w: std.Io.Writer = .fixed(&out);
+        try buf.view().writeJson(root, &w, .{});
+        std.mem.doNotOptimizeAway(w.end);
+    }
+}
+
+var json_input: []const u8 = "";
+
+fn zigJsonDecode(n: usize) !void {
     var mem: [65536]u8 align(4) = undefined;
-    var buf = try lite3.Buffer.initObj(&mem);
-    try buf.setStr(lite3.root, "name", "benchmark");
-    try buf.setI64(lite3.root, "value", 42);
-    try buf.setBool(lite3.root, "active", true);
-    try buf.setF64(lite3.root, "score", 99.5);
-
-    const iterations: u64 = 50_000;
-
-    // --- json_enc ---
-    var enc_times: [NUM_TRIALS]u64 = undefined;
-    {
-        // warmup
-        const j = try buf.jsonEncode(lite3.root);
-        j.deinit();
+    for (0..n) |_| {
+        const buf = try lite3.Buffer.fromJson(gpa, &mem, json_input, null);
+        std.mem.doNotOptimizeAway(buf.len);
     }
-    for (&enc_times) |*t| {
-        var timer = try Timer.start();
-        for (0..iterations) |_| {
-            const json = try buf.jsonEncode(lite3.root);
-            std.mem.doNotOptimizeAway(&json);
-            json.deinit();
-        }
-        t.* = timer.read();
-    }
-    printStats("json_enc:", iterations, &enc_times);
-
-    // Get a JSON string for decode benchmark
-    const json = try buf.jsonEncode(lite3.root);
-    defer json.deinit();
-
-    // --- json_dec ---
-    var dec_times: [NUM_TRIALS]u64 = undefined;
-    {
-        // warmup
-        var mem2: [65536]u8 align(4) = undefined;
-        const b = try lite3.Buffer.jsonDecode(&mem2, json.slice());
-        std.mem.doNotOptimizeAway(&b);
-    }
-    for (&dec_times) |*t| {
-        var timer = try Timer.start();
-        for (0..iterations) |_| {
-            var mem2: [65536]u8 align(4) = undefined;
-            const b = try lite3.Buffer.jsonDecode(&mem2, json.slice());
-            std.mem.doNotOptimizeAway(&b);
-        }
-        t.* = timer.read();
-    }
-    printStats("json_dec:", iterations, &dec_times);
 }
 
-fn benchContextVsBuffer() !void {
-    const iterations: u64 = 100_000;
+pub fn main(init: std.process.Init) !void {
+    io = init.io;
+    gpa = init.gpa;
+    std.debug.print("\nlite3-zig benchmarks (median of {d} trials)\n\n", .{trials});
 
-    // --- Buffer ---
-    var buf_times: [NUM_TRIALS]u64 = undefined;
-    {
-        var mem: [65536]u8 align(4) = undefined;
-        var buf = try lite3.Buffer.initObj(&mem);
-        try buf.setI64(lite3.root, "k", 1);
-        std.mem.doNotOptimizeAway(&buf);
-    }
-    for (&buf_times) |*t| {
-        var mem: [65536]u8 align(4) = undefined;
-        var buf = try lite3.Buffer.initObj(&mem);
-        var timer = try Timer.start();
-        for (0..iterations) |_| {
-            try buf.setI64(lite3.root, "k", 1);
-        }
-        t.* = timer.read();
-        std.mem.doNotOptimizeAway(&buf);
-    }
-    printStats("buffer_set:", iterations, &buf_times);
+    const n = 200_000;
+    std.debug.print("Objects:\n", .{});
+    const raw_set = try measure(n, rawSetI64);
+    report("set i64 (string key)", try measure(n, zigSetI64Plain), raw_set);
+    report("set i64 (lite3.key)", try measure(n, zigSetI64Key), raw_set);
+    const raw_get = try measure(n, rawGetI64);
+    report("get i64 (string key)", try measure(n, zigGetI64Plain), raw_get);
+    report("get i64 (lite3.key)", try measure(n, zigGetI64Key), raw_get);
+    report("set string", try measure(n, zigSetStr), try measure(n, rawSetStr));
+    report("get string", try measure(n, zigGetStr), try measure(n, rawGetStr));
+    report("Document set i64", try measure(n, zigDocumentSet), raw_set);
 
-    // --- Context ---
-    var ctx_times: [NUM_TRIALS]u64 = undefined;
-    {
-        var ctx = try lite3.Context.init();
-        try ctx.resetObj();
-        try ctx.setI64(lite3.root, "k", 1);
-        std.mem.doNotOptimizeAway(&ctx);
-        ctx.deinit();
-    }
-    for (&ctx_times) |*t| {
-        var ctx = try lite3.Context.init();
-        try ctx.resetObj();
-        var timer = try Timer.start();
-        for (0..iterations) |_| {
-            try ctx.setI64(lite3.root, "k", 1);
-        }
-        t.* = timer.read();
-        std.mem.doNotOptimizeAway(&ctx);
-        ctx.deinit();
-    }
-    printStats("ctx_set:", iterations, &ctx_times);
-
-    std.mem.sort(u64, &buf_times, {}, std.sort.asc(u64));
-    std.mem.sort(u64, &ctx_times, {}, std.sort.asc(u64));
-    const buf_med = buf_times[NUM_TRIALS / 2];
-    const ctx_med = ctx_times[NUM_TRIALS / 2];
-    std.debug.print("  overhead:     {d:.1}%\n", .{
-        (@as(f64, @floatFromInt(ctx_med)) / @as(f64, @floatFromInt(buf_med)) - 1.0) * 100.0,
-    });
-}
-
-pub fn main() !void {
-    std.debug.print("\nlite3-zig benchmarks ({d} trials each)\n", .{NUM_TRIALS});
-    std.debug.print("=========================================\n\n", .{});
-
-    std.debug.print("Set/Get:\n", .{});
-    try benchSetGetI64();
-    try benchSetGetStr();
-
-    std.debug.print("\nArray:\n", .{});
-    try benchArrayAppend();
-
-    std.debug.print("\nIteration:\n", .{});
-    try benchIterate();
+    std.debug.print("\nArrays:\n", .{});
+    report("append i64", try measure(50_000, zigAppend), try measure(50_000, rawAppend));
+    report("iterate (per element)", try measure(iterate_len * 100, zigIterate), try measure(iterate_len * 100, rawIterate));
 
     std.debug.print("\nJSON:\n", .{});
+    report("encode (16 values)", try measure(50_000, zigJsonEncode), null);
     if (lite3.json_enabled) {
-        try benchJsonRoundTrip();
+        const buf = try prepJson();
+        var out: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&out);
+        try buf.view().writeJson(root, &w, .{});
+        json_input = w.buffered();
+        report("decode (16 values)", try measure(50_000, zigJsonDecode), null);
     } else {
-        std.debug.print("  disabled (-Djson=false)\n", .{});
+        std.debug.print("  decode disabled (-Djson=false)\n", .{});
     }
-
-    std.debug.print("\nBuffer vs Context:\n", .{});
-    try benchContextVsBuffer();
-
-    std.debug.print("\nDone.\n", .{});
+    std.debug.print("\n", .{});
 }

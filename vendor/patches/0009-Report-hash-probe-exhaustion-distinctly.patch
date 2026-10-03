@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: lite3-zig <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 08:08:56 +0000
+Subject: [PATCH] Report hash-probe exhaustion distinctly
+
+When all LITE3_HASH_PROBE_MAX probe slots for a key hold other keys,
+lookups and inserts both returned EINVAL, indistinguishable from invalid
+arguments. A lookup now returns ENOENT (the key cannot be present), and
+an insert returns ENOSPC (no slot left), so applications can recognise
+- and rate-limit - inputs crafted to collide under the unseeded DJB2
+hash.
+---
+ src/lite3.c | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/src/lite3.c b/src/lite3.c
+index a623c2e..4ed062e 100644
+--- a/src/lite3.c
++++ b/src/lite3.c
+@@ -327,8 +327,9 @@ int lite3_get_impl(
+ 			}
+ 		}
+ 	}
+-	LITE3_PRINT_ERROR("LITE3_HASH_PROBE_MAX LIMIT REACHED\n");
+-	errno = EINVAL;
++	// Every probe slot held a different key, so this key is not present.
++	LITE3_PRINT_ERROR("KEY NOT FOUND (LITE3_HASH_PROBE_MAX SLOTS PROBED)\n");
++	errno = ENOENT;
+ 	return -1;
+ }
+ 
+@@ -819,8 +820,11 @@ insert_append:
+ 		LITE3_PRINT_DEBUG("OK\n");
+ 		return 0;
+ 	}
++	// Every probe slot holds a different key: no slot left for this one.
++	// Distinct from EINVAL so callers can tell (possibly adversarial) hash
++	// collisions from invalid arguments.
+ 	LITE3_PRINT_ERROR("LITE3_HASH_PROBE_MAX LIMIT REACHED\n");
+-	errno = EINVAL;
++	errno = ENOSPC;
+ 	return -1;
+ }
+ 

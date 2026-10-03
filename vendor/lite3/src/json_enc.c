@@ -36,6 +36,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
+#include <limits.h>
 
 #include "yyjson/yyjson.h"
 #include "nibble_base64/base64.h"
@@ -77,12 +78,20 @@ int _lite3_json_enc_switch(const unsigned char *buf, size_t buflen, size_t nesti
                 *yy_val = yyjson_mut_double(doc, lite3_val_f64(val));
                 break;
         case LITE3_TYPE_BYTES:
+                ;
                 size_t bytes_len;
                 const u8 *bytes = lite3_val_bytes(val, &bytes_len);
+                // nibble_base64() computes 4 * (len + pad) in an int; keep that from overflowing.
+                if (bytes_len > (size_t)(INT_MAX / 4) - 3) {
+                	LITE3_PRINT_ERROR("BYTES VALUE TOO LARGE FOR BASE64 CONVERSION\n");
+                	errno = EMSGSIZE;
+                	return -1;
+                }
                 int b64_len;
                 char *b64 = nibble_base64(bytes, (int)bytes_len, &b64_len);
                 if (!b64) {
                 	LITE3_PRINT_ERROR("FAILED TO CONVERT BYTES TO BASE64\n");
+                	errno = ENOMEM;
                 	// No need to free the `b64` pointer, since the allocation would have failed anyways.
                 	return -1;
                 }
@@ -98,6 +107,7 @@ int _lite3_json_enc_switch(const unsigned char *buf, size_t buflen, size_t nesti
                 free(b64);
                 break;
         case LITE3_TYPE_STRING:
+                ;
                 size_t str_len;
                 const char *str = lite3_val_str_n(val, &str_len);
                 /*
@@ -150,7 +160,7 @@ int _lite3_json_enc_obj(const unsigned char *buf, size_t buflen, size_t ofs, siz
         	val = (lite3_val *)(buf + val_ofs);
         	if ((ret = _lite3_json_enc_switch(buf, buflen, nesting_depth, doc, &yy_val, val)) < 0)
         		return ret;
-                if (!yyjson_mut_obj_add(coll, yyjson_mut_str(doc, LITE3_STR(buf, key)), yy_val)) {
+                if (!yyjson_mut_obj_add(coll, yyjson_mut_strn(doc, LITE3_STR(buf, key), key.len), yy_val)) {
 			LITE3_PRINT_ERROR("FAILED TO BUILD JSON DOCUMENT: ADDING KEY-VALUE PAIR FAILED\n");
 			errno = EINVAL;
 			return -1;
