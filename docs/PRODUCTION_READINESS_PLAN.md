@@ -320,7 +320,7 @@ There are no users, so this replaces the four current types outright: no aliases
   - 67/67 tests pass in Debug, ReleaseSafe, ReleaseFast and ReleaseSmall (JSON-only tests skip with `-Djson=false`).
   - The upstream C tests pass.
   - Valgrind is clean.
-  - FUZZ_RESULT
+  - 20M coverage-guided fuzz runs (5M per target, ReleaseSafe) found nothing after the write-sequence target was taught that `InvalidOffset` is the correct error for an Offset whose container was overwritten.
 
 1. **Types:**
    - **`View`:** read-only, over `[]align(4) const u8`. It implements every read, iteration, JSON output and `format()` once.
