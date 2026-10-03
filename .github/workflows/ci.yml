@@ -144,7 +144,8 @@ jobs:
   # Depend on the package the way users do: from a git archive tarball.
   consumer:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Room for a slow toolchain download (seen to take ~20 minutes).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3.6.3
