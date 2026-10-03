@@ -84,7 +84,10 @@ const Walker = struct {
         w.budget += n;
         if (w.budget > w.bytes.len) return error.CorruptData;
         const claimed = w.claimed orelse return;
-        for (ofs..ofs + n) |i| {
+        // In bounds, so the range fits in usize on 32-bit targets too.
+        if (!w.inBounds(ofs, n)) return error.CorruptData;
+        const start: usize = @intCast(ofs);
+        for (start..start + @as(usize, @intCast(n))) |i| {
             const mask = @as(u8, 1) << @intCast(i % 8);
             if (claimed[i / 8] & mask != 0) return error.CorruptData;
             claimed[i / 8] |= mask;

@@ -40,20 +40,28 @@ pub fn main(init: std.process.Init) !void {
     // Reads go through a View. A View taken before a write returns
     // error.StaleView afterwards, so take a fresh one after writing.
     const v = buf.view();
-    try out.print("name:    {s}\n", .{try v.get([]const u8, root, "name")});
-    try out.print("age:     {d}\n", .{try v.get(i64, root, "age")});
+    const name = try v.get([]const u8, root, "name");
+    const age = try v.get(i64, root, "age");
+    const city = try v.get([]const u8, try v.getObject(root, "address"), "city");
+    try out.print("name:    {s}\n", .{name});
+    try out.print("age:     {d}\n", .{age});
     try out.print("active:  {}\n", .{try v.get(bool, root, "active")});
-    try out.print("city:    {s}\n", .{try v.get([]const u8, try v.getObject(root, "address"), "city")});
+    try out.print("city:    {s}\n", .{city});
     try out.print("entries: {d}\n", .{try v.count(root)});
+    try check(std.mem.eql(u8, name, "Alice") and age == 30 and std.mem.eql(u8, city, "Wonderland"));
+    try check(try v.count(root) == 7);
     try out.print("used:    {d} of {d} bytes\n", .{ buf.slice().len, buf.capacity() });
 
     // Keys known at compile time can be hashed at compile time.
     const name_key = lite3.key("name");
     try out.print("has name: {}\n", .{try v.has(root, name_key)});
+    try check(try v.has(root, name_key));
 
     // Iteration.
     var it = try v.arrayIterator(tags);
-    while (try it.next()) |e| try out.print("tag[{d}]: {s}\n", .{ e.index, e.value.string });
+    var n_tags: u32 = 0;
+    while (try it.next()) |e| : (n_tags += 1) try out.print("tag[{d}]: {s}\n", .{ e.index, e.value.string });
+    try check(n_tags == 2);
 
     // JSON encoding needs no allocation.
     try out.print("json:    {f}\n", .{v});
@@ -61,7 +69,7 @@ pub fn main(init: std.process.Init) !void {
     // --- Document: growable memory ---
     try out.print("\n=== Document ===\n", .{});
 
-    const gpa = std.heap.smp_allocator;
+    const gpa = init.gpa;
     var doc = try lite3.Document.init(gpa, .object);
     defer doc.deinit(gpa);
 
@@ -78,5 +86,13 @@ pub fn main(init: std.process.Init) !void {
     const copy = try gpa.dupe(u8, doc.slice());
     defer gpa.free(copy);
     const received = try lite3.View.fromBytes(copy);
-    try out.print("event from copy: {s}\n", .{try received.get([]const u8, root, "event")});
+    const event = try received.get([]const u8, root, "event");
+    try out.print("event from copy: {s}\n", .{event});
+    try check(std.mem.eql(u8, event, "login"));
+}
+
+/// Examples double as smoke tests: `zig build run-examples` fails if one
+/// prints something unexpected.
+fn check(ok: bool) !void {
+    if (!ok) return error.UnexpectedResult;
 }

@@ -413,6 +413,8 @@ Exit criteria:
 
 ## 6. Upstream contributions
 
+Ready-to-file drafts for all of these, plus the Phase 3 finding (patch 0010), are in [`upstream-issues.md`](upstream-issues.md), with a column to record the issue links.
+
 These bugs are still present at upstream HEAD `48ab0e9`. Each one should be carried as a local patch and also filed upstream:
 
 - the iterator key length bug (C2)

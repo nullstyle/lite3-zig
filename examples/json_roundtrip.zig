@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout = std.Io.File.stdout().writerStreaming(init.io, &write_buf);
     const out = &stdout.interface;
     defer out.flush() catch {};
-    const gpa = std.heap.smp_allocator;
+    const gpa = init.gpa;
 
     var mem: [16384]u8 align(4) = undefined;
     var buf = try lite3.Buffer.init(&mem, .object);
@@ -46,19 +46,30 @@ pub fn main(init: std.process.Init) !void {
     var doc = try lite3.Document.fromJson(gpa, json, .{});
     defer doc.deinit(gpa);
     const v = doc.view();
-    try out.print("status:       {d}\n", .{try v.get(i64, root, "status")});
+    const status = try v.get(i64, root, "status");
+    try out.print("status:       {d}\n", .{status});
+    try check(status == 200);
     try out.print("content-type: {s}\n", .{try v.get([]const u8, try v.getObject(root, "headers"), "content-type")});
 
     const json2 = try v.jsonAlloc(gpa, root, .{});
     defer gpa.free(json2);
     try out.print("round trip:   {s}\n", .{if (std.mem.eql(u8, json, json2)) "identical" else "DIFFERENT"});
+    try check(std.mem.eql(u8, json, json2));
 
     // Invalid input reports where parsing stopped.
     var diag: lite3.JsonDiagnostics = .{};
     if (lite3.Document.fromJson(gpa, "{\"a\": [1, 2,]}", .{ .diagnostics = &diag })) |bad| {
         var d = bad;
         d.deinit(gpa);
+        return error.UnexpectedResult;
     } else |err| {
         try out.print("\ninvalid JSON: {s} at byte {d}: {s}\n", .{ @errorName(err), diag.position, diag.message });
+        try check(err == error.SyntaxError and diag.position == 11);
     }
+}
+
+/// Examples double as smoke tests: `zig build run-examples` fails if one
+/// prints something unexpected.
+fn check(ok: bool) !void {
+    if (!ok) return error.UnexpectedResult;
 }

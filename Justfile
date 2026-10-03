@@ -41,15 +41,23 @@ lint-c:
     zig build lint-c
 
 # Run all test variants
-test-all: test test-release test-fast test-no-json test-upstream
-
-# Run the local GitHub Actions CI workflow with act
-act-local:
-    act -W .github/workflows/ci-local.yml
+test-all: test test-release test-fast test-no-json test-upstream run-examples consumer
 
 # Build example programs
 examples:
     zig build examples
+
+# Build and run the examples and the README quick start
+run-examples:
+    zig build run-examples
+
+# Build a throwaway project that depends on this package (from git archive of HEAD)
+consumer:
+    scripts/consumer-test.sh
+
+# Generate API docs in zig-out/docs
+docs:
+    zig build docs
 
 # Clean build artifacts
 clean:
@@ -65,7 +73,7 @@ bench:
 
 # Check source formatting
 fmt-check:
-    zig fmt --check build.zig build.zig.zon src examples
+    zig build fmt
 
 # Format source files
 fmt:

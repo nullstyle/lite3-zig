@@ -25,37 +25,44 @@ The C source for lite3 is vendored directly in `vendor/lite3/` — no submodules
 
 ## Quick start
 
+`zig build run-examples` compiles and runs this program straight from the README.
+
 ```zig
 const std = @import("std");
 const lite3 = @import("lite3");
 const root = lite3.root;
 
-// Fixed memory: writes fail with error.NoSpaceLeft when it is full.
-var mem: [4096]u8 align(4) = undefined;
-var buf = try lite3.Buffer.init(&mem, .object);
-try buf.set(root, "name", "Alice");
-try buf.set(root, "age", 30);
-const tags = try buf.setArray(root, "tags");
-try buf.append(tags, "admin");
+pub fn main(init: std.process.Init) !void {
+    // Fixed memory: writes fail with error.NoSpaceLeft when it is full.
+    var mem: [4096]u8 align(4) = undefined;
+    var buf = try lite3.Buffer.init(&mem, .object);
+    try buf.set(root, "name", "Alice");
+    try buf.set(root, "age", 30);
+    const tags = try buf.setArray(root, "tags");
+    try buf.append(tags, "admin");
 
-const v = buf.view();
-const name = try v.get([]const u8, root, "name"); // "Alice"
-const age = try v.get(u8, root, lite3.key("age")); // 30
-std.debug.print("{s} {d} {f}\n", .{ name, age, v }); // {f}: compact JSON
+    const v = buf.view();
+    const name = try v.get([]const u8, root, "name"); // "Alice"
+    const age = try v.get(u8, root, lite3.key("age")); // 30
+    std.debug.print("{s} {d} {f}\n", .{ name, age, v }); // {f}: compact JSON
 
-// Growable memory.
-const gpa = std.heap.smp_allocator;
-var doc = try lite3.Document.init(gpa, .object);
-defer doc.deinit(gpa);
-try doc.set(gpa, root, "event", "login");
+    // Growable memory; the allocator is passed to each call that may grow.
+    const gpa = init.gpa;
+    var doc = try lite3.Document.init(gpa, .object);
+    defer doc.deinit(gpa);
+    try doc.set(gpa, root, "event", "login");
 
-// Received bytes: validated before use.
-const received = try lite3.View.fromBytes(doc.slice());
-_ = try received.get([]const u8, root, "event");
+    // Received bytes are validated before use.
+    const received = try lite3.View.fromBytes(doc.slice());
+    std.debug.print("{s}\n", .{try received.get([]const u8, root, "event")});
 
-// JSON (decoding needs the default -Djson=true).
-var parsed = try lite3.Document.fromJson(gpa, "{\"a\":[1,2,3]}", .{});
-defer parsed.deinit(gpa);
+    // JSON decoding needs the default -Djson=true.
+    if (lite3.json_enabled) {
+        var parsed = try lite3.Document.fromJson(gpa, "{\"a\":[1,2,3]}", .{});
+        defer parsed.deinit(gpa);
+        std.debug.print("{f}\n", .{parsed.view()});
+    }
+}
 ```
 
 ## Building
@@ -80,7 +87,7 @@ zig build -Doptimize=ReleaseFast
 | `-Dlto=true`       | `false` | Link-time optimization across Zig and C (inlines shim calls; uses the LLVM backend for every artifact) |
 | `-Dc-optimize=…`   | same as `-Doptimize` | Optimize mode for the C library. In Debug/ReleaseSafe the C code runs under UBSan |
 
-Build steps: `test`, `test-upstream` (lite3's own C tests against the vendored sources), `test-valgrind` (needs valgrind; pass `-Dcpu=x86_64_v3`), `examples`, `bench` (always ReleaseFast; compares each operation with lite3's C API), `check` (compile everything without running), `lint-c` (project C sources with `-Werror`).
+Build steps: `test`, `test-upstream` (lite3's own C tests against the vendored sources), `test-valgrind` (needs valgrind; pass `-Dcpu=x86_64_v3`), `examples`, `run-examples` (also runs the README quick start), `bench` (always ReleaseFast; compares each operation with lite3's C API), `check` (compile everything without running), `fmt` (check formatting), `docs` (API docs in `zig-out/docs`), `lint-c` (project C sources with `-Werror`).
 
 ### Building examples
 
@@ -96,26 +103,53 @@ zig build bench
 
 ## Using as a dependency
 
-Add this package to your `build.zig.zon`:
-
-```zig
-.dependencies = .{
-    .lite3 = .{
-        .url = "https://github.com/<your-fork>/lite3-zig/archive/<commit>.tar.gz",
-        .hash = "...",
-    },
-},
+```bash
+zig fetch --save=lite3_zig git+https://github.com/nullstyle/lite3-zig#v0.1.0
 ```
 
 Then in your `build.zig`:
 
 ```zig
-const lite3_dep = b.dependency("lite3", .{
+const lite3_dep = b.dependency("lite3_zig", .{
     .target = target,
     .optimize = optimize,
+    // .json = false, // leave out yyjson (JSON decoding); encoding still works
 });
 exe.root_module.addImport("lite3", lite3_dep.module("lite3"));
 ```
+
+`scripts/consumer-test.sh` (run in CI) builds a project set up exactly like this.
+
+## Supported platforms
+
+| Platform | Status |
+|---|---|
+| Linux x86_64, x86 (glibc, musl) | Tested in CI (x86 and musl natively) |
+| macOS (Apple silicon) | Tested in CI |
+| Linux aarch64, arm, riscv64; macOS x86_64; wasm32-wasi | Cross-compiled in CI, not run |
+| Windows | Not supported yet (compile error) |
+| Big-endian targets | Not supported: the format is little-endian (compile error) |
+
+Requires Zig 0.17.0. A nightly CI job tries Zig master as an early warning.
+
+## JSON mapping
+
+| lite3 | JSON out (`writeJson`) | JSON in (`fromJson`) |
+|---|---|---|
+| null, bool | `null`, `true`/`false` | same |
+| int (i64) | integer | integers that fit i64 |
+| float (f64) | number, always with `.` or an exponent; NaN/±Inf are `error.NonFiniteNumber` | numbers with a fraction or exponent, and integers outside i64 |
+| string | string (must be valid UTF-8, else `error.InvalidUtf8`) | string (a key containing `\u0000` is `error.InvalidKey`) |
+| bytes | base64 string | — (comes back as a string) |
+| object, array | object, array (keys in storage order, not insertion order) | object, array; root must be one of these; at most 32 levels |
+
+Duplicate keys in JSON input: the last one wins.
+
+## Wire format
+
+Documents are byte-compatible with lite3's C library at the commit in `vendor/lite3/UPSTREAM`: bytes written by one can be read by the other. The format is little-endian, with 96-byte B-tree nodes aligned to 4 bytes. `src/testdata/sample.lite3` is a golden fixture: any change to the bytes this library produces fails a test, and an intended change is a breaking change recorded in the CHANGELOG.
+
+lite3 never reclaims space in place: overwriting a value with a larger one leaves the old bytes behind. `Document.compact` rewrites a document without them.
 
 ## Examples
 
@@ -194,7 +228,7 @@ lite3-zig/
 │   ├── testdata/           # Golden fixtures
 │   ├── bench.zig, bench_raw.c
 ├── examples/
-├── scripts/update-vendor.sh
+├── scripts/              # update-vendor.sh, consumer-test.sh, mutate.py
 └── vendor/
     ├── lite3/              # Vendored upstream sources (github.com/fastserial/lite3)
     └── patches/            # Local fixes applied on top
@@ -202,29 +236,15 @@ lite3-zig/
 
 ## Development
 
-```bash
-# With mise and just installed:
-mise install          # Install Zig 0.17.0
-just test             # Run tests
-just test-release     # Run tests with ReleaseSafe
-just test-no-json     # Run tests with JSON backend disabled
-just clean            # Remove build artifacts
-just update-vendor    # Re-vendor lite3 and apply vendor/patches
-just act-local        # Run local CI in act
-
-```
-
-### Local GitHub Actions (act)
-
-To run CI locally, use the dedicated workflow in `.github/workflows/ci-local.yml`:
+See [CONTRIBUTING.md](CONTRIBUTING.md). In short, with mise and just installed:
 
 ```bash
-act workflow_dispatch -W .github/workflows/ci-local.yml
+mise install          # Zig 0.17.0
+just test-all         # tests in several modes, upstream C tests, examples, consumer package
+just fuzz             # coverage-guided fuzzing
+just mutate           # mutation testing
+just update-vendor    # re-vendor lite3 and apply vendor/patches
 ```
-
-If you install act and want a short alias, use `just act-local` from the root of this repository.
-
-The local workflow intentionally mirrors the existing CI commands on Linux so it can run in `act` consistently without requiring a macOS runner.
 
 ## Safety notes
 

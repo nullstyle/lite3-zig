@@ -30,6 +30,20 @@ pub fn build(b: *std.Build) void {
 
     const check_step = b.step("check", "Compile tests, examples and benchmarks without running them");
 
+    // --- Formatting ---
+    const fmt_paths: []const std.Build.LazyPath = &.{ b.path("build.zig"), b.path("build.zig.zon"), b.path("src"), b.path("examples") };
+    const fmt_step = b.step("fmt", "Check formatting (zig fmt)");
+    fmt_step.dependOn(&b.addFmt(.{ .paths = fmt_paths, .check = true }).step);
+
+    // --- API docs ---
+    const docs_obj = b.addObject(.{ .name = "lite3", .root_module = lite3.module });
+    const docs_step = b.step("docs", "Generate API documentation in zig-out/docs");
+    docs_step.dependOn(&b.addInstallDirectory(.{
+        .source_dir = docs_obj.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    }).step);
+
     // --- Tests ---
     const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose name contains this (repeatable)") orelse &.{};
     const tests = b.addTest(.{
@@ -94,6 +108,7 @@ pub fn build(b: *std.Build) void {
     };
 
     const examples_step = b.step("examples", "Build example programs");
+    const run_examples_step = b.step("run-examples", "Build and run the example programs");
     for (example_files) |ex| {
         const ex_exe = b.addExecutable(.{
             .name = ex.name,
@@ -107,7 +122,28 @@ pub fn build(b: *std.Build) void {
         if (enable_lto) enableLto(ex_exe);
         check_step.dependOn(&ex_exe.step);
         examples_step.dependOn(&b.addInstallArtifact(ex_exe, .{}).step);
+        // The examples check their own results and fail if one is wrong.
+        const run_ex = b.addRunArtifact(ex_exe);
+        run_ex.expectExitCode(0);
+        run_examples_step.dependOn(&run_ex.step);
     }
+
+    // The README's quick start, extracted and built like an example, so the
+    // documentation cannot drift from the API.
+    const quickstart = b.addExecutable(.{
+        .name = "readme_quickstart",
+        .root_module = b.createModule(.{
+            .root_source_file = readmeQuickStart(b),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "lite3", .module = lite3.module }},
+        }),
+    });
+    if (enable_lto) enableLto(quickstart);
+    check_step.dependOn(&quickstart.step);
+    const run_quickstart = b.addRunArtifact(quickstart);
+    run_quickstart.expectExitCode(0);
+    run_examples_step.dependOn(&run_quickstart.step);
 
     // --- Upstream C tests ---
     // lite3's own test programs, built against the vendored (patched) sources
@@ -287,6 +323,18 @@ fn addLite3(b: *std.Build, config: Config, visibility: enum { public, private })
     module.linkLibrary(lib);
 
     return .{ .lib = lib, .module = module };
+}
+
+/// The first ```zig block after "## Quick start" in README.md, as a file.
+fn readmeQuickStart(b: *std.Build) std.Build.LazyPath {
+    const readme_path = b.root.join(b.allocator, "README.md") catch @panic("OOM");
+    const readme = readme_path.root_dir.handle.readFileAlloc(b.graph.io, readme_path.sub_path, b.allocator, .limited(1 << 20)) catch |err|
+        std.debug.panic("cannot read README.md: {s}", .{@errorName(err)});
+    const section = std.mem.indexOf(u8, readme, "## Quick start") orelse @panic("README.md has no '## Quick start'");
+    const open = "```zig\n";
+    const start = (std.mem.indexOfPos(u8, readme, section, open) orelse @panic("no zig block in the README quick start")) + open.len;
+    const end = std.mem.indexOfPos(u8, readme, start, "```") orelse @panic("unterminated zig block in README.md");
+    return b.addWriteFiles().add("readme_quickstart.zig", readme[start..end]);
 }
 
 fn isSafe(mode: std.builtin.OptimizeMode) bool {
