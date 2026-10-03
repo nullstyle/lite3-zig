@@ -18,6 +18,23 @@ const build_options = @import("lite3_build_options");
 
 const c = @import("lite3_c");
 
+const validation = @import("validate.zig");
+
+/// Maximum container nesting accepted by `validate` (the root is depth 1).
+pub const max_nesting_depth = validation.max_nesting_depth;
+
+/// Check that `bytes` (the used part of a serialized document, root at offset
+/// 0) is a well-formed lite3 document. A document that passes can be read and
+/// modified through this API without out-of-bounds access or unbounded work,
+/// whatever its origin. Runs in linear time and does not allocate.
+///
+/// The constructors that take serialized bytes (`Buffer.fromSerialized`,
+/// `Context.initFromBuf`, `importFromBuf`, ...) call this automatically;
+/// their `*Unchecked` variants skip it for data this program produced.
+pub fn validate(bytes: []const u8) Error!void {
+    validation.validate(bytes) catch return Error.CorruptData;
+}
+
 /// True when JSON conversion support is compiled in.
 pub const json_enabled: bool = build_options.json_enabled;
 
@@ -926,6 +943,15 @@ pub const Buffer = struct {
 
     /// Construct a buffer view from existing Lite3 bytes copied into `mem`.
     pub fn fromSerialized(mem: []align(4) u8, used_len: usize) Error!Buffer {
+        if (used_len == 0 or used_len > mem.len) return Error.InvalidArgument;
+        try validate(mem[0..used_len]);
+        return fromSerializedUnchecked(mem, used_len);
+    }
+
+    /// Like `fromSerialized`, but skips `validate`. Only for bytes this
+    /// program produced itself: reading or writing a malformed document
+    /// through this Buffer is not guaranteed to stay in bounds.
+    pub fn fromSerializedUnchecked(mem: []align(4) u8, used_len: usize) Error!Buffer {
         if (used_len == 0 or used_len > mem.len) return Error.InvalidArgument;
         return Buffer{
             .buf = mem.ptr,
