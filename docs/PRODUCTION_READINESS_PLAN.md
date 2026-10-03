@@ -234,7 +234,19 @@ Exit criteria: the C-level reproduction tests (iterator key, size-0 string, unte
   - `-Dtest-filter` was added to select targets.
 - **Bug found by fuzzing:** `lite3_set_obj`/`set_arr` and their ctx variants are macros with an early `return`, which bypassed the Phase 1 status translation, so validation failures surfaced as `NotFound`. Fixed with helper functions and a regression test.
 - **Threat model:** `SECURITY.md`.
-- **Fuzz results:** a one-hour run of each target is in progress; results will be recorded here.
+- **Fuzz results (2026-10-03).** Each target ran 20M iterations in ReleaseSafe, with the C library under UBSan, and none failed:
+
+  | Target | Unique paths | Coverage points |
+  |---|---|---|
+  | Mutated documents | 734 | 709 |
+  | Arbitrary bytes | 401 | 56 |
+  | JSON | 64 | 466 |
+  | Write sequences | 201 | 559 |
+
+  - That took about 15 minutes per target, short of the planned hour. The nightly CI job (20M per target) carries the long runs from here.
+  - Coverage feedback sees only Zig code, because the C library is not instrumented. The JSON and raw-byte searches are therefore close to random over yyjson and lite3's C paths.
+  - Valgrind is clean (0 errors) over the suite, seed corpora and mutation sweep, with JSON on and off.
+  - 160 tests pass in every optimize mode × JSON setting, the upstream C tests pass, and LTO, lint and the cross `check` build are green.
 
 Untrusted buffers are a supported use case. The wrapper's contract becomes: **no API reachable from safe-looking code reads or writes outside the document, loops without bound, or crashes, whatever bytes it is given.**
 
