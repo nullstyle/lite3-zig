@@ -25,23 +25,23 @@ fn buildRich(buf: *lite3.Buffer) !void {
     for (0..200) |i| {
         const key = try std.fmt.bufPrint(&kb, "key-{d}", .{i});
         switch (i % 6) {
-            0 => try buf.set(lite3.root, key, @intCast(i)),
+            0 => try buf.set(lite3.root, key, i),
             1 => try buf.set(lite3.root, key, "value"),
             2 => try buf.set(lite3.root, key, i % 4 == 1),
-            3 => try buf.set(lite3.root, key, @floatFromInt(i)),
+            3 => try buf.set(lite3.root, key, @as(f64, @floatFromInt(i))),
             4 => try buf.set(lite3.root, key, lite3.bytes(&.{ 0, 1, 2, 3 })),
-            else => try buf.set(lite3.root, key),
+            else => try buf.set(lite3.root, key, null),
         }
     }
     const arr = try buf.setArray(lite3.root, "array");
-    for (0..300) |i| try buf.append(arr, @intCast(i));
+    for (0..300) |i| try buf.append(arr, i);
     const nested = try buf.appendObject(arr);
     try buf.set(nested, "deep", "yes");
     var inner = nested;
     for (0..20) |_| inner = try buf.setObject(inner, "child");
 
     @memset(kb[0..70], 'm');
-    try buf.set(lite3.root, kb[0..70]); // 2-byte key tag
+    try buf.set(lite3.root, kb[0..70], null); // 2-byte key tag
     // A 4-byte key tag needs a key of at least 16383 bytes; the wrapper's key
     // limit is lower, so that path is covered by the JSON test below.
 
@@ -61,7 +61,7 @@ test "validate: documents built through the API are valid" {
     try lite3.validate(buf.slice());
 
     var arr_buf = try lite3.Buffer.init(mem, .array);
-    for (0..5000) |i| try arr_buf.append(lite3.root, @intCast(i));
+    for (0..5000) |i| try arr_buf.append(lite3.root, i);
     try lite3.validate(arr_buf.slice());
 }
 
@@ -114,7 +114,7 @@ test "validate: rejects a key whose hash does not match" {
 /// A document whose root has been split into an internal node with children.
 fn splitDoc(mem: []align(4) u8) !lite3.Buffer {
     var buf = try lite3.Buffer.init(mem, .array);
-    for (0..40) |i| try buf.append(lite3.root, @intCast(i));
+    for (0..40) |i| try buf.append(lite3.root, i);
     try testing.expect(readU32(mem, ofs_child) != 0); // root is internal
     try lite3.validate(buf.slice());
     return buf;
@@ -162,7 +162,7 @@ test "validate: any single-byte corruption is rejected or fully readable" {
     var mem: [16384]u8 align(4) = undefined;
     var buf = try lite3.Buffer.init(&mem, .object);
     var kb: [16]u8 = undefined;
-    for (0..12) |i| try buf.set(lite3.root, try std.fmt.bufPrint(&kb, "k{d}", .{i}), @intCast(i));
+    for (0..12) |i| try buf.set(lite3.root, try std.fmt.bufPrint(&kb, "k{d}", .{i}), i);
     try buf.set(lite3.root, "s", "hello");
     try buf.set(lite3.root, "b", lite3.bytes(&.{ 1, 2, 3 }));
     try buf.set(lite3.root, "t", true);
@@ -204,7 +204,7 @@ test "validate: accepts genuine hash collisions resolved by probing" {
     const keys = [_][]const u8{ "Aa", "B@", "C\x1f" };
     var mem: [4096]u8 align(4) = undefined;
     var buf = try lite3.Buffer.init(&mem, .object);
-    for (keys, 0..) |k, i| try buf.set(lite3.root, k, @intCast(i));
+    for (keys, 0..) |k, i| try buf.set(lite3.root, k, i);
     try lite3.validate(buf.slice());
     for (keys, 0..) |k, i| try testing.expectEqual(@as(i64, @intCast(i)), try buf.view().get(i64, lite3.root, k));
 

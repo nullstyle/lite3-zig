@@ -4,9 +4,15 @@ const lite3 = @import("lite3");
 
 test {
     _ = @import("api_tests.zig");
+    _ = @import("validate_tests.zig");
+    _ = @import("fuzz_tests.zig");
+    _ = @import("regression_tests.zig");
+    _ = @import("property_tests.zig");
 }
 
 test "smoke: compile every declaration" {
+    // The JSON decoders are compile errors in a -Djson=false build.
+    if (!lite3.json_enabled) return error.SkipZigTest;
     testing.refAllDecls(lite3);
     testing.refAllDecls(lite3.View);
     testing.refAllDecls(lite3.Buffer);

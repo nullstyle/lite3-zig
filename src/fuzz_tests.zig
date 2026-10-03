@@ -16,20 +16,23 @@ const readAll = @import("test_util.zig").readAll;
 /// `validateStrict`, it must still pass after every write.
 fn exercise(mem: []align(4) u8, len: usize) !void {
     var buf = try lite3.Buffer.fromBytes(mem, len);
-    try readAll(&buf, lite3.root, 1);
-    if (lite3.json_enabled) {
-        if (buf.jsonEncode(lite3.root)) |json| json.deinit() else |_| {}
-    }
+    try readAll(buf.view(), lite3.root, 1);
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    buf.view().writeJson(lite3.root, &discard.writer, .{}) catch |err| switch (err) {
+        // Validation does not check float or UTF-8 content.
+        error.NonFiniteNumber, error.InvalidUtf8 => {},
+        else => return err,
+    };
     const strict = if (lite3.validateStrict(testing.allocator, buf.slice())) true else |err| switch (err) {
         error.CorruptData => false,
         else => return err,
     };
-    const writes = [_]*const fn (*lite3.Buffer) lite3.Error!void{ writeKey, appendStr, writeObj };
+    const writes = [_]*const fn (*lite3.Buffer) lite3.WriteError!void{ writeKey, appendStr, writeObj };
     for (writes) |write| {
         write(&buf) catch |err| switch (err) {
             // Wrong root kind, full buffer, colliding key; or, for a
             // non-strict document, structure a previous write disturbed.
-            error.InvalidArgument, error.NoBufferSpace, error.KeyCollision => {},
+            error.TypeMismatch, error.NoSpaceLeft, error.KeyCollision => {},
             error.CorruptData => if (strict) return err,
             else => return err,
         };
@@ -37,15 +40,15 @@ fn exercise(mem: []align(4) u8, len: usize) !void {
     }
 }
 
-fn writeKey(buf: *lite3.Buffer) lite3.Error!void {
+fn writeKey(buf: *lite3.Buffer) lite3.WriteError!void {
     try buf.set(lite3.root, "fuzz", 1);
 }
 
-fn appendStr(buf: *lite3.Buffer) lite3.Error!void {
+fn appendStr(buf: *lite3.Buffer) lite3.WriteError!void {
     try buf.append(lite3.root, "x");
 }
 
-fn writeObj(buf: *lite3.Buffer) lite3.Error!void {
+fn writeObj(buf: *lite3.Buffer) lite3.WriteError!void {
     const o = try buf.setObject(lite3.root, "fuzz");
     try buf.set(o, "inner", "v");
 }
@@ -59,12 +62,12 @@ fn seedDoc(mem: []align(4) u8, which: u8) !usize {
             try buf.set(lite3.root, "name", "Alice");
             try buf.set(lite3.root, "age", 30);
             try buf.set(lite3.root, "ok", true);
-            try buf.setBytesX(lite3.root, "raw", &.{ 1, 2, 3 });
+            try buf.set(lite3.root, "raw", lite3.bytes(&.{ 1, 2, 3 }));
             return buf.len;
         },
         1 => {
             var buf = try lite3.Buffer.init(mem, .array);
-            for (0..30) |i| try buf.append(lite3.root, @intCast(i));
+            for (0..30) |i| try buf.append(lite3.root, i);
             return buf.len;
         },
         2 => {
@@ -73,7 +76,7 @@ fn seedDoc(mem: []align(4) u8, which: u8) !usize {
             const arr = try buf.setArray(lite3.root, "list");
             try buf.append(arr, "a");
             const inner = try buf.appendObject(arr);
-            try buf.set(inner, "n");
+            try buf.set(inner, "n", null);
             return buf.len;
         },
         else => {
@@ -107,8 +110,35 @@ test "fuzz: mutated documents are rejected or safe to use" {
 fn fuzzRawBytes(_: void, s: *Smith) !void {
     var mem: [4096]u8 align(4) = undefined;
     const len = s.slice(&mem);
+    // Reads of unvalidated bytes may fail but must not crash or hang.
+    walkUnchecked(lite3.View.fromBytesUnchecked(mem[0..len]), lite3.root, 0) catch {};
     lite3.validate(mem[0..len]) catch return;
     try exercise(&mem, len);
+}
+
+fn walkUnchecked(v: lite3.View, at: lite3.Offset, depth: usize) lite3.ReadError!void {
+    if (depth > lite3.max_nesting_depth) return;
+    _ = try v.count(at);
+    switch (try v.containerType(at)) {
+        .object => {
+            var it = try v.objectIterator(at);
+            while (try it.next()) |e| {
+                _ = try v.getValue(at, e.key);
+                try walkValue(v, e.value, depth);
+            }
+        },
+        .array => {
+            var it = try v.arrayIterator(at);
+            while (try it.next()) |e| try walkValue(v, e.value, depth);
+        },
+    }
+}
+
+fn walkValue(v: lite3.View, value: lite3.Value, depth: usize) lite3.ReadError!void {
+    switch (value) {
+        .object, .array => |c| try walkUnchecked(v, c, depth + 1),
+        else => {},
+    }
 }
 
 test "fuzz: arbitrary bytes are rejected or safe to use" {
@@ -121,7 +151,7 @@ fn fuzzJsonDecode(_: void, s: *Smith) !void {
     var json: [2048]u8 = undefined;
     const json_len = s.slice(&json);
     var mem: [32768]u8 align(4) = undefined;
-    const buf = lite3.Buffer.fromJson(testing.allocator, &mem, json[0..json_len]) catch return;
+    const buf = lite3.Buffer.fromJson(testing.allocator, &mem, json[0..json_len], null) catch return;
     // Anything the decoder produces must be a valid document.
     try lite3.validate(buf.slice());
     try exercise(&mem, buf.len);
@@ -151,15 +181,15 @@ fn fuzzOperations(_: void, s: *Smith) !void {
         const key = std.fmt.bufPrint(&key_buf, "k{d}", .{s.valueRangeAtMost(u8, 0, 40)}) catch unreachable;
         const str = str_buf[0..s.valueRangeAtMost(u8, 0, 63)];
         @memset(str, 'v');
-        const op = s.valueRangeAtMost(u8, 0, 9);
+        const op = s.valueRangeAtMost(u8, 0, 10);
         const result: anyerror!void = switch (op) {
             0 => buf.set(at, key, s.value(i64)),
             1 => buf.set(at, key, str),
             2 => buf.set(at, key, s.value(bool)),
-            3 => buf.set(at, key),
-            4 => buf.append(at, @floatFromInt(s.value(i32))),
+            3 => buf.set(at, key, null),
+            4 => buf.append(at, @as(f64, @floatFromInt(s.value(i32)))),
             5 => buf.append(at, str),
-            6 => buf.appendBytesX(at, str),
+            6 => buf.append(at, lite3.bytes(str)),
             7, 8 => blk: {
                 const new = (if (op == 7) buf.setObject(at, key) else buf.appendArray(at)) catch |err| break :blk err;
                 if (n_containers < containers.len) {
@@ -167,11 +197,13 @@ fn fuzzOperations(_: void, s: *Smith) !void {
                     n_containers += 1;
                 }
             },
+            9 => buf.arrSet(at, s.valueRangeAtMost(u32, 0, 40), str),
             else => buf.set(at, key, 1.25),
         };
         result catch |err| switch (err) {
-            // Wrong container kind for the operation, or full.
-            error.InvalidArgument, error.NoBufferSpace => {},
+            // Wrong container kind for the operation, index past the end,
+            // or full.
+            error.TypeMismatch, error.IndexOutOfBounds, error.NoSpaceLeft => {},
             else => return err,
         };
         // Offsets of containers that were later overwritten stay in the
@@ -179,7 +211,7 @@ fn fuzzOperations(_: void, s: *Smith) !void {
         // the document either.
         try lite3.validateStrict(testing.allocator, buf.slice());
     }
-    try readAll(&buf, lite3.root, 1);
+    try readAll(buf.view(), lite3.root, 1);
 }
 
 test "fuzz: any sequence of writes leaves a valid document" {
